@@ -155,6 +155,13 @@
   "admin.header.account": "Account",
   "admin.header.profile": "Profile",
   "admin.header.changePwd": "Change Password",
+  "admin.pwdModal.title": "Change Admin Password",
+  "admin.pwdModal.confirmPwd": "Current Password",
+  "admin.pwdModal.newPwd": "New Password (min 6 chars)",
+  "admin.pwdModal.change": "Change",
+  "admin.pwdModal.success": "Password changed — please sign in again",
+  "admin.pwdModal.fail": "Change failed: ",
+
   "admin.header.viewAllPending": "View all pending →",
 
   "admin.dashboard.title": "Dashboard",
