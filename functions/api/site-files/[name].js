@@ -1,4 +1,4 @@
-import { handleSiteFiles } from '../../../_lib/api-core.js';
+import { handleSiteFiles } from '../../_lib/api-core.js';
 
 /** GET /api/site-files/:name（下载产物内容） */
 export async function onRequest(context) {
