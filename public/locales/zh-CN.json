@@ -155,6 +155,14 @@
   "admin.header.account": "账户",
   "admin.header.profile": "个人资料",
   "admin.header.changePwd": "修改密码",
+  "admin.header.changePwd": "修改密码",
+  "admin.pwdModal.title": "修改管理密码",
+  "admin.pwdModal.confirmPwd": "当前密码",
+  "admin.pwdModal.newPwd": "新密码(至少 6 位)",
+  "admin.pwdModal.change": "确认修改",
+  "admin.pwdModal.success": "密码已修改,请重新登录",
+  "admin.pwdModal.fail": "修改失败: ",
+
   "admin.header.viewAllPending": "查看全部待审核 →",
 
   "admin.dashboard.title": "仪表盘",
