@@ -26,10 +26,10 @@ pages_build_output_dir = "public"
 [[kv_namespaces]]
 binding = "BLOG"
 # id 由 GitHub Actions 的 secrets.BLOG_KV_ID 内插（部署时不落仓库）
-id = "{env.BLOG_KV_ID}"
+id = "d75d5bc9608f4492bff150a86ff9d804"
 
 # D1 数据库（主存储；表结构见 migrations/0001_init.sql，部署前由 Actions 自动执行）
 [[d1_databases]]
 binding = "DB"
 database_name = "blog"
-database_id = "{env.BLOG_D1_ID}"
+database_id = "45a031eb-9e34-42fa-888b-baf42820801c"
