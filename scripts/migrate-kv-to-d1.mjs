@@ -52,14 +52,13 @@ async function kvGet(key) {
   return res.text();
 }
 
-// SQL 字符串转义（单引号翻倍、反斜杠翻倍、换行转义）
+// SQL 字符串转义（单引号翻倍即可）
+// 注意：SQLite 不识别反斜杠转义（与 MySQL 不同）。此前把换行替换成字面量 \n、
+// 把反斜杠翻倍，会让多行正文与评论在库里存成 "\n" 两个字符而非真实换行，导致
+// 迁移后文章排版全部串行。SQLite 字符串字面量本身允许跨行，直接原样保留即可。
 function sqlStr(v) {
   if (v === null || v === undefined) return 'NULL';
-  const s = String(v)
-    .replace(/\\/g, '\\\\')
-    .replace(/'/g, "''")
-    .replace(/\n/g, '\\n')
-    .replace(/\r/g, '\\r');
+  const s = String(v).replace(/'/g, "''");
   return `'${s}'`;
 }
 function sqlInt(v) {
@@ -80,10 +79,10 @@ async function main() {
     const tagsJson = JSON.stringify(tags.filter(Boolean));
     const encJson = protectedPost ? JSON.stringify(p.enc) : null;
     lines.push(
-      `INSERT OR REPLACE INTO posts (id,title,date,excerpt,content,pinned,protected,enc,tags) VALUES (`
+      `INSERT INTO posts (id,title,date,excerpt,content,pinned,protected,enc,tags) VALUES (`
       + `${sqlStr(p.id)},${sqlStr(p.title)},${sqlStr(p.date)},${sqlStr(p.excerpt)},`
       + `${sqlStr(protectedPost ? '' : (p.content || ''))},${p.pinned ? 1 : 0},${protectedPost ? 1 : 0},`
-      + `${sqlStr(encJson)},${sqlStr(tagsJson)});`
+      + `${sqlStr(encJson)},${sqlStr(tagsJson)}) ON CONFLICT(id) DO UPDATE SET title=excluded.title,date=excluded.date,excerpt=excluded.excerpt,content=excluded.content,pinned=excluded.pinned,protected=excluded.protected,enc=excluded.enc,tags=excluded.tags;`
     );
   }
 

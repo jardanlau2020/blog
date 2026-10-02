@@ -6,7 +6,20 @@
  *   · 其余请求 → 静态资源（由 wrangler.workers.toml [assets] 绑定提供）
  * 部署：npx wrangler deploy
  * ============================================================ */
-import { handlePosts, handlePostId, handleFeed, handleComments, handleCommentId, handleSitemap, handleSiteFiles, handleStats, handleAdminSetup, handleAdminLogin, handleAdminLogout, getCorsHeaders, handleCommentsList, handleCommentUpdate, handleCommentDeleteGlobal, handleMedia, handleMediaId, handleSettings, handleAdminPassword, handleStatsTrend } from './functions/_lib/api-core.js';
+import { handleSearch } from './functions/_lib/search.js';
+import { handlePostRelations } from './functions/_lib/relations.js';
+import { handlePopular } from './functions/_lib/popular.js';
+import { handlePostAnalytics } from './functions/_lib/analytics.js';
+import { handlePosts, handlePostId, handleFeed, handleComments, handleCommentId, handleSitemap, handleSiteFiles, handleStats, handleAdminSetup, handleAdminLogin, handleAdminLogout, getCorsHeaders, securityHeaders, handleCommentsList, handleCommentUpdate, handleCommentDeleteGlobal, handleMedia, handleMediaId, handleSettings, handleAdminPassword, handleStatsTrend, publishScheduledPosts, handlePostRevisions, handlePostRevision, handlePostRevisionRestore, dbFirst } from './functions/_lib/api-core.js';
+import { onRequest as aiPing } from './functions/api/ai/ping.js';
+import { onRequest as aiSummary } from './functions/api/ai/summary.js';
+import { onRequest as aiAssist } from './functions/api/ai/assist.js';
+import { onRequest as aiComments } from './functions/api/ai/comments.js';
+import { handleMusic, handleMusicId, handleMusicUploadUrl } from './functions/_lib/music.js';
+import { handleBackups, handleBackupId, handleBackupRestore, createBackup } from './functions/_lib/backup.js';
+import { handleSubscribe, handleSubscribeConfirm, handleUnsubscribe, handleSubscribersAdmin, handleSubscriberId, processMailOutbox } from './functions/_lib/subscribe.js';
+import { handleOgUploadUrl } from './functions/_lib/og.js';
+import { handleMediaUploadUrl, deleteMediaObject } from './functions/_lib/media.js';
 
 export default {
   async fetch(request, env) {
@@ -24,9 +37,28 @@ export default {
         status: 500,
         headers: Object.assign(
           { 'Content-Type': 'application/json; charset=utf-8' },
-          getCorsHeaders(request, env)
+          getCorsHeaders(request, env),
+          securityHeaders()
         )
       });
+    }
+  },
+
+  async scheduled(event, env) {
+    try {
+      const now = event && event.scheduledTime ? event.scheduledTime : Date.now();
+      const result = await publishScheduledPosts(env, now);
+      if (result && result.published) {
+        console.log('[cron] scheduled posts published:', result.published, result.ids.join(','));
+      }
+      const mail = await processMailOutbox(env, 20);
+      if (mail && (mail.sent || mail.failed)) console.log('[cron] subscriber mail:', mail.sent, mail.failed);
+      if (event && event.cron === '0 19 * * *') {
+        const backup = await createBackup(env, 'auto');
+        console.log('[cron] daily backup created:', backup.id, backup.size);
+      }
+    } catch (e) {
+      console.error('[cron] scheduled publishing failed:', e && e.message, e && e.stack);
     }
   },
 
@@ -34,8 +66,44 @@ export default {
     const url = new URL(request.url);
 
     // API 路由
+    if (url.pathname === '/api/popular') {
+      return handlePopular(request, env);
+    }
+    if (url.pathname === '/api/search') {
+      return handleSearch(request, env);
+    }
     if (url.pathname === '/api/posts') {
       return handlePosts(request, env);
+    }
+    if (url.pathname === '/api/subscribe') {
+      return handleSubscribe(request, env);
+    }
+    if (url.pathname === '/api/subscribe/confirm') {
+      return handleSubscribeConfirm(request, env);
+    }
+    if (url.pathname === '/api/subscribe/unsubscribe') {
+      return handleUnsubscribe(request, env);
+    }
+    if (url.pathname === '/api/admin/og-upload-url') {
+      return handleOgUploadUrl(request, env);
+    }
+    if (url.pathname === '/api/admin/subscribers') {
+      return handleSubscribersAdmin(request, env);
+    }
+    let subscriberMatch = url.pathname.match(/^\/api\/admin\/subscribers\/([^/]+)$/);
+    if (subscriberMatch) {
+      return handleSubscriberId(request, env, decodeURIComponent(subscriberMatch[1]));
+    }
+    if (url.pathname === '/api/admin/backups') {
+      return handleBackups(request, env);
+    }
+    let backupMatch = url.pathname.match(/^\/api\/admin\/backups\/([^/]+)\/restore$/);
+    if (backupMatch) {
+      return handleBackupRestore(request, env, decodeURIComponent(backupMatch[1]));
+    }
+    backupMatch = url.pathname.match(/^\/api\/admin\/backups\/([^/]+)$/);
+    if (backupMatch) {
+      return handleBackupId(request, env, decodeURIComponent(backupMatch[1]));
     }
     if (url.pathname === '/api/admin/setup') {
       return handleAdminSetup(request, env);
@@ -46,6 +114,9 @@ export default {
     if (url.pathname === '/api/admin/logout') {
       return handleAdminLogout(request, env);
     }
+    if (url.pathname === '/api/admin/post-analytics') {
+      return handlePostAnalytics(request, env);
+    }
     if (url.pathname === '/api/admin/password') {
       return handleAdminPassword(request, env);
     }
@@ -54,6 +125,9 @@ export default {
     }
     if (url.pathname === '/api/media') {
       return handleMedia(request, env);
+    }
+    if (url.pathname === '/api/media/upload-url') {
+      return handleMediaUploadUrl(request, env);
     }
     if (url.pathname === '/api/settings') {
       return handleSettings(request, env);
@@ -68,7 +142,13 @@ export default {
     }
     let mm = url.pathname.match(/^\/api\/media\/([^/]+)$/);
     if (mm) {
-      return handleMediaId(request, env, decodeURIComponent(mm[1]));
+      const mid = decodeURIComponent(mm[1]);
+      // 删除媒体：先删 R2 对象（若 url 是本站 media/ 前缀），再删 D1 元数据
+      if (request.method === 'DELETE') {
+        const row = env && env.DB ? await dbFirst(env.DB, 'SELECT url, thumb_url FROM media WHERE id = ?', mid).catch(() => null) : null;
+        if (row && row.url) { try { await deleteMediaObject(env, row.url, row.thumb_url || ''); } catch (e) { /* R2 删除失败不阻塞 */ } }
+      }
+      return handleMediaId(request, env, mid);
     }
     if (url.pathname === '/api/feed.xml') {
       return handleFeed(request, env);
@@ -76,7 +156,25 @@ export default {
     if (url.pathname === '/api/sitemap.xml') {
       return handleSitemap(request, env);
     }
-    let match = url.pathname.match(/^\/api\/posts\/([^/]+)\/comments\/([^/]+)$/);
+    if (url.pathname === '/sitemap.xml') {
+      return handleSitemap(request, env);
+    }
+    if (url.pathname === '/feed.xml') {
+      return handleFeed(request, env);
+    }
+    let match = url.pathname.match(/^\/api\/posts\/([^/]+)\/revisions\/([^/]+)\/restore$/);
+    if (match) {
+      return handlePostRevisionRestore(request, env, decodeURIComponent(match[1]), decodeURIComponent(match[2]));
+    }
+    match = url.pathname.match(/^\/api\/posts\/([^/]+)\/revisions\/([^/]+)$/);
+    if (match) {
+      return handlePostRevision(request, env, decodeURIComponent(match[1]), decodeURIComponent(match[2]));
+    }
+    match = url.pathname.match(/^\/api\/posts\/([^/]+)\/revisions$/);
+    if (match) {
+      return handlePostRevisions(request, env, decodeURIComponent(match[1]));
+    }
+    match = url.pathname.match(/^\/api\/posts\/([^/]+)\/comments\/([^/]+)$/);
     if (match) {
       return handleCommentId(request, env, decodeURIComponent(match[1]), decodeURIComponent(match[2]));
     }
@@ -87,6 +185,10 @@ export default {
     match = url.pathname.match(/^\/api\/posts\/([^/]+)\/stats$/);
     if (match) {
       return handleStats(request, env, decodeURIComponent(match[1]));
+    }
+    match = url.pathname.match(/^\/api\/posts\/([^/]+)\/relations$/);
+    if (match) {
+      return handlePostRelations(request, env, decodeURIComponent(match[1]));
     }
     match = url.pathname.match(/^\/api\/posts\/([^/]+)$/);
     if (match) {
@@ -99,27 +201,77 @@ export default {
     if (url.pathname === '/api/site-files') {
       return handleSiteFiles(request, env);
     }
+    // AI（Workers AI；未绑定/关闭时由 ai lib 返回 404，前端自动隐藏）
+    if (url.pathname === '/api/ai/ping') {
+      return aiPing({ request, env });
+    }
+    if (url.pathname === '/api/ai/summary') {
+      return aiSummary({ request, env });
+    }
+    if (url.pathname === '/api/ai/assist') {
+      return aiAssist({ request, env });
+    }
+    if (url.pathname === '/api/ai/comments') {
+      return aiComments({ request, env });
+    }
+    // 音乐（播放列表读取公开；上传需管理会话，R2 直传）
+    if (url.pathname === '/api/music/upload-url') {
+      return handleMusicUploadUrl(request, env);
+    }
+    if (url.pathname === '/api/music') {
+      return handleMusic(request, env);
+    }
+    mm = url.pathname.match(/^\/api\/music\/([^/]+)$/);
+    if (mm) {
+      return handleMusicId(request, env, decodeURIComponent(mm[1]));
+    }
 
     // 未知 /api/* 路径：返回 JSON 404，绝不回退到 index.html（避免 API 调用方收到 HTML）
     if (url.pathname === '/api' || url.pathname.indexOf('/api/') === 0) {
       return new Response(JSON.stringify({ ok: false, error: 'Not Found' }), {
         status: 404,
-        headers: { 'Content-Type': 'application/json; charset=utf-8' }
+        headers: Object.assign({ 'Content-Type': 'application/json; charset=utf-8' }, securityHeaders())
       });
     }
 
     // 静态资源（index.html / style.css / app.js / …）
     if (env.ASSETS) {
-      const res = await env.ASSETS.fetch(request);
+      let res = await env.ASSETS.fetch(request);
       // SPA 回退：干净路径 / 首页 / 归档 / 关于 / 标签 / /posts/<别名>/ /admin / /write，
       // 以及 /api 以外的任何无扩展名路径，都返回 index.html（由前端 app.js 依据 pathname 渲染）。
       // 仅对 GET/HEAD 回退：POST 等非幂等方法拿到 HTML 会误导调用方。
       if (res.status === 404 && (request.method === 'GET' || request.method === 'HEAD') && !/\.[a-zA-Z0-9]+$/.test(url.pathname)) {
-        const idx = await env.ASSETS.fetch(new Request(url.origin + '/', request));
-        if (idx.status === 200) return idx;
+        res = await env.ASSETS.fetch(new Request(url.origin + '/', request));
+      }
+      // 性能：给静态资源加缓存头，避免每次刷新全量重下大文件（app.js 184KB / style.css 94KB）。
+      //  · 带扩展名的静态文件：1 小时强缓存 + 1 天 SWR（部署后 CF_ZONE_ID purge 立即生效，无陈旧感）
+      //  · 无扩展名（HTML SPA 入口）：no-cache（每次重新验证，ETag 命中即 304，体积极小）
+      // 安全：所有静态响应统一附带安全响应头（nosniff / CSP / frame 防护等）。
+      try {
+        const headers = new Headers(res.headers);
+        Object.keys(securityHeaders()).forEach(function (k) { headers.set(k, securityHeaders()[k]); });
+        const hasExt = /\.[a-zA-Z0-9]+$/.test(url.pathname);
+        // 版本化资源（style.css?v=…、app.js?v=…）与字体/图标等不可变资源，可放心一年强缓存；
+        // 其余扩展名静态文件保持 1 小时 + SWR（部署后仍能快速生效）。
+        const versioned = url.search && url.search.indexOf('v=') === 1;
+        const immutablePath = /^\/fonts\/|^\/flags\/|^\/libs\/smoji\/|^\/icons\//.test(url.pathname);
+        if (url.pathname === '/sw.js') {
+          headers.set('Cache-Control', 'no-cache');
+          headers.set('Service-Worker-Allowed', '/');
+        } else if (url.pathname === '/manifest.webmanifest') {
+          headers.set('Content-Type', 'application/manifest+json; charset=utf-8');
+          headers.set('Cache-Control', 'public, max-age=3600');
+        } else if (hasExt && request.method === 'GET') {
+          headers.set('Cache-Control', versioned || immutablePath
+            ? 'public, max-age=31536000, immutable'
+            : 'public, max-age=3600, stale-while-revalidate=86400');
+        } else if (request.method === 'GET') {
+          headers.set('Cache-Control', 'no-cache');
+        }
+        return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
+      } catch (e) {
         return res;
       }
-      return res;
     }
     return new Response('Not Found', { status: 404 });
   }
