@@ -34,7 +34,11 @@ const KNOWN_ROUTES = [
   /^\/api\/posts\/[^/]+\/stats$/,
   /^\/api\/posts\/[^/]+\/relations$/,
   /^\/api\/comments$/,
+  /^\/api\/comments\/[^/]+\/like$/,
   /^\/api\/comments\/[^/]+$/,
+  /^\/api\/music$/,
+  /^\/api\/music\/upload-url$/,
+  /^\/api\/music\/[^/]+$/,
   /^\/api\/media$/,
   /^\/api\/media\/upload-url$/,
   /^\/api\/media\/[^/]+$/,
@@ -45,6 +49,11 @@ const KNOWN_ROUTES = [
   /^\/api\/feed\.xml$/,
   /^\/api\/sitemap\.xml$/,
   /^\/api\/admin\/post-analytics$/,
+  /^\/api\/admin\/tags$/,
+  /^\/api\/admin\/comments\/bulk$/,
+  /^\/api\/admin\/health$/,
+  /^\/api\/admin\/stats\/sources$/,
+  /^\/api\/admin\/audit$/,
   /^\/api\/admin\/(setup|login|logout|password)$/,
   /^\/api\/ai\/(ping|summary|assist|comments)$/
 ];

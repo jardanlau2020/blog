@@ -16,6 +16,11 @@ main = "worker.js"
 directory = "./public"
 binding = "ASSETS"
 not_found_handling = "single-page-application"
+# 注意：静态资源默认在 Worker 之前被 Cloudflare 直接返回，因此 worker.js 里
+# 「版本化资源一年强缓存 + 安全响应头」那段逻辑不会执行（线上一直是 max-age=0）。
+# 修复需要 run_worker_first = true，但它要求 wrangler >= 3.94，而 4.x 在本项目下部署失败，
+# 故暂未开启；现阶段靠 public/_headers（Pages 路径）与 Service Worker 缓存兜底。
+# 需要 wrangler >= 3.94（CI 已升到 4.x）。
 html_handling = "auto-trailing-slash"
 
 # KV 命名空间（文章数据存储 + 管理员密码哈希）
@@ -63,6 +68,10 @@ binding = "AI"
 [vars]
 SITE_URL = "{env.SITE_URL}"
 CF_ZONE_ID = "{env.CF_ZONE_ID}"
+# 可选：AI 开关（空值 = 默认开启；0 / false / off 关闭）。部署时由 GitHub Secrets 注入，未配置即留空。
+BLOG_AI_ENABLED = "{env.BLOG_AI_ENABLED}"
+# 可选：设为 0 / false / off 后，匿名访客不能触发生成（只读缓存与 ping 不受影响）
+BLOG_AI_PUBLIC = "{env.BLOG_AI_PUBLIC}"
 # Cron：每 5 分钟检查定时文章；每天 19:00 UTC（北京时间 03:00）自动备份
 [triggers]
 crons = ["*/5 * * * *", "0 19 * * *"]

@@ -120,8 +120,10 @@
     try {
       return await window.apiFetch(url, opts || {});
     } catch (e) {
-      // 401 = 会话过期/无效，清除 token 并跳转登录页
-      if ((e && e.status) === 401 || String(e.message || e).indexOf('HTTP 401') >= 0) {
+      // 401 = 会话过期/无效，清除 token 并跳转登录页。
+      // 改密接口的 401 只代表当前密码错误，不能退出仍有效的会话。
+      if (((e && e.status) === 401 || String(e.message || e).indexOf('HTTP 401') >= 0)
+        && !/api\/admin\/password/.test(String(url))) {
         sessionExpired();
       }
       throw e;
@@ -133,10 +135,29 @@
     if (window.cloudLogout) window.cloudLogout(); else if (window.adminLogout) window.adminLogout();
     setTimeout(function () { if (window.navigate) window.navigate('/admin'); }, 800);
   }
+  function mustChangeRequired() {
+    return typeof window._mustChangeRequired === 'function' && window._mustChangeRequired();
+  }
   /* 全局会话失效事件（前台 apiFetch 在任意 401 时派发，后台监听后自动退出登录状态） */
   if (!window.__qySessionExpiredBound) {
     window.__qySessionExpiredBound = true;
     window.addEventListener('qy:session-expired', function () { sessionExpired(); });
+  }
+  /* 服务端拦截未改密会话时切换为不可跳过的改密页。 */
+  if (!window.__qyPasswordChangeBound) {
+    window.__qyPasswordChangeBound = true;
+    var _mustChangeTimer = null;
+    window.addEventListener('qy:password-change-required', function () {
+      if (!mustChangeRequired() || _mustChangeTimer) return;
+      _mustChangeTimer = setTimeout(function () {
+        _mustChangeTimer = null;
+        if (!mustChangeRequired() || !isAdmin()) return;
+        var root = document.querySelector('#app');
+        if (!root) return;
+        var path = (typeof window.currentRoute === 'function') ? window.currentRoute().path : '/admin';
+        mount(root, path);
+      }, 0);
+    });
   }
   function toast(msg, type) {
     var wrap = document.querySelector('.ab-toast-wrap');
@@ -241,7 +262,7 @@
     for (var i = 0; i < drafts.length; i++) if (drafts[i] && drafts[i].id === post.id) idx = i;
     var item = { id: post.id, title: post.title, date: post.date, tags: post.tags || [], excerpt: post.excerpt || '',
       cover: post.cover || '', ogImage: post.ogImage || '', category: post.category || '', series: post.series || '', seriesOrder: Number(post.seriesOrder) || 0, status: post.status || 'published',
-      pinned: !!post.pinned, protected: !!post.protected, enc: post.protected ? (post.enc || null) : null,
+      pinned: !!post.pinned, protected: !!post.protected, enc: post.protected ? (post.enc || null) : null, seo: post.seo || {},
       publishAt: post.publishAt || null, content: post.content || '' };
     if (idx >= 0) drafts[idx] = item; else drafts.push(item);
     localStorage.setItem('qingyu.drafts', JSON.stringify(drafts));
@@ -646,12 +667,16 @@
       ] },
       { group: t('admin.sidebar.commentManage'), items: [
         { key: 'comments', label: t('admin.sidebar.allComments'), icon: 'quote', href: '/admin/comments' },
-        { key: 'comments-pending', label: t('admin.sidebar.pendingComments'), icon: 'clock', href: '/admin/comments/pending', badge: 'pending' }
+        { key: 'comments-pending', label: t('admin.sidebar.pendingComments'), icon: 'clock', href: '/admin/comments/pending', badge: 'pending' },
+        { key: 'webmentions', label: t('admin.sidebar.webmentions'), icon: 'link', href: '/admin/webmentions' }
       ] },
       { group: t('admin.sidebar.contentSettings'), items: [
         { key: 'media', label: t('admin.sidebar.media'), icon: 'image', href: '/admin/media' },
         { key: 'music', label: t('admin.sidebar.musicManage'), icon: 'music', href: '/admin/music' },
         { key: 'subscribers', label: t('admin.sidebar.subscribers'), icon: 'send', href: '/admin/subscribers' },
+        { key: 'audit', label: t('admin.sidebar.audit'), icon: 'clock', href: '/admin/audit' },
+        { key: 'health', label: t('admin.sidebar.health'), icon: 'gauge', href: '/admin/health' },
+        { key: 'errors', label: t('admin.sidebar.errors'), icon: 'bug', href: '/admin/errors' },
         { key: 'backup', label: t('admin.sidebar.backups'), icon: 'save', href: '/admin/backups' },
         { key: 'transfer', label: t('admin.sidebar.importExport'), icon: 'download', href: '/admin/import-export' },
         { key: 'settings', label: t('admin.sidebar.settings'), icon: 'sliders', href: '/admin/settings' }
@@ -803,6 +828,10 @@
     if (path === '/admin/media') return { key: 'media', page: 'media' };
     if (path === '/admin/music') return { key: 'music', page: 'music' };
     if (path === '/admin/subscribers') return { key: 'subscribers', page: 'subscribers' };
+    if (path === '/admin/audit') return { key: 'audit', page: 'audit' };
+    if (path === '/admin/health') return { key: 'health', page: 'health' };
+    if (path === '/admin/errors') return { key: 'errors', page: 'errors' };
+    if (path === '/admin/webmentions') return { key: 'webmentions', page: 'webmentions' };
     if (path === '/admin/backups') return { key: 'backup', page: 'backup' };
     if (path === '/admin/import-export') return { key: 'transfer', page: 'transfer' };
     if (path === '/admin/settings') return { key: 'settings', page: 'settings' };
@@ -824,8 +853,58 @@
   /* ----------------------- 装载入口 ----------------------- */
   var siderCollapsed = false;
 
+  function renderMustChangeGate(root) {
+    root.innerHTML =
+      '<div class="ab-gate"><div class="ab-gate-card">' +
+      '<div class="ab-gate-logo">' + icon('lock', 24) + '</div>' +
+      '<h2>' + t('admin.firstLoginTitle') + '</h2>' +
+      '<p class="ab-hint">' + t('admin.firstLoginWarn') + '</p>' +
+      '<div class="ab-field" style="margin:16px 0 12px"><label class="ab-label">' + t('admin.pwdModal.confirmPwd') + '</label>' +
+      '<input class="ab-input" id="abForceCurPwd" type="password" autocomplete="current-password"></div>' +
+      '<div class="ab-field" style="margin-bottom:16px"><label class="ab-label">' + t('admin.pwdModal.newPwd') + '</label>' +
+      '<input class="ab-input" id="abForceNewPwd" type="password" autocomplete="new-password"></div>' +
+      '<button class="ab-btn primary" id="abForcePwdBtn" style="width:100%">' + t('admin.pwdModal.change') + '</button>' +
+      '<button type="button" class="ab-gate-link" id="abForceLogout">' + t('admin.sidebar.logout') + '</button>' +
+      '</div></div>';
+    var cur = root.querySelector('#abForceCurPwd');
+    var pwd = root.querySelector('#abForceNewPwd');
+    var btn = root.querySelector('#abForcePwdBtn');
+    var logoutBtn = root.querySelector('#abForceLogout');
+    if (typeof window._initialAdminPwd === 'function') {
+      try { cur.value = window._initialAdminPwd() || ''; } catch (e) {}
+    }
+    async function submit() {
+      var current = cur.value || '';
+      var next = pwd.value || '';
+      if (!current || !next) { toast(t('admin.pwdRequired'), 'err'); return; }
+      if (next.length < 8) { toast(t('admin.pwdModal.tooShort'), 'err'); return; }
+      btn.disabled = true;
+      try {
+        await api('api/admin/password', { method: 'POST', body: JSON.stringify({ current: current, password: next }) });
+        toast(t('admin.pwdModal.success'), 'ok');
+        if (window._setMustChange) window._setMustChange(false);
+        if (cloudOn() && window.cloudLogout) await window.cloudLogout();
+        else if (window.adminLogout) window.adminLogout();
+        setTimeout(function () { go('/admin'); }, 300);
+      } catch (e) {
+        toast(t('admin.pwdModal.fail') + (e.message || e), 'err');
+        btn.disabled = false;
+      }
+    }
+    btn.addEventListener('click', submit);
+    if (logoutBtn) logoutBtn.addEventListener('click', function () {
+      if (cloudOn() && window.cloudLogout) window.cloudLogout(); else if (window.adminLogout) window.adminLogout();
+      go('/admin');
+    });
+    [cur, pwd].forEach(function (el) {
+      el.addEventListener('keydown', function (e) { if (e.key === 'Enter') submit(); });
+    });
+    cur.focus();
+  }
+
   function mount(root, path) {
     if (!isAdmin()) { renderGate(root); return; }
+    if (mustChangeRequired()) { renderMustChangeGate(root); return; }
     // 确保 i18n 已加载
     var route = parseRoute(path);
     // 异步拉取待审核数量用于角标
@@ -944,6 +1023,7 @@
     var content = root.querySelector('#abContent');
     if (window.destroySmojiPicker) window.destroySmojiPicker();
     if (_feedTimer) { clearInterval(_feedTimer); _feedTimer = null; } // 离开仪表盘时停止评论自动滚动
+    if (_editorDraftTimer) { clearInterval(_editorDraftTimer); _editorDraftTimer = null; } // 离开编辑器时停止草稿自动保存
     if (route.page === 'dashboard') return pageDashboard(content);
     if (route.page === 'posts') return pagePosts(content);
     if (route.page === 'analytics') return pageAnalytics(content);
@@ -955,22 +1035,41 @@
     if (route.page === 'media') return pageMedia(content);
     if (route.page === 'music') return pageMusic(content);
     if (route.page === 'subscribers') return pageSubscribers(content);
+    if (route.page === 'audit') return pageAudit(content);
+    if (route.page === 'health') return pageHealth(content);
+    if (route.page === 'errors') return pageErrors(content);
+    if (route.page === 'webmentions') return pageWebmentions(content);
     if (route.page === 'backup') return pageBackups(content);
     if (route.page === 'transfer') return pageImportExport(content);
     if (route.page === 'settings') return pageSettings(content);
   }
 
   /* ====================== 仪表盘 ====================== */
+  /* 仪表盘骨架屏：所有卡片统一用同一套占位，避免个别卡片单独转圈 */
+  function skBar(w, h, extra) { return '<span class="ab-sk" style="width:' + w + ';height:' + (h || 12) + 'px;' + (extra || '') + '"></span>'; }
+  function skStatCards(n) {
+    var out = '';
+    for (var i = 0; i < n; i++) out += '<div class="ab-card ab-stat">' + skBar('42%', 11) + skBar('58%', 24, 'margin-top:12px') + '</div>';
+    return out;
+  }
+  function skChartBox() { return '<div class="ab-sk-chart">' + skBar('100%', 0, 'height:100%;border-radius:12px') + '</div>'; }
+  function skRows(n) {
+    var out = '';
+    for (var i = 0; i < n; i++) out += '<div class="ab-sk-row"><span class="ab-sk ab-sk-round"></span>' + skBar('100%', 12) + '</div>';
+    return out;
+  }
   function pageDashboard(content) {
     content.innerHTML = '<div class="ab-page-head"><div><h1 class="ab-page-title">' + t('admin.dashboard.title') + '</h1><p class="ab-page-sub">' + t('admin.dashboard.desc') + '</p></div></div>' +
-      '<div class="ab-grid cols-5" id="abStats"></div>' +
+      '<div class="ab-grid cols-5" id="abStats">' + skStatCards(5) + '</div>' +
       '<div class="ab-grid cols-2">' +
-        '<div class="ab-card"><div class="ab-section-title">' + icon('eye', 16) + ' ' + t('admin.dashboard.visitTrend') + '</div><div id="abTrendViews"></div></div>' +
-        '<div class="ab-card"><div class="ab-section-title">' + icon('quote', 16) + ' ' + t('admin.dashboard.commentTrend') + '</div><div id="abTrendCmt"></div></div>' +
+        '<div class="ab-card"><div class="ab-section-title">' + icon('eye', 16) + ' ' + t('admin.dashboard.visitTrend') + '</div><div id="abTrendViews">' + skChartBox() + '</div></div>' +
+        '<div class="ab-card"><div class="ab-section-title">' + icon('quote', 16) + ' ' + t('admin.dashboard.commentTrend') + '</div><div id="abTrendCmt">' + skChartBox() + '</div></div>' +
       '</div>' +
+      '<div class="ab-card" id="abSourcesCard"><div class="ab-section-title">' + icon('globe', 16) + ' ' + t('admin.dashboard.sourcesTitle') + '</div><div id="abSourcesBody">' + skRows(3) + '</div></div>' +
+      '<div class="ab-card" id="abStorageCard"><div class="ab-section-title">' + icon('cloud', 16) + ' ' + t('admin.dashboard.storageTitle') + '</div><div id="abStorageBody">' + skRows(4) + '</div></div>' +
       '<div class="ab-grid cols-2">' +
-        '<div class="ab-card"><div class="ab-section-title">' + icon('doc', 16) + ' ' + t('admin.dashboard.latestPosts') + '</div><div class="ab-feed" id="abRecentPosts"></div></div>' +
-        '<div class="ab-card"><div class="ab-section-title">' + icon('quote', 16) + ' ' + t('admin.dashboard.latestComments') + '</div><div class="ab-feed" id="abRecentCmt"></div></div>' +
+        '<div class="ab-card"><div class="ab-section-title">' + icon('doc', 16) + ' ' + t('admin.dashboard.latestPosts') + '</div><div class="ab-feed" id="abRecentPosts">' + skRows(3) + '</div></div>' +
+        '<div class="ab-card"><div class="ab-section-title">' + icon('quote', 16) + ' ' + t('admin.dashboard.latestComments') + '</div><div class="ab-feed" id="abRecentCmt">' + skRows(3) + '</div></div>' +
       '</div>';
 
     loadDashboard(content);
@@ -1040,27 +1139,129 @@
       content.querySelector('#abTrendViews').innerHTML = '<div class="ab-empty"><p>' + t('admin.dashboard.cloudOnly') + '</p></div>';
       content.querySelector('#abTrendCmt').innerHTML = '<div class="ab-empty"><p>' + t('admin.dashboard.cloudOnly') + '</p></div>';
     }
+
+    loadStorageOverview(content);
+    loadSourcesOverview(content);
+  }
+
+  /** 两位国家码 → 国旗 emoji + 代码（如 CN → 🇨🇳 CN） */
+  function countryLabel(code) {
+    var c = String(code || '').toUpperCase();
+    if (!/^[A-Z]{2}$/.test(c)) return t('admin.dashboard.unknown');
+    try { return String.fromCodePoint(0x1F1E6 + c.charCodeAt(0) - 65) + String.fromCodePoint(0x1F1E6 + c.charCodeAt(1) - 65) + ' ' + c; } catch (e) { return c; }
+  }
+  /** 设备类型 i18n（desktop/mobile/tablet/bot） */
+  function deviceLabel(name) {
+    var n = String(name || '');
+    var key = 'admin.dashboard.dev' + n.charAt(0).toUpperCase() + n.slice(1);
+    var v = t(key);
+    return v === key ? n : v;
+  }
+  /** 访问来源 / 设备概览（近 30 天，异步加载） */
+  async function loadSourcesOverview(content) {
+    var box = content.querySelector('#abSourcesBody');
+    if (!box) return;
+    if (!cloudOn()) { box.innerHTML = '<div class="ab-empty"><p>' + t('admin.dashboard.cloudOnly') + '</p></div>'; return; }
+    try {
+      var d = await api('api/admin/stats/sources?days=30');
+      var refs = (d && d.referrers) || [];
+      var devs = (d && d.devices) || [];
+      var countries = (d && d.countries) || [];
+      var platforms = (d && d.platforms) || [];
+      var vendors = (d && d.vendors) || [];
+      var refTotal = Number(d && d.refTotal) || 0;
+      var devTotal = Number(d && d.devTotal) || 0;
+      var countryTotal = Number(d && d.countryTotal) || 0;
+      var platformTotal = Number(d && d.platformTotal) || 0;
+      var vendorTotal = Number(d && d.vendorTotal) || 0;
+      function pct(n, total) { return total > 0 ? Math.round(n / total * 100) + '%' : '0%'; }
+      function rows(items, total, asCountry, asDevice) {
+        return items.length ? items.map(function (r) {
+          var label = asCountry ? countryLabel(r.name) : (asDevice ? deviceLabel(r.name) : r.name);
+          return '<div class="ab-row" style="justify-content:space-between;gap:10px"><span class="co-name">' + esc(label) + '</span><b>' + (Number(r.views) || 0) + ' · ' + pct(r.views, total) + '</b></div>';
+        }).join('') : '<div class="ab-muted">' + t('admin.dashboard.noData') + '</div>';
+      }
+      box.innerHTML = '<div class="ab-grid cols-2" style="margin:0">' +
+        '<div><div class="ab-label">' + t('admin.dashboard.colCountry') + '</div>' + rows(countries, countryTotal, true, false) + '</div>' +
+        '<div><div class="ab-label">' + t('admin.dashboard.colRef') + '</div>' + rows(refs, refTotal, false, false) + '</div>' +
+        '<div><div class="ab-label">' + t('admin.dashboard.colDevice') + '</div>' + rows(devs, devTotal, false, true) + '</div>' +
+        '<div><div class="ab-label">' + t('admin.dashboard.colPlatform') + '</div>' + rows(platforms, platformTotal, false, false) + '</div>' +
+        '<div><div class="ab-label">' + t('admin.dashboard.colVendor') + '</div>' + rows(vendors, vendorTotal, false, false) + '</div>' +
+      '</div>';
+    } catch (e) { box.innerHTML = '<div class="ab-empty"><p>' + esc(e.message || e) + '</p></div>'; }
+  }
+
+  /** 存储与订阅概览：媒体占用 / 音乐 / 订阅者 / 备份（异步加载，不阻塞首屏） */
+  async function loadStorageOverview(content) {
+    var box = content.querySelector('#abStorageBody');
+    if (!box) return;
+    if (!cloudOn()) {
+      box.innerHTML = '<div class="ab-empty"><p>' + t('admin.dashboard.cloudOnly') + '</p></div>';
+      return;
+    }
+    var media = [], music = [], subs = { total: 0, active: 0 }, backups = [];
+    await Promise.all([
+      api('api/media').then(function (d) { media = (d && d.media) || []; }).catch(function () {}),
+      api('api/music').then(function (d) { music = (d && d.music) || []; }).catch(function () {}),
+      api('api/admin/subscribers').then(function (d) { subs = (d && d.counts) || subs; }).catch(function () {}),
+      api('api/admin/backups').then(function (d) { backups = (d && d.backups) || []; }).catch(function () {})
+    ]);
+    var mediaSize = media.reduce(function (n, m) { return n + (Number(m.size) || 0); }, 0);
+    var items = [
+      { label: t('admin.dashboard.sMedia'), value: media.length, sub: fmtSize(mediaSize), icon: 'image' },
+      { label: t('admin.dashboard.sMusic'), value: music.length, sub: '', icon: 'music' },
+      { label: t('admin.dashboard.sSubs'), value: subs.total || 0, sub: t('admin.dashboard.sActive', { n: subs.active || 0 }), icon: 'send' },
+      { label: t('admin.dashboard.sBackups'), value: backups.length, sub: backups.length ? t('admin.dashboard.sLatest', { time: fmtTimestamp(backups[0].createdAt) }) : '', icon: 'save' }
+    ];
+    box.innerHTML = '<div class="ab-grid cols-4" style="margin:0">' + items.map(function (x) {
+      return '<div class="ab-card ab-stat" style="margin:0"><div class="ab-stat-label">' + icon(x.icon, 16) + esc(x.label) + '</div><div class="ab-stat-value">' + esc(String(x.value)) + '</div>' + (x.sub ? '<div class="ab-muted" style="font-size:12px">' + esc(x.sub) + '</div>' : '') + '</div>';
+    }).join('') + '</div>';
   }
 
   var _chartData = {}; // metric → days[]，供交互浮层读取
   var _feedTimer = null; // 最新评论自动滚动定时器（离开页面时清理）
 
-  /* 趋势折线图：SVG 折线/数据点 + HTML 时间轴刻度 + 点击/悬停浮层（时间·访问·评论） */
+  /* 趋势折线图：平滑曲线 + 渐变面积 + 网格与刻度 + 数据点 + 悬停/点击浮层 */
+  function smoothLinePath(pts) {
+    if (!pts.length) return '';
+    if (pts.length < 3) return pts.map(function (p, i) { return (i ? 'L' : 'M') + p[0].toFixed(1) + ' ' + p[1].toFixed(1); }).join(' ');
+    var d = 'M' + pts[0][0].toFixed(1) + ' ' + pts[0][1].toFixed(1);
+    for (var i = 0; i < pts.length - 1; i++) {
+      var p0 = pts[i - 1] || pts[i], p1 = pts[i], p2 = pts[i + 1], p3 = pts[i + 2] || p2;
+      var c1x = p1[0] + (p2[0] - p0[0]) / 6, c1y = p1[1] + (p2[1] - p0[1]) / 6;
+      var c2x = p2[0] - (p3[0] - p1[0]) / 6, c2y = p2[1] - (p3[1] - p1[1]) / 6;
+      d += ' C' + c1x.toFixed(1) + ' ' + c1y.toFixed(1) + ',' + c2x.toFixed(1) + ' ' + c2y.toFixed(1) + ',' + p2[0].toFixed(1) + ' ' + p2[1].toFixed(1);
+    }
+    return d;
+  }
   function lineChart(days, metric) {
-    var w = 520, h = 200, pad = 28;
+    var w = 520, h = 200, pad = 30, padTop = 16;
     var n = days.length;
     if (!n) return '<div class="ab-empty"><p>' + t('admin.dashboard.noData') + '</p></div>';
     _chartData[metric] = days;
     var values = days.map(function (d) { return Number(d[metric]) || 0; });
     var max = Math.max(1, Math.max.apply(null, values));
+    var plotH = h - pad - padTop;
     var step = (w - pad * 2) / Math.max(1, n - 1);
     var pts = values.map(function (v, i) {
-      return [pad + i * step, h - pad - (v / max) * (h - pad * 2)];
+      return [pad + i * step, h - pad - (v / max) * plotH];
     });
-    var path = pts.map(function (p, i) { return (i === 0 ? 'M' : 'L') + p[0].toFixed(1) + ' ' + p[1].toFixed(1); }).join(' ');
-    var dots = pts.map(function (p) { return '<circle class="dot" cx="' + p[0].toFixed(1) + '" cy="' + p[1].toFixed(1) + '" r="2.6"/>'; }).join('');
+    var line = smoothLinePath(pts);
+    var area = line + ' L' + pts[n - 1][0].toFixed(1) + ' ' + (h - pad) + ' L' + pts[0][0].toFixed(1) + ' ' + (h - pad) + ' Z';
+    var dots = pts.map(function (p, i) {
+      return '<circle class="dot" data-i="' + i + '" cx="' + p[0].toFixed(1) + '" cy="' + p[1].toFixed(1) + '" r="2.6"/>';
+    }).join('');
     var base = '<line class="axis" x1="' + pad + '" y1="' + (h - pad) + '" x2="' + (w - pad) + '" y2="' + (h - pad) + '"/>';
-    var guide = '<line class="guide" x1="0" y1="' + pad + '" x2="0" y2="' + (h - pad) + '"/>';
+    var guide = '<line class="guide" x1="0" y1="' + padTop + '" x2="0" y2="' + (h - pad) + '"/>';
+    // 水平网格线：0 / 25% / 50% / 75% / 100%
+    var grid = [0, 0.25, 0.5, 0.75, 1].map(function (f) {
+      var y = padTop + plotH * f;
+      return '<line class="grid" x1="' + pad + '" y1="' + y.toFixed(1) + '" x2="' + (w - pad) + '" y2="' + y.toFixed(1) + '"/>';
+    }).join('');
+    // Y 轴刻度：峰值与 0
+    var yLabels = '<text class="lbl ylab" x="' + (pad - 7) + '" y="' + (padTop + 4) + '" text-anchor="end">' + esc(String(max)) + '</text>' +
+      '<text class="lbl ylab" x="' + (pad - 7) + '" y="' + (h - pad + 3) + '" text-anchor="end">0</text>';
+    var uid = 'abGrad-' + metric;
     // 时间轴刻度：约 6 个（首尾必含），格式 M/D
     var tickEvery = Math.max(1, Math.ceil(n / 6));
     var ticks = [];
@@ -1070,13 +1271,20 @@
       return '<span class="tick" style="left:' + (pts[i][0] / w * 100).toFixed(2) + '%">' + esc(days[i].date.slice(5).replace('-', '/')) + '</span>';
     }).join('');
     return '<div class="ab-chart-box" data-metric="' + metric + '">' +
-      '<svg class="ab-chart" viewBox="0 0 ' + w + ' ' + h + '" preserveAspectRatio="none">' + base + guide +
-      '<path class="line" d="' + path + '"/>' + dots + '</svg>' +
+      '<svg class="ab-chart" viewBox="0 0 ' + w + ' ' + h + '" preserveAspectRatio="none">' +
+      '<defs><linearGradient id="' + uid + '" x1="0" y1="0" x2="0" y2="1">' +
+        '<stop offset="0%" stop-color="var(--ab-primary)" stop-opacity="0.32"/>' +
+        '<stop offset="70%" stop-color="var(--ab-primary)" stop-opacity="0.06"/>' +
+        '<stop offset="100%" stop-color="var(--ab-primary)" stop-opacity="0"/>' +
+      '</linearGradient></defs>' +
+      grid + base + yLabels +
+      '<path class="area" d="' + area + '" fill="url(#' + uid + ')"/>' +
+      '<path class="line" d="' + line + '"/>' + guide + dots +
+      '</svg>' +
       '<div class="ab-axis">' + axisHtml + '</div>' +
       '<div class="ab-chart-tip"></div>' +
     '</div>';
   }
-
   /* 趋势图交互：悬停实时预览 + 点击固定浮层（时间 · 访问 · 评论） */
   function bindTrendCharts(content) {
     var W = 520, H = 200, PAD = 28;
@@ -1191,17 +1399,50 @@
       return '<div class="ab-stat"><span class="ab-stat-ico">' + icon(c.icon, 17) + '</span><span class="ab-stat-num' + (c.small ? ' small' : '') + '">' + esc(String(c.value)) + '</span><span class="ab-stat-label">' + esc(c.label) + '</span></div>';
     }).join('');
   }
+  function analyticsSparkline(trend) {
+    var points = Array.isArray(trend) ? trend : [];
+    if (points.length < 2) return '<span class="ab-muted">—</span>';
+    var values = points.map(function (p) { return Number(p.views) || 0; });
+    var max = Math.max.apply(Math, values.concat([1]));
+    var w = 96, h = 26;
+    var coords = values.map(function (v, i) {
+      var x = (i / (values.length - 1)) * w;
+      var y = h - (v / max) * (h - 4) - 2;
+      return x.toFixed(1) + ',' + y.toFixed(1);
+    }).join(' ');
+    return '<svg class="ab-sparkline" viewBox="0 0 ' + w + ' ' + h + '" preserveAspectRatio="none" aria-hidden="true"><polyline points="' + coords + '"></polyline></svg>';
+  }
+  function exportAnalyticsCsv(content) {
+    var items = (content && content.__analyticsItems) || [];
+    if (!items.length) return;
+    var header = ['id', 'title', 'status', 'date', 'views', 'likes', 'comments', 'score'];
+    var lines = [header.join(',')];
+    items.forEach(function (p) {
+      lines.push(header.map(function (key) {
+        var val = p[key] == null ? '' : String(p[key]);
+        return '"' + val.replace(/"/g, '""') + '"';
+      }).join(','));
+    });
+    var blob = new Blob(['\ufeff' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8' });
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'post-analytics-' + new Date().toISOString().slice(0, 10) + '.csv';
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(function () { URL.revokeObjectURL(a.href); if (a.remove) a.remove(); }, 0);
+    toast(t('admin.analytics.exported'), 'ok');
+  }
   function renderAnalyticsTable(items) {
     var body = document.querySelector('#abAnalyticsBody');
     if (!body) return;
     if (!items || !items.length) {
-      body.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:30px" class="ab-muted">' + t('admin.analytics.empty') + '</td></tr>';
+      body.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:30px" class="ab-muted">' + t('admin.analytics.empty') + '</td></tr>';
       return;
     }
     body.innerHTML = items.map(function (p) {
       var status = p.status === 'draft' ? t('admin.dashboard.drafts') : (p.status === 'scheduled' ? t('admin.dashboard.scheduled') : '');
       return '<tr><td><a class="ab-post-title" data-link="/admin/posts/' + enc(p.id) + '/edit">' + esc(p.title || t('admin.dashboard.noTitle')) + '</a>' + (status ? ' <span class="ab-chip">' + esc(status) + '</span>' : '') + '</td>'
-        + '<td>' + (Number(p.views) || 0) + '</td><td>' + (Number(p.likes) || 0) + '</td><td>' + (Number(p.comments) || 0) + '</td><td><b class="ab-analytics-score">' + (Number(p.score) || 0) + '</b></td></tr>';
+        + '<td>' + (Number(p.views) || 0) + '</td><td>' + (Number(p.likes) || 0) + '</td><td>' + (Number(p.comments) || 0) + '</td><td><b class="ab-analytics-score">' + (Number(p.score) || 0) + '</b></td><td class="ab-td-trend">' + analyticsSparkline(p.trend) + '</td></tr>';
     }).join('');
     body.querySelectorAll('[data-link]').forEach(function (a) {
       a.addEventListener('click', function (e) { e.preventDefault(); go(a.getAttribute('data-link')); });
@@ -1209,7 +1450,7 @@
   }
   async function loadAnalytics(content, range) {
     var body = content.querySelector('#abAnalyticsBody');
-    if (body) body.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:30px"><span class="ab-spin"></span> ' + t('admin.postList.loading') + '</td></tr>';
+    if (body) body.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:30px"><span class="ab-spin"></span> ' + t('admin.postList.loading') + '</td></tr>';
     var data = null;
     if (cloudOn()) {
       try { data = await api('api/admin/post-analytics?range=' + encodeURIComponent(range || 'all')); } catch (e) {}
@@ -1217,14 +1458,18 @@
     if (!data) {
       try { data = localPostAnalytics(await listPosts()); } catch (e) { data = { summary: {}, items: [] }; }
     }
+    content.__analyticsItems = data.items || [];
     renderAnalyticsSummary(data.summary || {}, data.items || []);
     renderAnalyticsTable(data.items || []);
   }
   function pageAnalytics(content) {
     content.innerHTML = '<div class="ab-page-head"><div><h1 class="ab-page-title">' + t('admin.analytics.title') + '</h1><p class="ab-page-sub">' + t('admin.analytics.desc') + '</p></div></div>'
       + (cloudOn() ? '<div class="ab-analytics-tabs"><button class="ab-btn sm active" data-analytics-range="all">' + t('admin.analytics.all') + '</button><button class="ab-btn sm" data-analytics-range="30">' + t('admin.analytics.last30') + '</button><button class="ab-btn sm" data-analytics-range="7">' + t('admin.analytics.last7') + '</button></div>' : '')
+      + '<div class="ab-row" style="justify-content:flex-end;margin-bottom:10px"><button class="ab-btn sm" id="abAnalyticsExport">' + icon('download', 13) + ' ' + t('admin.analytics.exportCsv') + '</button></div>'
       + '<div class="ab-grid cols-4" id="abAnalyticsSummary"></div>'
-      + '<div class="ab-card"><div class="ab-table-wrap"><table class="ab-table"><thead><tr><th>' + t('admin.analytics.colTitle') + '</th><th>' + t('admin.analytics.colViews') + '</th><th>' + t('admin.analytics.colLikes') + '</th><th>' + t('admin.analytics.colComments') + '</th><th>' + t('admin.analytics.colScore') + '</th></tr></thead><tbody id="abAnalyticsBody"></tbody></table></div></div>';
+      + '<div class="ab-card"><div class="ab-table-wrap"><table class="ab-table"><thead><tr><th>' + t('admin.analytics.colTitle') + '</th><th>' + t('admin.analytics.colViews') + '</th><th>' + t('admin.analytics.colLikes') + '</th><th>' + t('admin.analytics.colComments') + '</th><th>' + t('admin.analytics.colScore') + '</th><th>' + t('admin.analytics.colTrend') + '</th></tr></thead><tbody id="abAnalyticsBody"></tbody></table></div></div>';
+    var exportBtn = content.querySelector('#abAnalyticsExport');
+    if (exportBtn) exportBtn.addEventListener('click', function () { exportAnalyticsCsv(content); });
     content.querySelectorAll('[data-analytics-range]').forEach(function (btn) {
       btn.addEventListener('click', function () {
         content.querySelectorAll('[data-analytics-range]').forEach(function (b) { b.classList.remove('active'); });
@@ -1243,11 +1488,19 @@
         '<div class="ab-search"><input class="ab-input" id="abPostKw" placeholder="' + t('admin.postList.search') + '"></div>' +
         '<select class="ab-select" id="abPostStatus" style="max-width:160px"><option value="all">' + t('admin.postList.allStatus') + '</option><option value="published">' + t('admin.dashboard.published') + '</option><option value="scheduled">' + t('admin.dashboard.scheduled') + '</option><option value="draft">' + t('admin.dashboard.drafts') + '</option></select>' +
       '</div>' +
+      '<div class="ab-bulk" id="abPostBulk" style="display:none"><span class="ab-muted" id="abPostSelInfo"></span>' +
+        '<button class="ab-btn sm" id="abPostPinOn">' + icon('pin', 13) + ' ' + t('admin.postList.bulkPinOn') + '</button>' +
+        '<button class="ab-btn sm" id="abPostPinOff">' + icon('pin', 13) + ' ' + t('admin.postList.bulkPinOff') + '</button>' +
+        '<button class="ab-btn sm danger" id="abPostDel">' + icon('trash', 13) + ' ' + t('admin.postList.bulkDelete') + '</button></div>' +
       '<div class="ab-table-wrap"><table class="ab-table"><thead><tr>' +
+        '<th class="col-check"><input type="checkbox" id="abPostAll" aria-label="' + t('admin.postList.selectPage') + '"></th>' +
         '<th>' + t('admin.postList.colTitle') + '</th><th>' + t('admin.postList.colTags') + '</th><th>' + t('admin.postList.colDate') + '</th><th>' + t('admin.postList.colStatus') + '</th><th class="col-actions">' + t('admin.postList.colActions') + '</th>' +
       '</tr></thead><tbody id="abPostBody"></tbody></table></div>' +
       '<div class="ab-pagination" id="abPostPage"></div>';
 
+    content.querySelector('#abPostPinOn').addEventListener('click', function () { bulkPinPosts(content, true); });
+    content.querySelector('#abPostPinOff').addEventListener('click', function () { bulkPinPosts(content, false); });
+    content.querySelector('#abPostDel').addEventListener('click', function () { bulkDeletePosts(content); });
     bindPosts(content);
     loadPosts(content, 1);
     // 绑定内容区内的导航链接（如「写新文章」按钮），bindShell 仅绑定挂载时已有的元素
@@ -1262,19 +1515,93 @@
     function refilter() { loadPosts(content, 1); }
     kw.addEventListener('input', debounce(refilter, 250));
     st.addEventListener('change', refilter);
+    var all = content.querySelector('#abPostAll');
+    if (all) all.addEventListener('change', function () {
+      var on = all.checked;
+      content.querySelectorAll('#abPostBody [data-pick]').forEach(function (cb) {
+        var id = dec(cb.getAttribute('data-pick'));
+        if (on) postSel[id] = true; else delete postSel[id];
+        cb.checked = on;
+      });
+      syncPostSelection(content);
+    });
+  }
+  /** 文章列表多选状态（跨页保留，按 id 记录） */
+  var postSel = {};
+  function syncPostSelection(content) {
+    var ids = Object.keys(postSel);
+    var bar = content.querySelector('#abPostBulk');
+    var info = content.querySelector('#abPostSelInfo');
+    if (bar) bar.style.display = ids.length ? 'flex' : 'none';
+    if (info) info.textContent = t('admin.postList.bulkSelected', { n: ids.length });
+  }
+  async function bulkPinPosts(content, pinned) {
+    var ids = Object.keys(postSel);
+    if (!ids.length) return;
+    var ok = 0;
+    for (var i = 0; i < ids.length; i++) {
+      try {
+        var post = await getPost(ids[i]);
+        if (!post) continue;
+        post.pinned = pinned;
+        if (cloudOn()) await api('api/posts/' + enc(ids[i]), { method: 'PUT', body: JSON.stringify(post) });
+        else saveStaticPost(post);
+        ok++;
+      } catch (e) {}
+    }
+    if (!cloudOn() && ok) downloadPostsJs();
+    toast(pinned ? t('admin.postList.bulkPinned', { n: ok }) : t('admin.postList.bulkUnpinned', { n: ok }), ok ? 'ok' : 'err');
+    postSel = {};
+    loadPosts(content, 1);
+  }
+  async function bulkDeletePosts(content) {
+    var ids = Object.keys(postSel);
+    if (!ids.length) return;
+    confirmModal(t('admin.postList.bulkDelete'), '<p class="ab-muted">' + t('admin.postList.bulkDeleteConfirm', { n: ids.length }) + '</p>', async function () {
+      var ok = 0;
+      for (var i = 0; i < ids.length; i++) {
+        try { await deletePost(ids[i]); if (window.syncDeletedPost) window.syncDeletedPost(ids[i]); ok++; } catch (e) {}
+      }
+      toast(t('admin.postList.bulkDeleted', { n: ok }), ok ? 'ok' : 'err');
+      postSel = {};
+      loadPosts(content, 1);
+    }, t('admin.comments.delete'));
   }
   function debounce(fn, ms) { var t; return function () { clearTimeout(t); t = setTimeout(fn, ms); }; }
 
+  /* 文章列表分页（纯函数，便于单测）：serverTotal>0 表示云端服务端分页，
+   * posts 已是当前页、不能再切；serverTotal=0 表示静态模式，需对完整列表本地切片。 */
+  function paginatePosts(posts, page, per, serverTotal) {
+    var list = Array.isArray(posts) ? posts : [];
+    var size = Math.max(1, Math.floor(Number(per) || 10));
+    var total = Math.max(0, Math.floor(Number(serverTotal) || 0));
+    var totalPages = total > 0 ? Math.max(1, Math.ceil(total / size)) : Math.max(1, Math.ceil(list.length / size));
+    var current = Math.min(Math.max(1, Math.floor(Number(page) || 1)), totalPages);
+    var slice = total > 0 ? list : list.slice((current - 1) * size, current * size);
+    return { slice: slice, page: current, totalPages: totalPages };
+  }
   async function loadPosts(content, page, silent) {
     var body = content.querySelector('#abPostBody');
     // silent：删除/审核后的静默校准刷新，不打断当前视图（不闪加载行）
-    if (!silent) body.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:30px"><span class="ab-spin"></span> ' + t('admin.postList.loading') + '</td></tr>';
+    if (!silent) body.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:30px"><span class="ab-spin"></span> ' + t('admin.postList.loading') + '</td></tr>';
     var posts = [];
-    try { posts = await listPosts(); } catch (e) { body.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:30px" class="ab-muted">' + t('admin.postList.loadFail') + esc(e.message || e) + '</td></tr>'; return; }
-
-    var kw = content.querySelector('#abPostKw').value.trim().toLowerCase();
+    var serverTotal = 0;   // 云端服务端分页返回的总条数；静态模式保持 0
+    var kwRaw = content.querySelector('#abPostKw').value.trim();
+    var kw = kwRaw.toLowerCase();
     var st = content.querySelector('#abPostStatus').value;
-
+    if (cloudOn()) {
+      // 云端：直接走服务端分页接口（关键字 / 状态过滤 + 只取当前页），不再先拉全量再本地切片
+      try {
+        var sd = await api('api/posts?q=' + encodeURIComponent(kwRaw) + '&status=' + encodeURIComponent(st) + '&page=' + page + '&per=10');
+        posts = (sd && sd.posts) || [];
+        serverTotal = Number(sd && sd.total) || 0;
+      } catch (e) {
+        body.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:30px" class="ab-muted">' + t('admin.postList.loadFail') + esc(e.message || e) + '</td></tr>';
+        return;
+      }
+    } else {
+      try { posts = await listPosts(); } catch (e) { body.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:30px" class="ab-muted">' + t('admin.postList.loadFail') + esc(e.message || e) + '</td></tr>'; return; }
+    }
     var filtered = posts.filter(function (p) {
       if (st !== 'all' && (p.status || 'published') !== st) return false;
       if (kw) {
@@ -1286,13 +1613,14 @@
     filtered.sort(function (a, b) { return (b.date || '').localeCompare(a.date || ''); });
 
     if (!filtered.length) {
-      body.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:34px" class="ab-muted">' + t('admin.postList.noMatch') + '</td></tr>';
+      body.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:34px" class="ab-muted">' + t('admin.postList.noMatch') + '</td></tr>';
       content.querySelector('#abPostPage').innerHTML = '';
       return;
     }
-    var per = 10, totalPages = Math.max(1, Math.ceil(filtered.length / per));
-    page = Math.min(page, totalPages);
-    var slice = filtered.slice((page - 1) * per, page * per);
+    var paged = paginatePosts(filtered, page, 10, serverTotal);
+    page = paged.page;
+    var totalPages = paged.totalPages;
+    var slice = paged.slice;
     body.innerHTML = slice.map(function (p) {
       var id = p.id;
       var statusBadge = '';
@@ -1300,7 +1628,8 @@
       if (postStatus === 'scheduled') statusBadge = '<span class="ab-status scheduled">' + icon('clock', 11) + ' ' + t('admin.dashboard.scheduled') + (p.publishAt ? ' · ' + esc(fmtTimestamp(p.publishAt)) : '') + '</span>';
       else if (p.pinned) statusBadge = '<span class="ab-status published">' + icon('pin', 11) + ' ' + t('admin.postList.pin') + '</span>';
       else statusBadge = '<span class="ab-status ' + (postStatus === 'draft' ? 'draft' : 'published') + '">' + (postStatus === 'draft' ? t('admin.dashboard.drafts') : t('admin.dashboard.published')) + '</span>';
-      return '<tr>' +
+      return '<tr' + (postSel[id] ? ' class="selected"' : '') + '>' +
+        '<td class="col-check"><input type="checkbox" data-pick="' + enc(id) + '"' + (postSel[id] ? ' checked' : '') + ' aria-label="' + t('admin.postList.selectPage') + '"></td>' +
         '<td><a class="ab-post-title" data-link="/admin/posts/' + enc(id) + '/edit">' + esc(p.title || t('admin.dashboard.noTitle')) + '</a>' + (p.series ? ' <span class="ab-chip">' + icon('list', 11) + ' ' + esc(p.series) + (p.seriesOrder ? ' #' + esc(String(p.seriesOrder)) : '') + '</span>' : '') + '</td>' +
         '<td class="ab-td-tags">' + (p.tags && p.tags.length ? '<div class="ab-tag-row">' + p.tags.map(function (t) { return '<span class="ab-chip">' + esc(t) + '</span>'; }).join('') + '</div>' : '<span class="ab-muted">—</span>') + '</td>' +
         '<td class="ab-td-date">' + esc(fmtPostDate(p.date)) + '</td>' +
@@ -1358,6 +1687,22 @@
       }, t('admin.comments.delete'));
     }); });
 
+    body.querySelectorAll('[data-pick]').forEach(function (cb) {
+      cb.addEventListener('change', function () {
+        var id = dec(cb.getAttribute('data-pick'));
+        if (cb.checked) postSel[id] = true; else delete postSel[id];
+        var card = cb.closest('tr');
+        if (card) card.classList.toggle('selected', cb.checked);
+        var allBox = content.querySelector('#abPostAll');
+        var boxes = body.querySelectorAll('[data-pick]');
+        if (allBox) allBox.checked = boxes.length > 0 && Array.prototype.every.call(boxes, function (x) { return x.checked; });
+        syncPostSelection(content);
+      });
+    });
+    var allBox0 = content.querySelector('#abPostAll');
+    if (allBox0) allBox0.checked = false;
+    syncPostSelection(content);
+
     var pg = content.querySelector('#abPostPage');
     var html = '';
     if (page > 1) html += '<button class="ab-page-btn" data-p="' + (page - 1) + '">' + t('pagination.prev') + '</button>';
@@ -1399,6 +1744,34 @@
       } catch (e) { transferAnchorDownload(name, blob); return; }
     }
     transferAnchorDownload(name, blob);
+  }
+  /** 在「用户点击手势仍然有效」时先弹出另存为对话框，返回 Promise<FileSystemFileHandle>。
+   *  浏览器要求 showSaveFilePicker 必须在用户手势内调用；而导出过程是异步的（要抓资源、等接口），
+   *  等到打包完再调用会因丢失手势被浏览器拒绝，于是只剩下载没有「保存位置」这一步。 */
+  function transferPickSaveHandle(name) {
+    try {
+      if (typeof window.showSaveFilePicker !== 'function') return null;
+      return window.showSaveFilePicker({ suggestedName: name });
+    } catch (e) { return null; }
+  }
+  /** 把内容写入先前选定的位置；没有选过 / 被取消 / 权限不足时回退到默认下载目录。
+   *  返回 'saved' | 'cancelled' | 'downloaded' */
+  async function transferSaveAs(handlePromise, name, blob) {
+    var handle = null;
+    if (handlePromise) { try { handle = await handlePromise; } catch (e) { handle = null; } }
+    if (handle) {
+      try {
+        var writable = await handle.createWritable();
+        await writable.write(blob);
+        await writable.close();
+        return 'saved';
+      } catch (e) { /* 写入失败则回退到默认下载目录 */ }
+    } else if (handlePromise) {
+      // 用户主动取消「另存为」：尊重取消，不再偷偷下载
+      return 'cancelled';
+    }
+    transferAnchorDownload(name, blob);
+    return 'downloaded';
   }
   function transferDownloadText(name, text, type) {
     transferDownload(name, new Blob([String(text || '')], { type: type || 'text/plain;charset=utf-8' }));
@@ -1566,6 +1939,7 @@
   function transferU16(n) { return [n & 0xFF, (n >>> 8) & 0xFF]; }
   function transferU32(n) { return [n & 0xFF, (n >>> 8) & 0xFF, (n >>> 16) & 0xFF, (n >>> 24) & 0xFF]; }
   function transferBytes(text) {
+    if (text instanceof Uint8Array) return text;   // 二进制资源直接透传
     if (typeof TextEncoder !== 'undefined') return new TextEncoder().encode(String(text || ''));
     var out = [];
     var s = unescape(encodeURIComponent(String(text || '')));
@@ -1592,7 +1966,7 @@
     var dt = transferDosTime(new Date());
     (files || []).forEach(function (file) {
       var name = transferBytes(file.name);
-      var data = transferBytes(file.text || '');
+      var data = file.data instanceof Uint8Array ? file.data : transferBytes(file.text || '');
       var crc = transferCrc32(data);
       var localHead = transferConcat([
         new Uint8Array([0x50, 0x4B, 0x03, 0x04]), new Uint8Array(transferU16(20)),
@@ -1638,6 +2012,121 @@
     files.push({ name: 'posts.json', text: transferBackupJson(posts) });
     return transferZip(files);
   }
+  /* ----------------------- 导出静态站（一键打包可部署的纯静态版本） ----------------------- */
+  /** 相对化模板里的资源链接：嵌套目录页面（posts/x/）需要 ../ 前缀 */
+  function staticRebase(html, base) {
+    if (!base) return html;
+    return html.replace(/(href|src)="(?!https?:|\/\/|data:|#)([^"]*)"/g, function (m, attr, val) {
+      var clean = val.charAt(0) === '/' ? val.slice(1) : val;
+      return attr + '="' + base + clean + '"';
+    });
+  }
+  /** 基于 index.html 模板生成某一页（替换标题/描述/canonical/#app 内容，去掉 Service Worker） */
+  function staticPageFromTemplate(tpl, o) {
+    var out = String(tpl || '');
+    out = out.replace(/<title>[\s\S]*?<\/title>/, '<title>' + esc(o.title || '') + '</title>');
+    out = out.replace(/<meta name="description" content="[^"]*">/, '<meta name="description" content="' + esc(o.desc || '') + '">');
+    out = out.replace(/<link rel="canonical" href="[^"]*">/, '<link rel="canonical" href="' + esc(o.canonical || '') + '">');
+    if (o.noindex) out = out.replace(/<\/head>/, '<meta name="robots" content="noindex, nofollow">' + '\n' + '</head>');
+    var start = out.indexOf('<div id="app">');
+    var appScript = out.indexOf('<script defer src="app.min.js', start);
+    if (start >= 0 && appScript > start) {
+      out = out.slice(0, start + '<div id="app">'.length) + (o.app || '') + '\n' + out.slice(appScript);
+    }
+    out = out.replace(/<script>[\s\S]*?navigator\.serviceWorker[\s\S]*?<\/script>/, '');
+    return staticRebase(out, o.base || '');
+  }
+  function staticPostDir(id) { return /[\\/]/.test(String(id)) ? encodeURIComponent(id) : String(id); }
+  async function exportStaticSite(content, button) {
+    var status = content ? content.querySelector('#abIeStatus') : null;
+    var old = button ? button.innerHTML : '';
+    // 必须在用户手势内同步弹出「另存为」，否则打包结束再调会被浏览器拒绝（只剩下载、没有保存位置）
+    var suggestedName = 'qingyu-static-site-' + transferStamp() + '.zip';
+    var cached = (content && content.__iePosts) || null;
+    var lookEmpty = cached ? cached.filter(function (p) { return (p.status || 'published') === 'published'; }).length === 0 : false;
+    var saveHandle = lookEmpty ? null : transferPickSaveHandle(suggestedName);
+
+    if (button) { button.disabled = true; button.innerHTML = icon('spinner', 12) + ' ' + t('admin.transfer.exporting'); }
+    try {
+      var all = cached || await listFullPosts();
+      var posts = (all || []).filter(function (p) { return (p.status || 'published') === 'published'; });
+      if (!posts.length) { toast(t('admin.staticExport.empty'), 'err'); return; }
+      if (status) status.textContent = t('admin.staticExport.building');
+      var cfg = window.getConfig ? window.getConfig() : (window.BLOG_CONFIG || {});
+      var siteUrl = String(cfg.siteUrl || location.origin + '/').replace(/\/+$/, '/');
+      var siteName = window.getSiteName ? window.getSiteName() : (document.title || 'Blog');
+      var siteDesc = (cfg.site && cfg.site.desc) || '';
+      var files = [];
+      // ① 静态数据（只导出已发布文章；加密文章只带密文）
+      var data = posts.map(function (p) {
+        return { id: p.id, title: p.title, date: p.date, excerpt: p.excerpt || '',
+          content: p.enc ? '' : (p.content || ''), cover: p.cover || '', ogImage: p.ogImage || '',
+          pinned: !!p.pinned, protected: !!p.protected, enc: p.enc || null, tags: p.tags || [],
+          category: p.category || '', series: p.series || '', seriesOrder: Number(p.seriesOrder) || 0,
+          status: 'published', seo: p.seo || {} };
+      });
+      files.push({ name: 'posts.min.js', text: 'window.BLOG_POSTS = ' + JSON.stringify(data) + ';\n' });
+      files.push({ name: 'config.min.js', text: 'window.BLOG_CONFIG = ' + JSON.stringify({ mode: 'static', apiBase: '', siteUrl: String(cfg.siteUrl || ''), writeToken: '', adminPwd: '', pageSize: 0, ads: {} }) + ';\n' });
+      // ② 复制静态资源（清单见 public/static-export.json）
+      var manifest = [];
+      try { manifest = await (await fetch('static-export.json', { cache: 'no-store' })).json(); } catch (e) { manifest = []; }
+      for (var i = 0; i < manifest.length; i++) {
+        if (status) status.textContent = t('admin.staticExport.progress', { done: i + 1, total: manifest.length });
+        try {
+          var buf = await (await fetch(manifest[i], { cache: 'no-store' })).arrayBuffer();
+          files.push({ name: manifest[i], data: new Uint8Array(buf) });
+        } catch (e) { /* 单个资源缺失不阻塞导出 */ }
+      }
+      // ③ 页面（每个路由独立 index.html → 任意静态托管都无需重写规则）
+      var tpl = await (await fetch('index.html', { cache: 'no-store' })).text();
+      var homeApp = window.renderNav('/') + '<main class="container page-fade"><div class="list-head"><h2 class="page-title">' + t('home.latest') + '</h2></div><div id="listContainer" class="list-nopager">' + window.renderCardList(data, {}, false) + '</div></main>' + window.renderFooter();
+      files.push({ name: 'index.html', text: staticPageFromTemplate(tpl, { title: siteName + ' · ' + t('site.subtitle'), desc: siteDesc, canonical: siteUrl, app: homeApp, base: '' }) });
+      data.forEach(function (p) {
+        var body = p.enc ? '' : window.renderMarkdown(p.content || '');
+        var toc = window.buildToc(body).html;
+        var tags = (p.tags || []).map(function (x) { return '<span>' + esc(x) + '</span>'; }).join('');
+        var art = '<div class="post-body"><div class="post-header"><h1>' + esc(p.title || '') + '</h1><div class="meta"><span class="meta-date">' + esc(p.date || '') + '</span></div></div>' + toc + '<article class="article">' + body + '</article><div class="article-footer"><div class="af-tags">' + tags + '</div></div></div>';
+        var appHtml = window.renderNav('/posts/' + encodeURIComponent(p.id) + '/') + '<main class="container page-fade">' + art + '</main>' + window.renderFooter();
+        var seo = p.seo || {};
+        files.push({ name: 'posts/' + staticPostDir(p.id) + '/index.html', text: staticPageFromTemplate(tpl, {
+          title: seo.title || ((p.title || '') + ' · ' + siteName),
+          desc: seo.desc || p.excerpt || '',
+          canonical: seo.canonical || (siteUrl + 'posts/' + encodeURIComponent(p.id) + '/'),
+          app: appHtml, base: '../../', noindex: !!seo.noindex
+        }) });
+      });
+      var simple = [
+        { dir: 'archive', fn: 'renderArchive', title: t('archive.title') },
+        { dir: 'tags', fn: 'renderTags', title: t('tags.title') },
+        { dir: 'categories', fn: 'renderCategories', title: t('categories.title') },
+        { dir: 'links', fn: 'renderLinks', title: t('links.title') },
+        { dir: 'about', fn: 'renderAbout', title: t('about.title') }
+      ];
+      simple.forEach(function (sp) {
+        var appHtml = '';
+        try { if (typeof window[sp.fn] === 'function') appHtml = window[sp.fn](); } catch (e) { appHtml = ''; }
+        files.push({ name: sp.dir + '/index.html', text: staticPageFromTemplate(tpl, { title: sp.title + ' · ' + siteName, desc: sp.title + ' - ' + siteDesc, canonical: siteUrl + sp.dir + '/', app: appHtml, base: '../' }) });
+      });
+      ['series', 'history', 'popular', 'guestbook', 'subscribe'].forEach(function (dir) {
+        files.push({ name: dir + '/index.html', text: staticPageFromTemplate(tpl, { title: siteName, desc: siteDesc, canonical: siteUrl + dir + '/', app: '', base: '../' }) });
+      });
+      var notFoundApp = window.renderNav('/') + '<main class="container page-fade"><div class="empty"><div class="big">' + svgIcon('question', 36) + '</div><p>' + t('post.notFound') + '</p><p><a href="' + esc(window.href ? window.href('/') : '/') + '">' + t('post.backHome') + '</a></p></div></main>' + window.renderFooter();
+      files.push({ name: '404.html', text: staticPageFromTemplate(tpl, { title: '404 · ' + siteName, desc: '', app: notFoundApp, base: '', noindex: true }) });
+      // ④ RSS / Sitemap / 说明
+      try { if (window.buildSitemapClient) files.push({ name: 'sitemap.xml', text: window.buildSitemapClient() }); } catch (e) {}
+      try { if (window.buildFeedXmlClient) files.push({ name: 'feed.xml', text: window.buildFeedXmlClient(data, 20) }); } catch (e) {}
+      files.push({ name: 'README-静态站说明.txt', text: t('admin.staticExport.readme', { site: siteName, count: data.length }) });
+      var outcome = await transferSaveAs(saveHandle, suggestedName, transferZip(files));
+      if (outcome === 'cancelled') toast(t('admin.staticExport.cancelled'));
+      else toast(t('admin.staticExport.done', { count: data.length, files: files.length }), 'ok');
+    } catch (e) {
+      toast(t('admin.staticExport.fail') + (e.message || e), 'err');
+    } finally {
+      if (button) { button.disabled = false; button.innerHTML = old; }
+      if (status) status.textContent = '';
+    }
+  }
+
   async function transferExportOne(id, button, content) {
     var old = button ? button.innerHTML : '';
     if (button) { button.disabled = true; button.innerHTML = icon('spinner', 12) + ' ' + t('admin.transfer.exporting'); }
@@ -1778,6 +2267,9 @@
           '<p class="ab-muted" style="line-height:1.7;margin:10px 0 14px">' + t('admin.transfer.exportHint') + '</p>' +
           '<div class="ab-row" style="gap:8px;flex-wrap:wrap"><button class="ab-btn" id="abIeExportAll" disabled>' + icon('download', 14) + ' ' + t('admin.transfer.exportAll') + '</button>' +
           '<button class="ab-btn" id="abIeExportBackup" disabled>' + icon('save', 14) + ' ' + t('admin.transfer.exportBackup') + '</button></div></div>' +
+        '<div class="ab-card"><div class="ab-section-title">' + icon('cloud', 16) + ' ' + t('admin.staticExport.title') + '</div>' +
+          '<p class="ab-muted" style="line-height:1.7;margin:10px 0 14px">' + t('admin.staticExport.hint') + '</p>' +
+          '<button class="ab-btn" id="abIeExportStatic" disabled>' + icon('download', 14) + ' ' + t('admin.staticExport.button') + '</button></div>' +
         '<div class="ab-card"><div class="ab-section-title">' + icon('upload', 16) + ' ' + t('admin.transfer.importTitle') + '</div>' +
           '<p class="ab-muted" style="line-height:1.7;margin:10px 0 14px">' + t('admin.transfer.importHint') + '</p>' +
           '<p class="ab-hint" id="abIeStatus" style="min-height:18px;margin:0"></p></div>' +
@@ -1802,6 +2294,8 @@
     folderInput.addEventListener('change', function () { transferImportFiles(folderInput.files, content); });
     content.querySelector('#abIeExportAll').addEventListener('click', function () { transferExportPosts(content, null); });
     content.querySelector('#abIeExportBackup').addEventListener('click', function () { transferExportBackup(content); });
+    var staticBtn = content.querySelector('#abIeExportStatic');
+    if (staticBtn) staticBtn.addEventListener('click', function () { exportStaticSite(content, staticBtn); });
     var all = content.querySelector('#abIeSelectAll');
     all.addEventListener('change', function () {
       content.querySelectorAll('.ab-ie-check').forEach(function (cb) { cb.checked = all.checked; });
@@ -1821,11 +2315,11 @@
   }
   async function loadImportExport(content) {
     var body = content.querySelector('#abIeTableBody');
-    body.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:30px"><span class="ab-spin"></span> ' + t('admin.transfer.loading') + '</td></tr>';
+    body.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:30px"><span class="ab-spin"></span> ' + t('admin.transfer.loading') + '</td></tr>';
     var posts = [];
     try { posts = await listFullPosts(); content.__iePosts = posts; }
     catch (e) {
-      body.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:30px" class="ab-muted">' + t('admin.postList.loadFail') + esc(e.message || e) + '</td></tr>';
+      body.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:30px" class="ab-muted">' + t('admin.postList.loadFail') + esc(e.message || e) + '</td></tr>';
       return;
     }
     posts.sort(function (a, b) { return (b.date || '').localeCompare(a.date || ''); });
@@ -1854,7 +2348,7 @@
       var ids = Array.prototype.slice.call(content.querySelectorAll('.ab-ie-check')).filter(function (cb) { return cb.checked; }).map(function (cb) { return dec(cb.getAttribute('data-id')); });
       transferExportPosts(content, ids);
     };
-    ['#abIeExportAll', '#abIeExportBackup', '#abIeExportSelected'].forEach(function (sel) {
+    ['#abIeExportAll', '#abIeExportBackup', '#abIeExportStatic', '#abIeExportSelected'].forEach(function (sel) {
       var btn = content.querySelector(sel);
       if (btn) btn.disabled = false;
     });
@@ -1950,7 +2444,7 @@
     if (isReplace) {
       extraPaste = '<button type="button" class="ab-btn sm ghost" data-abai-use="paste">' + icon('download', 12) + ' ' + esc(t('ai.assist.pasteEnd')) + '</button>';
     }
-    return '<div class="ab-ai-result"><pre>' + esc(result) + '</pre>'
+    return '<div class="ab-ai-result"><div class="ab-ai-text">' + esc(result) + '</div>'
       + '<div class="ab-row" style="gap:8px;margin-top:8px;flex-wrap:wrap">'
       + '<button type="button" class="ab-btn sm primary" data-abai-use="' + useAct + '">' + esc(useLabel) + '</button>'
       + extraPaste
@@ -2160,21 +2654,115 @@
   }
 
   /* ====================== 编辑器 ====================== */
+  /* 文章访问密码：仅记在本机浏览器，便于站长日后查看/编辑已加密文章；
+   * 服务器只保存密文，无法解密，也就无法在服务端提供密码。 */
+  var POST_PWD_PREFIX = 'qingyu.postPwd.';
+  function rememberPostPwd(id, pwd) { try { if (id && pwd) localStorage.setItem(POST_PWD_PREFIX + id, String(pwd)); } catch (e) {} }
+  function readPostPwd(id) { try { return localStorage.getItem(POST_PWD_PREFIX + id) || ''; } catch (e) { return ''; } }
+  function forgetPostPwd(id) { try { if (id) localStorage.removeItem(POST_PWD_PREFIX + id); } catch (e) {} }
+  /* ---------- 编辑器本地草稿（自动保存 / 崩溃恢复） ----------
+   * 每 10 秒或输入停顿 1.5 秒自动存到 localStorage；保存成功后清除。
+   * 加密文章不落本地明文（避免把待加密正文写进浏览器存储）。 */
+  var EDITOR_DRAFT_PREFIX = 'qingyu.editorDraft.';
+  var _editorDraftTimer = null;
+  function editorDraftKey(id) { return String(id || '__new'); }
+  function readEditorDraft(id) {
+    try { var raw = localStorage.getItem(EDITOR_DRAFT_PREFIX + editorDraftKey(id)); if (!raw) return null; var d = JSON.parse(raw); return (d && d.data) ? d : null; } catch (e) { return null; }
+  }
+  function writeEditorDraft(id, data) { try { localStorage.setItem(EDITOR_DRAFT_PREFIX + editorDraftKey(id), JSON.stringify({ v: 1, savedAt: Date.now(), data: data })); } catch (e) {} }
+  function clearEditorDraft(id) { try { localStorage.removeItem(EDITOR_DRAFT_PREFIX + editorDraftKey(id)); } catch (e) {} }
+  function editorDraftEnabled(content) {
+    var prot = content.querySelector('#abProtected');
+    return !(prot && prot.checked);   // 加密文章不自动保存明文
+  }
+  function collectEditorDraft(content) {
+    return {
+      title: val(content, '#abTitle'), tags: val(content, '#abTags'), category: val(content, '#abCategory'),
+      series: val(content, '#abSeries'), seriesOrder: val(content, '#abSeriesOrder'), author: val(content, '#abAuthor'),
+      cover: val(content, '#abCover'), date: val(content, '#abDate'),
+      pinned: !!(content.querySelector('#abPinned') || {}).checked,
+      seoTitle: val(content, '#abSeoTitle'), seoDesc: val(content, '#abSeoDesc'),
+      seoCanonical: val(content, '#abSeoCanonical'), seoNoindex: !!(content.querySelector('#abSeoNoindex') || {}).checked,
+      body: val(content, '#abBody')
+    };
+  }
+  function setDraftHint(content, at) {
+    var el = content.querySelector('#abDraftHint');
+    if (!el) return;
+    el.textContent = at ? t('admin.editor.draftSavedAt', { time: fmtTimestamp(at) }) : '';
+  }
+  function autosaveEditorDraft(content, route) {
+    try {
+      if (!editorDraftEnabled(content)) { clearEditorDraft(route.id); setDraftHint(content, 0); return; }
+      var d = collectEditorDraft(content);
+      if (!d.title && !d.body) return;   // 空编辑器不产生草稿
+      writeEditorDraft(route.id, d);
+      setDraftHint(content, Date.now());
+    } catch (e) {}
+  }
+  function applyEditorDraft(content, data) {
+    var set = function (sel, v) { var el = content.querySelector(sel); if (el) el.value = v == null ? '' : v; };
+    set('#abTitle', data.title); set('#abTags', data.tags); set('#abCategory', data.category);
+    set('#abSeries', data.series); set('#abSeriesOrder', data.seriesOrder); set('#abAuthor', data.author);
+    set('#abCover', data.cover); set('#abDate', data.date); set('#abBody', data.body);
+    set('#abSeoTitle', data.seoTitle); set('#abSeoDesc', data.seoDesc); set('#abSeoCanonical', data.seoCanonical);
+    var ni = content.querySelector('#abSeoNoindex'); if (ni) ni.checked = !!data.seoNoindex;
+    var pin = content.querySelector('#abPinned'); if (pin) pin.checked = !!data.pinned;
+    try { updatePreview(content); updateEditorStats(content); } catch (e) {}
+  }
+  function renderDraftBar(content, route) {
+    var bar = content.querySelector('#abDraftBar');
+    if (!bar) return;
+    var d = readEditorDraft(route.id);
+    if (!d || !d.savedAt) { bar.innerHTML = ''; return; }
+    bar.innerHTML = '<div class="ab-card" style="margin-bottom:16px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">' +
+      '<span>' + icon('save', 14) + ' ' + esc(t('admin.editor.draftFound', { time: fmtTimestamp(d.savedAt) })) + '</span>' +
+      '<button class="ab-btn sm primary" id="abDraftRestore">' + t('admin.editor.draftRestore') + '</button>' +
+      '<button class="ab-btn sm ghost" id="abDraftDiscard">' + t('admin.editor.draftDiscard') + '</button></div>';
+    bar.querySelector('#abDraftRestore').addEventListener('click', function () {
+      applyEditorDraft(content, d.data);
+      bar.innerHTML = '';
+      toast(t('admin.editor.draftRestored'), 'ok');
+    });
+    bar.querySelector('#abDraftDiscard').addEventListener('click', function () {
+      clearEditorDraft(route.id);
+      bar.innerHTML = '';
+      setDraftHint(content, 0);
+      toast(t('admin.editor.draftDiscarded'), 'ok');
+    });
+  }
   function pageEditor(content, route) {
     content.innerHTML =
       '<div class="ab-page-head"><div><h1 class="ab-page-title">' + (route.isNew ? t('admin.editor.newPost') : t('admin.editor.editPost')) + '</h1><p class="ab-page-sub">' + t('editor.markdownHint') + '</p></div></div>' +
+      '<div id="abDraftBar"></div>' +
       '<div class="ab-editor-head">' +
         '<div class="ab-editor-meta">' +
           '<div class="ab-field ab-title-field" style="margin:0"><label class="ab-label" for="abTitle">' + t('admin.editor.titleLabel') + '</label><input class="ab-input" id="abTitle" placeholder="' + t('admin.editor.titlePlaceholder') + '" autocomplete="off"><label class="ab-hint">' + t('admin.editor.titleHint') + '</label></div>' +
           '<div class="ab-field" style="margin:0"><label class="ab-label">' + t('admin.editor.tagsPlaceholder') + '</label><input class="ab-input" id="abTags" placeholder="' + t('admin.editor.tagsExample') + '" autocomplete="off"></div>' +
+          '<div class="ab-field" style="margin:0"><label class="ab-label">' + t('admin.editor.category') + '</label><input class="ab-input" id="abCategory" list="abCategoryList" placeholder="' + t('admin.editor.categoryPh') + '" autocomplete="off"><datalist id="abCategoryList"></datalist></div>' +
+          '<div class="ab-field" style="margin:0"><label class="ab-label">' + t('admin.editor.author') + '</label><input class="ab-input" id="abAuthor" list="abAuthorList" placeholder="' + t('admin.editor.authorPh') + '" autocomplete="off"><datalist id="abAuthorList"></datalist></div>' +
           '<div class="ab-field" style="margin:0"><label class="ab-label">' + t('admin.editor.seriesLabel') + '</label><div class="ab-row"><input class="ab-input" id="abSeries" placeholder="' + t('admin.editor.seriesPlaceholder') + '" autocomplete="off"><input class="ab-input" id="abSeriesOrder" type="number" min="0" step="1" style="max-width:110px" placeholder="' + t('admin.editor.seriesOrder') + '"></div><label class="ab-hint">' + t('admin.editor.seriesHint') + '</label></div>' +
           '<div class="ab-field" style="margin:0"><label class="ab-label" for="abDate">' + t('admin.editor.dateLabel') + '</label><div class="ab-row"><input class="ab-input" id="abDate" type="datetime-local" step="60"><button class="ab-btn sm" id="abNow">' + t('admin.editor.setNow') + '</button></div><label class="ab-hint">' + t('admin.editor.dateHint') + '</label></div>' +
           (cloudOn() ? '<div class="ab-field" style="margin:0"><label class="ab-label" for="abSchedule">' + t('admin.editor.scheduleLabel') + '</label><input class="ab-input" id="abSchedule" type="datetime-local" step="60"><label class="ab-hint">' + t('admin.editor.scheduleHint') + '</label></div>' : '') +
         '</div>' +
         '<div class="ab-field" style="margin:0"><label class="ab-label">' + t('admin.editor.coverPlaceholder') + '</label><div class="ab-row"><input class="ab-input" id="abCover" placeholder="https://…"><button class="ab-btn sm" id="abPickCover">' + t('admin.editor.selectMedia') + '</button></div></div>' +
         '<div class="ab-field" style="margin:0"><label class="ab-label">' + t('admin.editor.ogLabel') + '</label><input type="hidden" id="abOgImage"><div class="ab-row" style="align-items:center;gap:10px;flex-wrap:wrap"><button class="ab-btn sm" id="abOgGenerate">' + icon('image', 13) + ' ' + t('admin.editor.ogGenerate') + '</button><label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer"><input type="checkbox" id="abOgAuto" checked> ' + t('admin.editor.ogAuto') + '</label></div><div id="abOgPreview" style="margin-top:8px"></div><label class="ab-hint">' + t('admin.editor.ogHint') + '</label></div>' +
+        '<div class="ab-field" style="margin:0"><label class="ab-label">' + t('admin.editor.seoLabel') + '</label>' +
+          '<div class="ab-row" style="gap:8px;flex-wrap:wrap"><input class="ab-input" id="abSeoTitle" placeholder="' + t('admin.editor.seoTitlePh') + '"><input class="ab-input" id="abSeoCanonical" placeholder="' + t('admin.editor.seoCanonicalPh') + '"></div>' +
+          '<textarea class="ab-textarea" id="abSeoDesc" style="min-height:60px;margin-top:8px" placeholder="' + t('admin.editor.seoDescPh') + '"></textarea>' +
+          '<label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;margin-top:8px"><input type="checkbox" id="abSeoNoindex"> ' + t('admin.editor.seoNoindex') + '</label>' +
+          '<label class="ab-hint">' + t('admin.editor.seoHint') + '</label></div>' +
         '<div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap;margin:0">' +
           '<label style="display:flex;align-items:center;gap:6px;font-size:14px;cursor:pointer"><input type="checkbox" id="abPinned"> ' + icon('pin', 14) + ' ' + t('admin.editor.pin') + '</label>' +
+          '<label style="display:flex;align-items:center;gap:6px;font-size:14px;cursor:pointer"><input type="checkbox" id="abProtected"> ' + icon('lock', 14) + ' ' + t('admin.editor.protect') + '</label>' +
+        '</div>' +
+        '<div class="ab-field" style="margin:0">' +
+          '<div class="ab-row" id="abProtectRow" style="display:none;align-items:center;gap:8px;flex-wrap:wrap">' +
+            '<input class="ab-input" id="abProtectPwd" type="password" autocomplete="new-password" maxlength="64" placeholder="' + t('admin.editor.protectPwdPh') + '" style="max-width:280px">' +
+            '<button type="button" class="ab-btn sm" id="abProtectShow">' + t('admin.editor.protectShow') + '</button>' +
+            '<button type="button" class="ab-btn sm" id="abProtectUnlock" style="display:none">' + icon('lock', 13) + ' ' + t('admin.editor.protectUnlock') + '</button>' +
+          '</div>' +
+          '<label class="ab-hint" id="abProtectHint">' + t('admin.editor.protectHint') + '</label>' +
         '</div>' +
       '</div>' +
       '<div id="abAiAssist" class="ab-ai-slot"></div>' +
@@ -2190,21 +2778,32 @@
             '<button class="ab-tool" data-md="link" title="' + t('admin.editor.link') + '">' + icon('link', 15) + '</button>' +
             '<button class="ab-tool" data-md="img" title="' + t('admin.editor.image') + '">' + icon('image', 15) + '</button>' +
             '<button class="ab-tool" data-md="wiki" title="' + t('admin.editor.wiki') + '">[[ ]]</button>' +
+            '<button class="ab-tool" data-md="table" title="' + t('admin.editor.table') + '">▦</button>' +
+            '<button class="ab-tool" data-md="task" title="' + t('admin.editor.task') + '">☑</button>' +
+            '<button class="ab-tool" data-md="hr" title="' + t('admin.editor.hr') + '">―</button>' +
+            '<button class="ab-tool" data-md="codeblock" title="' + t('admin.editor.codeBlock') + '">{ }</button>' +
+            '<select class="ab-tool-select" id="abMdLang" title="' + t('admin.editor.codeBlock') + '" aria-label="' + t('admin.editor.codeBlock') + '"><option value="">' + t('admin.editor.langPlain') + '</option><option value="js">JavaScript</option><option value="ts">TypeScript</option><option value="python">Python</option><option value="bash">Bash</option><option value="json">JSON</option><option value="html">HTML</option><option value="css">CSS</option><option value="sql">SQL</option><option value="go">Go</option><option value="java">Java</option></select>' +
             '<button class="ab-tool" id="abSmoji" title="' + t('admin.editor.emoji') + '" aria-label="' + t('admin.editor.emoji') + '">😊</button>' +
           '</div>' +
           '<textarea class="ab-editor-area" id="abBody" placeholder="' + t('admin.editor.writeHint') + '"></textarea>' +
+          '<div class="ab-editor-stats" id="abEditorStats"></div>' +
         '</div>' +
         '<div class="ab-editor-pane"><div class="ab-editor-preview" id="abPreviewPane"></div></div>' +
       '</div>' +
       '<div class="ab-row ab-editor-actions">' +
+        '<span class="ab-hint" id="abDraftHint" style="margin-right:auto"></span>' +
         (cloudOn() ? '' : '<button class="ab-btn" id="abExport">' + t('editor.exportAll') + '</button>') +
         (route.id ? '<button class="ab-btn" id="abHistory">' + icon('refresh', 15) + ' ' + t('admin.revisions.button') + '</button>' : '') +
         (cloudOn() ? '<button class="ab-btn" id="abScheduleBtn">' + icon('clock', 15) + ' ' + t('admin.editor.scheduleButton') + '</button>' : '') +
+        '<button class="ab-btn" id="abPreviewLink">' + icon('eye', 15) + ' ' + t('admin.editor.previewLink') + '</button>' +
         '<button class="ab-btn" id="abSaveDraft">' + t('admin.editor.saveDraft') + '</button>' +
         '<button class="ab-btn primary" id="abPublish">' + icon('check', 15) + ' ' + t('admin.editor.publish') + '</button>' +
       '</div>';
 
     bindEditor(content, route);
+    fillCategoryOptions(content);
+    fillAuthorOptions(content);
+    renderDraftBar(content, route);
     if (route.id) loadEditor(content, route.id);
     else {
       var dateInput = content.querySelector('#abDate');
@@ -2216,7 +2815,11 @@
 
   function bindEditor(content, route) {
     var area = content.querySelector('#abBody');
-    area.addEventListener('input', function () { autosizeArea(area); });
+    // 本地草稿自动保存：输入停顿 1.5s + 每 10s 一次（加密文章不落明文）
+    content.addEventListener('input', debounce(function () { autosaveEditorDraft(content, route); }, 1500));
+    if (_editorDraftTimer) { clearInterval(_editorDraftTimer); _editorDraftTimer = null; }
+    _editorDraftTimer = setInterval(function () { autosaveEditorDraft(content, route); }, 10000);
+    area.addEventListener('input', function () { autosizeArea(area); updateEditorStats(content); });
     area.addEventListener('input', debounce(function () { updatePreview(content); }, 200));
     area.addEventListener('paste', function (e) {
       var items = e.clipboardData && e.clipboardData.items ? Array.prototype.slice.call(e.clipboardData.items) : [];
@@ -2227,18 +2830,65 @@
       e.preventDefault();
       insertPastedImage(content, area, file);
     });
+    // 常用快捷键：Ctrl/⌘ + B / I / K / S
+    area.addEventListener('keydown', function (e) {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      var k = String(e.key || '').toLowerCase();
+      if (k === 'b' || k === 'i' || k === 'k') {
+        e.preventDefault();
+        var langSel = content.querySelector('#abMdLang');
+        insertMd(area, k === 'b' ? 'bold' : (k === 'i' ? 'italic' : 'link'), { lang: langSel ? langSel.value : '' });
+        updatePreview(content); updateEditorStats(content);
+      } else if (k === 's') {
+        e.preventDefault();
+        saveEditor(content, route, 'draft');
+      }
+    });
     content.querySelector('#abToolbar').querySelectorAll('[data-md]').forEach(function (b) {
-      b.addEventListener('click', function () { insertMd(area, b.getAttribute('data-md')); updatePreview(content); area.focus(); });
+      b.addEventListener('click', function () {
+        var langSel = content.querySelector('#abMdLang');
+        insertMd(area, b.getAttribute('data-md'), { lang: langSel ? langSel.value : '' });
+        updatePreview(content); updateEditorStats(content); area.focus();
+      });
     });
     var dateInput = content.querySelector('#abDate');
     var nowBtn = content.querySelector('#abNow');
     if (nowBtn && dateInput) nowBtn.addEventListener('click', function () { dateInput.value = localDateTimeValue(new Date()); });
     content.querySelector('#abSaveDraft').addEventListener('click', function () { saveEditor(content, route, 'draft'); });
     content.querySelector('#abPublish').addEventListener('click', function () { saveEditor(content, route, 'published'); });
+    var pvBtn = content.querySelector('#abPreviewLink');
+    if (pvBtn) pvBtn.addEventListener('click', function () { openPreviewLink(content, route); });
     var scheduleBtn = content.querySelector('#abScheduleBtn');
     if (scheduleBtn) scheduleBtn.addEventListener('click', function () { saveEditor(content, route, 'scheduled'); });
     var historyBtn = content.querySelector('#abHistory');
     if (historyBtn) historyBtn.addEventListener('click', function () { openRevisionHistory(content, route); });
+    // 文章加密：切换密码输入行 + 用原密码解锁正文以便编辑
+    var protBox = content.querySelector('#abProtected');
+    var protRow = content.querySelector('#abProtectRow');
+    if (protBox && protRow) protBox.addEventListener('change', function () { protRow.style.display = protBox.checked ? 'flex' : 'none'; });
+    var protShow = content.querySelector('#abProtectShow');
+    var protPwdInput = content.querySelector('#abProtectPwd');
+    if (protShow && protPwdInput) protShow.addEventListener('click', function () {
+      var show = protPwdInput.type === 'password';
+      protPwdInput.type = show ? 'text' : 'password';
+      protShow.textContent = show ? t('admin.editor.protectHide') : t('admin.editor.protectShow');
+    });
+    var protUnlock = content.querySelector('#abProtectUnlock');
+    if (protUnlock) protUnlock.addEventListener('click', function () {
+      var pwdEl = content.querySelector('#abProtectPwd');
+      var pwd = pwdEl ? String(pwdEl.value) : '';
+      var post = content.__editingPost;
+      if (!post || !post.enc) return;
+      if (!pwd) { toast(t('admin.editor.protectNeedPwd'), 'err'); return; }
+      protUnlock.disabled = true;
+      window.pfDecrypt(post.enc, pwd).then(function (plain) {
+        var area2 = content.querySelector('#abBody');
+        area2.value = plain || '';
+        content.__unlockedPlain = plain || '';
+        updatePreview(content); updateEditorStats(content);
+        toast(t('admin.editor.protectUnlocked'), 'ok');
+      }).catch(function () { toast(t('post.unlockFail'), 'err'); }).finally(function () { protUnlock.disabled = false; });
+    });
     var ogBtn = content.querySelector('#abOgGenerate');
     if (ogBtn) ogBtn.addEventListener('click', function () {
       var title = content.querySelector('#abTitle').value.trim();
@@ -2285,6 +2935,7 @@
     var md = area ? (area.value || '') : '';
     if (window.renderMarkdown) pane.innerHTML = window.renderMarkdown(md);
     else pane.textContent = md;
+    if (window.enhanceRichContent) window.enhanceRichContent(pane);   // 预览也渲染图表 / 公式
   }
   /* 编辑器输入框自动增高：无内部滚动条，高度完全跟随内容（与右侧预览一致展开） */
   function autosizeArea(area) {
@@ -2292,7 +2943,25 @@
     area.style.height = 'auto';
     area.style.height = Math.max(area.scrollHeight, 420) + 'px';
   }
-  function insertMd(area, type) {
+  /** 正文字数与预计阅读时长（中日韩按字计，拉丁按词计） */
+  function editorCounts(text) {
+    var str = String(text || '');
+    var cjkRe = /[\u4e00-\u9fa5\u3040-\u30ff\uac00-\ud7af]/g;
+    var cjk = (str.match(cjkRe) || []).length;
+    var words = (str.replace(cjkRe, ' ').match(/[A-Za-z0-9_'-]+/g) || []).length;
+    var total = cjk + words;
+    return { chars: str.length, total: total, minutes: Math.max(1, Math.ceil(total / 400)) };
+  }
+  function updateEditorStats(content) {
+    var box = content.querySelector('#abEditorStats');
+    if (!box) return;
+    var area = content.querySelector('#abBody');
+    var c = editorCounts(area ? area.value : '');
+    box.innerHTML = '<span>' + t('admin.editor.stats', { chars: c.chars, words: c.total, minutes: c.minutes }) + '</span>' +
+      '<span class="ab-hint">' + t('admin.editor.shortcutHint') + '</span>';
+  }
+  function insertMd(area, type, opts) {
+    opts = opts || {};
     var s = area.selectionStart, e = area.selectionEnd, v = area.value;
     var sel = v.slice(s, e), pre = '', post = '', rep = sel;
     if (type === 'bold') { pre = '**'; post = '**'; }
@@ -2301,11 +2970,55 @@
     else if (type === 'quote') { pre = '> '; }
     else if (type === 'code') { pre = '`'; post = '`'; }
     else if (type === 'ul') { pre = '- '; }
+    else if (type === 'task') { pre = '- [ ] '; }
+    else if (type === 'hr') { rep = (s > 0 && v.charAt(s - 1) !== '\n' ? '\n' : '') + '---\n'; }
+    else if (type === 'table') {
+      var col = t('admin.editor.tableCol'), cell = t('admin.editor.tableCell');
+      rep = '| ' + col + '1 | ' + col + '2 | ' + col + '3 |\n| --- | --- | --- |\n| ' + cell + ' | ' + cell + ' | ' + cell + ' |\n';
+    }
+    else if (type === 'codeblock') {
+      var lang = String(opts.lang || '').trim();
+      rep = '```' + lang + '\n' + (sel || '') + '\n```';
+    }
     else if (type === 'link') { rep = '[' + (sel || t('editor.linkBtn')) + '](https://)'; }
     else if (type === 'img') { rep = '![' + (sel || t('editor.imgBtn')) + '](https://)'; }
     else if (type === 'wiki') { rep = '[[' + (sel || t('admin.editor.wiki')) + ']]'; }
     area.value = v.slice(0, s) + pre + rep + post + v.slice(e);
     area.selectionStart = area.selectionEnd = s + pre.length + rep.length;
+  }
+  /** 用现有文章的分类填充下拉候选 */
+  async function fillCategoryOptions(content) {
+    var list = content.querySelector('#abCategoryList');
+    if (!list) return;
+    var posts = [];
+    try { posts = await listPosts(); } catch (e) {}
+    var seen = {}; var names = [];
+    // 先放后台「分类」导航里自定义的分类（软件 / 系统 / 服务器…），再补历史已用分类，保证都能选
+    var navCfg = parseArr(settingsCache && settingsCache.nav_menu, []);
+    navCfg.forEach(function (it) {
+      if (!it || String(it.url || '').replace(/\/+$/, '') !== '/categories') return;
+      (it.children || []).forEach(function (c) {
+        var name = c && String(c.text || '').trim();
+        if (name && !seen[name]) { seen[name] = 1; names.push(name); }
+      });
+    });
+    posts.forEach(function (x) {
+      var c2 = x && x.category ? String(x.category).trim() : '';
+      if (c2 && !seen[c2]) { seen[c2] = 1; names.push(c2); }
+    });
+    list.innerHTML = names.map(function (c) { return '<option value="' + esc(c) + '"></option>'; }).join('');
+  }
+  /** 作者候选：来自已有文章的作者 + 站点个人资料昵称 */
+  async function fillAuthorOptions(content) {
+    var list = content.querySelector('#abAuthorList');
+    if (!list) return;
+    var posts = [];
+    try { posts = await listPosts(); } catch (e) {}
+    var seen = {};
+    var prof = readAdminProfile ? readAdminProfile() : {};
+    if (prof && prof.name) seen[prof.name] = 1;
+    posts.forEach(function (p) { if (p && p.author) seen[p.author] = 1; });
+    list.innerHTML = Object.keys(seen).sort().map(function (a) { return '<option value="' + esc(a) + '"></option>'; }).join('');
   }
   async function loadEditor(content, id) {
     var p = await getPost(id);
@@ -2313,7 +3026,10 @@
     content.__editingPost = p;
     content.querySelector('#abTitle').value = p.title || '';
     content.querySelector('#abTags').value = (p.tags || []).join(', ');
+    var catEl = content.querySelector('#abCategory');
+    if (catEl) catEl.value = p.category || '';
     content.querySelector('#abSeries').value = p.series || '';
+    if (content.querySelector('#abAuthor')) content.querySelector('#abAuthor').value = p.author || '';
     content.querySelector('#abSeriesOrder').value = p.seriesOrder ? String(p.seriesOrder) : '';
     content.querySelector('#abCover').value = p.cover || '';
     content.querySelector('#abOgImage').value = p.ogImage || '';
@@ -2325,7 +3041,30 @@
     if (scheduleInput && p.publishAt) scheduleInput.value = toDateTimeLocal(p.publishAt);
     content.querySelector('#abBody').value = p.content || '';
     content.querySelector('#abPinned').checked = !!p.pinned;
+    var seo = p.seo || {};
+    if (content.querySelector('#abSeoTitle')) content.querySelector('#abSeoTitle').value = seo.title || '';
+    if (content.querySelector('#abSeoDesc')) content.querySelector('#abSeoDesc').value = seo.desc || '';
+    if (content.querySelector('#abSeoCanonical')) content.querySelector('#abSeoCanonical').value = seo.canonical || '';
+    if (content.querySelector('#abSeoNoindex')) content.querySelector('#abSeoNoindex').checked = !!seo.noindex;
+    var protBox = content.querySelector('#abProtected');
+    var protRow = content.querySelector('#abProtectRow');
+    var protUnlock = content.querySelector('#abProtectUnlock');
+    var protHint = content.querySelector('#abProtectHint');
+    if (p.enc) {
+      if (protBox) protBox.checked = true;
+      if (protRow) protRow.style.display = 'flex';
+      if (protUnlock) protUnlock.style.display = '';
+      var savedPwd = readPostPwd(p.id);
+      var pwdInput = content.querySelector('#abProtectPwd');
+      if (savedPwd && pwdInput) pwdInput.value = savedPwd;
+      if (protHint) protHint.textContent = savedPwd ? t('admin.editor.protectRemembered') : t('admin.editor.protectEncrypted');
+    } else if (protHint) {
+      protHint.textContent = t('admin.editor.protectHint');
+    }
+    var catEl2 = content.querySelector('#abCategory');
+    if (catEl2) catEl2.value = p.category || '';
     updatePreview(content);
+    updateEditorStats(content);
   }
   async function saveEditor(content, route, status) {
     var title = content.querySelector('#abTitle').value.trim();
@@ -2333,10 +3072,31 @@
     if (!title) { toast(t('admin.editor.noTitle'), 'err'); return; }
     var id = route.id || slug(title);
     var tags = content.querySelector('#abTags').value.split(/[,，]/).map(function (t) { return t.trim(); }).filter(Boolean);
+    var catInput = content.querySelector('#abCategory');
+    var categoryValue = catInput ? catInput.value.trim() : '';
 
     var wantPinned = !!content.querySelector('#abPinned').checked;
+    // 文章加密：勾选后把正文加密存入 enc，明文 content 置空
+    var protectBox = content.querySelector('#abProtected');
+    var protectOn = !!(protectBox && protectBox.checked);
+    var protectPwdEl = content.querySelector('#abProtectPwd');
+    var protectPwd = protectPwdEl ? String(protectPwdEl.value) : '';
+    var hadEnc = !!(content.__editingPost && content.__editingPost.enc);
+    var encData = null;
+    var contentToSave = body;
+    if (protectOn) {
+      if (!protectPwd) { toast(t('admin.editor.protectNeedPwd'), 'err'); return; }
+      if (hadEnc && !content.__unlockedPlain && !body) { toast(t('admin.editor.protectNeedUnlock'), 'err'); return; }
+      try { encData = await window.pfEncrypt(body, protectPwd); }
+      catch (e) { toast(t('admin.editor.protectFail'), 'err'); return; }
+      rememberPostPwd(id, protectPwd);   // 本机记住密码，便于后台查看
+      contentToSave = '';
+    } else {
+      forgetPostPwd(id);                 // 取消加密时清除本机记录的密码
+    }
     var dateInput = content.querySelector('#abDate');
-    var dateValue = normalizeEditorDate(dateInput ? dateInput.value : '');
+    var rawDate = dateInput ? String(dateInput.value || '').trim().replace('T', ' ') : '';
+    var dateValue = rawDate || ((content.__editingPost && content.__editingPost.date) ? String(content.__editingPost.date) : normalizeEditorDate(''));
     var publishAt = null;
     if (status === 'scheduled') {
       var scheduleInput = content.querySelector('#abSchedule');
@@ -2360,11 +3120,19 @@
     var post = Object.assign({}, content.__editingPost || {}, {
       id: id, title: title, date: dateValue, publishAt: publishAt,
       series: seriesValue,
+      author: val(content, '#abAuthor').trim(),
       ogImage: ogImage,
       seriesOrder: Math.max(0, Math.floor(Number(content.querySelector('#abSeriesOrder').value) || 0)),
       excerpt: (body.replace(/[#>*`\-!\[\]()]/g, '').slice(0, 120).trim()),
-      content: body, cover: content.querySelector('#abCover').value.trim(),
-      pinned: wantPinned, tags: tags,
+      content: contentToSave, cover: content.querySelector('#abCover').value.trim(),
+      seo: {
+        title: val(content, '#abSeoTitle').trim(),
+        desc: val(content, '#abSeoDesc').trim(),
+        canonical: val(content, '#abSeoCanonical').trim(),
+        noindex: !!(content.querySelector('#abSeoNoindex') || {}).checked
+      },
+      protected: protectOn, enc: encData,
+      pinned: wantPinned, tags: tags, category: categoryValue,
       status: status
     });
 
@@ -2374,6 +3142,7 @@
     try {
       var r = await savePost(post, isNew);
       if (r && (r.ok || r.post)) {
+        clearEditorDraft(id);
         toast(status === 'published' ? t('admin.editor.saved') : (status === 'scheduled' ? t('admin.editor.scheduled') : t('admin.editor.savedDraft')), 'ok');
         if (cloudOn()) go('/admin/posts'); else {
           toast(t('admin.editor.savedLocal'), 'ok');
@@ -2382,7 +3151,7 @@
         toast(t('admin.editor.saveFail'), 'err');
       }
     } catch (e) {
-      if (!cloudOn()) { saveStaticPost(post); toast(t('admin.editor.savedDraft'), 'ok'); }
+      if (!cloudOn()) { saveStaticPost(post); clearEditorDraft(id); toast(t('admin.editor.savedDraft'), 'ok'); }
       else if (isNetworkFailure(e)) { queueOfflinePost(post, isNew); toast(t('admin.editor.savedOffline'), 'ok'); }
       else toast(t('admin.editor.saveFail') + (e.message || e), 'err');
     } finally { btn.disabled = false; }
@@ -2508,6 +3277,11 @@
     try { await applyTermChange(old, nv); toast(t('admin.tags.renameOk'), 'ok'); loadTerms(content, sel); } catch (e) { toast(t('admin.postList.opFail') + (e.message || e), 'err'); }
   }
   async function applyTermChange(old, neo) {
+    // 云端：一次请求批量处理，避免逐篇 PUT（N+1）
+    if (cloudOn()) {
+      await api('api/admin/tags', { method: 'POST', body: JSON.stringify({ op: neo ? 'rename' : 'delete', from: old, to: neo || '' }) });
+      return;
+    }
     var summary = await listPosts();
     var ids = [];
     summary.forEach(function (p) {
@@ -2534,7 +3308,19 @@
     content.innerHTML += '<div class="ab-toolbar">' +
       '<div class="ab-search"><input class="ab-input" id="abCmtKw" placeholder="' + t('admin.comments.search') + '"></div>' +
       '<select class="ab-select" id="abCmtFilter" style="max-width:160px"><option value="all">' + t('admin.comments.all') + '</option><option value="pending"' + (filter === 'pending' ? ' selected' : '') + '>' + t('admin.comments.pendingStatus') + '</option><option value="approved">' + t('admin.comments.approved') + '</option></select>' +
-      '</div><div id="abAiComments" class="ab-ai-comments"></div><div class="ab-table-wrap"><table class="ab-table"><thead><tr><th>' + t('admin.comments.colAuthor') + '</th><th>' + t('admin.comments.colContent') + '</th><th>' + t('admin.comments.colPost') + '</th><th>' + t('admin.comments.colDate') + '</th><th>' + t('admin.comments.colStatus') + '</th><th class="col-actions">' + t('admin.comments.colActions') + '</th></tr></thead><tbody id="abCmtBody"></tbody></table></div>';
+      '</div><div class="ab-ai-comments" id="abAiComments"></div><div class="ab-bulk" id="abCmtBulk" style="display:none"><span class="ab-muted" id="abCmtSelInfo"></span><button class="ab-btn sm primary" id="abCmtApprove">' + icon('check', 13) + ' ' + t('admin.comments.bulkApprove') + '</button><button class="ab-btn sm" id="abCmtPending">' + icon('clock', 13) + ' ' + t('admin.comments.bulkPending') + '</button><button class="ab-btn sm danger" id="abCmtDelete">' + icon('trash', 13) + ' ' + t('admin.comments.bulkDelete') + '</button></div><div class="ab-table-wrap"><table class="ab-table"><thead><tr><th class="col-check"><input type="checkbox" id="abCmtAll" aria-label="' + t('admin.comments.selectPage') + '"></th><th>' + t('admin.comments.colAuthor') + '</th><th>' + t('admin.comments.colContent') + '</th><th>' + t('admin.comments.colPost') + '</th><th>' + t('admin.comments.colDate') + '</th><th>' + t('comment.like') + '</th><th>' + t('admin.comments.colStatus') + '</th><th class="col-actions">' + t('admin.comments.colActions') + '</th></tr></thead><tbody id="abCmtBody"></tbody></table></div>';
+    content.querySelector('#abCmtApprove').addEventListener('click', function () { bulkCommentOp(content, 'approve', filter); });
+    content.querySelector('#abCmtPending').addEventListener('click', function () { bulkCommentOp(content, 'pending', filter); });
+    content.querySelector('#abCmtDelete').addEventListener('click', function () { bulkCommentOp(content, 'delete', filter); });
+    content.querySelector('#abCmtAll').addEventListener('change', function () {
+      var on = this.checked;
+      content.querySelectorAll('#abCmtBody [data-cpick]').forEach(function (cb) {
+        var id = dec(cb.getAttribute('data-cpick'));
+        if (on) cmtSelMap[id] = 1; else delete cmtSelMap[id];
+        cb.checked = on;
+      });
+      syncCmtSelection(content);
+    });
     bindComments(content);
     loadComments(content, filter);
     initAbAiComments(content);
@@ -2545,57 +3331,149 @@
     kw.addEventListener('input', debounce(function () { loadComments(content, f.value); }, 250));
     f.addEventListener('change', function () { loadComments(content, f.value); });
   }
+  var cmtSelMap = {};
+  function syncCmtSelection(content) {
+    var ids = Object.keys(cmtSelMap);
+    var bar = content.querySelector('#abCmtBulk');
+    var info = content.querySelector('#abCmtSelInfo');
+    if (bar) bar.style.display = ids.length ? 'flex' : 'none';
+    if (info) info.textContent = t('admin.comments.bulkSelected', { n: ids.length });
+  }
+  async function bulkCommentOp(content, op, filter) {
+    var ids = Object.keys(cmtSelMap);
+    if (!ids.length) return;
+    var run = async function () {
+      try {
+        await api('api/admin/comments/bulk', { method: 'POST', body: JSON.stringify({ op: op, ids: ids }) });
+        toast(t('admin.comments.bulkDone', { n: ids.length }), 'ok');
+        cmtSelMap = {};
+        loadComments(content, filter);
+      } catch (e) { toast(t('admin.postList.opFail') + (e.message || e), 'err'); }
+    };
+    if (op === 'delete') {
+      confirmModal(t('admin.comments.bulkDelete'), '<p class="ab-muted">' + t('admin.comments.bulkDeleteConfirm', { n: ids.length }) + '</p>', run, t('admin.comments.delete'));
+      return;
+    }
+    run();
+  }
+
   async function loadComments(content, filter) {
+
     var body = content.querySelector('#abCmtBody');
     if (!body) return;
-    body.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:30px"><span class="ab-spin"></span> ' + t('admin.postList.loading') + '</td></tr>';
-    var d;
-    try { d = await api('api/comments?status=' + (filter === 'pending' ? 'pending' : 'all')); } catch (e) { body.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:30px" class="ab-muted">' + t('admin.postList.loadFail') + esc(e.message || e) + '</td></tr>'; return; }
-    var list = (d && d.comments) || [];
-    var kw = (content.querySelector('#abCmtKw').value || '').trim().toLowerCase();
-    if (kw) list = list.filter(function (c) { return ((c.author || '') + ' ' + (c.content || '')).toLowerCase().indexOf(kw) >= 0; });
-    if (!list.length) { body.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:34px" class="ab-muted">' + t('admin.dashboard.noComments') + '</td></tr>'; return; }
-    // 建立 id → 评论 映射，以便展示“回复了某人”的父子关系
-    var cmtById = {};
-    list.forEach(function (c) { cmtById[c.id] = c; });
-    body.innerHTML = list.map(function (c) {
-      var st = c.status || 'approved';
-      // 二级及以上回复：标注其父评论，便于后台追踪回复链
-      var replyTag = '';
-      if (c.parent_id) {
-        var parent = cmtById[c.parent_id];
-        if (parent) replyTag = ' <span class="ab-cmt-replyto">' + esc(t('comment.replyTo', { author: parent.author || t('admin.comments.anonymous') })) + '</span>';
-        else replyTag = ' <span class="ab-cmt-replyto">#' + esc(c.parent_id) + '</span>';
-      }
-      var actions = '';
-      if (st === 'pending') actions += '<button class="ab-btn sm primary" data-approve="' + enc(c.id) + '">' + icon('check', 13) + ' ' + t('admin.comments.approve') + '</button> ';
-      actions += '<button class="ab-btn sm danger" data-delcmt="' + enc(c.id) + '">' + icon('trash', 13) + ' ' + t('admin.comments.delete') + '</button>';
-      return '<tr>' +
-        '<td>' + esc(c.author || t('admin.comments.anonymous')) + '</td>' +
-        '<td style="max-width:320px">' + esc((c.content || '').slice(0, 120)) + replyTag + '</td>' +
-        '<td>' + esc(c.post_title || c.post_id || '—') + '</td>' +
-        '<td>' + esc(fmtDate(c.date)) + '</td>' +
-        '<td><span class="ab-status ' + st + '">' + (st === 'pending' ? t('admin.comments.pendingStatus') : t('admin.comments.approved')) + '</span></td>' +
-        '<td class="col-actions">' + actions + '</td>' +
-      '</tr>';
-    }).join('');
-    body.querySelectorAll('[data-approve]').forEach(function (b) { b.addEventListener('click', function () { approveComment(content, dec(b.getAttribute('data-approve')), filter, b.closest('tr')); }); });
-    body.querySelectorAll('[data-delcmt]').forEach(function (b) { b.addEventListener('click', function () {
-      var cid = dec(b.getAttribute('data-delcmt'));
-      var tr = b.closest('tr');
-      confirmModal(t('admin.comments.delete'), '<p class="ab-muted">' + t('admin.comments.deleteConfirm') + '</p>', async function () {
-        // 无感刷新：请求期间先半透明即时反馈，成功后行淡出移除，不整表重拉
-        if (tr) { tr.style.opacity = '0.45'; tr.style.pointerEvents = 'none'; }
-        try {
-          await api('api/comments/' + enc(cid), { method: 'DELETE' });
-          toast(t('admin.comments.deleted'), 'ok');
-          seamlessRemoveRow(body, tr, t('admin.dashboard.noComments'));
-        } catch (e) {
-          if (tr) { tr.style.opacity = ''; tr.style.pointerEvents = ''; }
-          toast(t('admin.postList.opFail') + (e.message || e), 'err');
+    body.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:30px"><span class="ab-spin"></span> ' + t('admin.postList.loading') + '</td></tr>';
+    try {
+      var d = await api('api/comments?status=' + (filter === 'pending' ? 'pending' : 'all'));
+      var list = (d && d.comments) || [];
+      var kw = (content.querySelector('#abCmtKw').value || '').trim().toLowerCase();
+      if (kw) list = list.filter(function (c) { return ((c.author || '') + ' ' + (c.content || '')).toLowerCase().indexOf(kw) >= 0; });
+      if (!list.length) { body.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:34px" class="ab-muted">' + t('admin.dashboard.noComments') + '</td></tr>'; return; }
+      // 建立 id → 评论 映射，以便展示“回复了某人”的父子关系
+      var cmtById = {};
+      list.forEach(function (c) { cmtById[c.id] = c; });
+      body.innerHTML = list.map(function (c) {
+        var st = c.status || 'approved';
+        var pinned = !!c.pinned, featured = !!c.featured;
+        // 二级及以上回复：标注其父评论，便于后台追踪回复链
+        var replyTag = '';
+        if (c.parent_id) {
+          var parent = cmtById[c.parent_id];
+          if (parent) replyTag = ' <span class="ab-cmt-replyto">' + esc(t('comment.replyTo', { author: parent.author || t('admin.comments.anonymous') })) + '</span>';
+          else replyTag = ' <span class="ab-cmt-replyto">#' + esc(c.parent_id) + '</span>';
         }
-      }, t('admin.comments.delete'));
-    }); });
+        var badges = '';
+        if (pinned) badges += ' <span class="ab-cmt-badge pinned">' + icon('pin', 11) + t('comment.pinned') + '</span>';
+        if (featured) badges += ' <span class="ab-cmt-badge featured">' + icon('star', 11) + t('comment.featured') + '</span>';
+        var actions = '';
+        if (st === 'pending') actions += '<button class="ab-btn sm primary" data-approve="' + enc(c.id) + '">' + icon('check', 13) + ' ' + t('admin.comments.approve') + '</button> ';
+        actions += '<button class="ab-btn sm' + (pinned ? ' primary' : '') + '" data-pin="' + enc(c.id) + '" data-on="' + (pinned ? '1' : '0') + '">' + icon('pin', 13) + ' ' + (pinned ? t('comment.unpinComment') : t('comment.pinComment')) + '</button> ';
+        actions += '<button class="ab-btn sm' + (featured ? ' primary' : '') + '" data-feat="' + enc(c.id) + '" data-on="' + (featured ? '1' : '0') + '">' + icon('star', 13) + ' ' + (featured ? t('comment.unfeature') : t('comment.feature')) + '</button> ';
+        actions += '<button class="ab-btn sm danger" data-delcmt="' + enc(c.id) + '">' + icon('trash', 13) + ' ' + t('admin.comments.delete') + '</button>';
+        var picked = !!cmtSelMap[c.id];
+        return '<tr' + (pinned ? ' class="ab-cmt-pinned"' : '') + (picked ? ' class-selected' : '') + '>' +
+          '<td class="col-check"><input type="checkbox" data-cpick="' + enc(c.id) + '"' + (picked ? ' checked' : '') + '></td>' +
+          '<td>' + esc(c.author || t('admin.comments.anonymous')) + '</td>' +
+          '<td style="max-width:320px">' + esc((c.content || '').slice(0, 120)) + replyTag + badges + '</td>' +
+          '<td>' + esc(c.post_title || c.post_id || '—') + '</td>' +
+          '<td>' + esc(fmtDate(c.date)) + '</td>' +
+          '<td style="text-align:center;white-space:nowrap">' + icon('heart', 12) + ' ' + esc(String(Number(c.likes) || 0)) + '</td>' +
+          '<td><span class="ab-status ' + st + '">' + (st === 'pending' ? t('admin.comments.pendingStatus') : t('admin.comments.approved')) + '</span></td>' +
+          '<td class="col-actions">' + actions + '</td>' +
+        '</tr>';
+      }).join('');
+      body.querySelectorAll('[data-cpick]').forEach(function (cb) {
+      cb.addEventListener('change', function () {
+        var id = dec(cb.getAttribute('data-cpick'));
+        if (cb.checked) cmtSelMap[id] = 1; else delete cmtSelMap[id];
+        syncCmtSelection(content);
+      });
+    });
+    syncCmtSelection(content);
+    body.querySelectorAll('[data-approve]').forEach(function (b) { b.addEventListener('click', function () { approveComment(content, dec(b.getAttribute('data-approve')), filter, b.closest('tr')); }); });
+      body.querySelectorAll('[data-pin]').forEach(function (b) { b.addEventListener('click', function () { toggleCommentFlag(content, b, 'pinned'); }); });
+      body.querySelectorAll('[data-feat]').forEach(function (b) { b.addEventListener('click', function () { toggleCommentFlag(content, b, 'featured'); }); });
+      body.querySelectorAll('[data-delcmt]').forEach(function (b) {
+        b.addEventListener('click', function () {
+          var cid = dec(b.getAttribute('data-delcmt'));
+          var tr = b.closest('tr');
+          confirmModal(t('admin.comments.delete'), '<p class="ab-muted">' + t('admin.comments.deleteConfirm') + '</p>', async function () {
+            // 无感刷新：请求期间先半透明即时反馈，成功后行淡出移除，不整表重拉
+            if (tr) { tr.style.opacity = '0.45'; tr.style.pointerEvents = 'none'; }
+            try {
+              await api('api/comments/' + enc(cid), { method: 'DELETE' });
+              toast(t('admin.comments.deleted'), 'ok');
+              seamlessRemoveRow(body, tr, t('admin.dashboard.noComments'));
+            } catch (e) {
+              if (tr) { tr.style.opacity = ''; tr.style.pointerEvents = ''; }
+              toast(t('admin.postList.opFail') + (e.message || e), 'err');
+            }
+          }, t('admin.comments.delete'));
+        });
+      });
+    } catch (e) {
+      // 渲染期异常同样兜底，避免一直停在加载态（回归：cmtSel 未定义曾导致永久转圈）
+      body.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:30px" class="ab-muted">' + t('admin.postList.loadFail') + esc(e.message || e) + '</td></tr>';
+    }
+  }
+  // 切换评论置顶 / 精选（就地更新按钮与徽章，不重拉整表）
+  async function toggleCommentFlag(content, btn, key) {
+    var attr = key === 'pinned' ? 'data-pin' : 'data-feat';
+    var cid = dec(btn.getAttribute(attr));
+    var on = btn.getAttribute('data-on') === '1';
+    var target = !on;
+    btn.disabled = true;
+    try {
+      var payload = {};
+      payload[key] = target;
+      await api('api/comments/' + enc(cid), { method: 'PUT', body: JSON.stringify(payload) });
+      btn.setAttribute('data-on', target ? '1' : '0');
+      btn.classList.toggle('primary', target);
+      if (key === 'pinned') {
+        btn.innerHTML = icon('pin', 13) + ' ' + (target ? t('comment.unpinComment') : t('comment.pinComment'));
+      } else {
+        btn.innerHTML = icon('star', 13) + ' ' + (target ? t('comment.unfeature') : t('comment.feature'));
+      }
+      var tr = btn.closest('tr');
+      if (tr) {
+        if (key === 'pinned') tr.classList.toggle('ab-cmt-pinned', target);
+        var cell = tr.cells && tr.cells[1];
+        if (cell) {
+          var badge = cell.querySelector('.ab-cmt-badge.' + key);
+          if (target && !badge) {
+            var span = document.createElement('span');
+            span.className = 'ab-cmt-badge ' + key;
+            span.innerHTML = (key === 'pinned' ? icon('pin', 11) + t('comment.pinned') : icon('star', 11) + t('comment.featured'));
+            cell.appendChild(span);
+          } else if (!target && badge) {
+            badge.remove();
+          }
+        }
+      }
+    } catch (e) {
+      toast(t('admin.postList.opFail') + (e.message || e), 'err');
+    } finally {
+      btn.disabled = false;
+    }
   }
   async function approveComment(content, cid, filter, tr) {
     // 无感刷新：审核通过后原行状态徽章就地更新为「已通过」，其余行与滚动位置不动
@@ -2615,38 +3493,185 @@
   }
 
   /* ====================== 媒体库 ====================== */
+  var mediaState = { list: [], kw: '', page: 1, per: 24, selected: {} };
   function pageMedia(content) {
     content.innerHTML = '<div class="ab-page-head"><div><h1 class="ab-page-title">' + t('admin.media.title') + '</h1><p class="ab-page-sub">' + t('admin.media.desc') + '</p><p class="ab-hint" style="margin:6px 0 0">' + t('admin.media.compressHint') + '</p></div>' +
       (cloudOn() ? '<label class="ab-btn primary">' + icon('upload', 15) + ' ' + t('admin.media.upload') + '<input type="file" id="abUpload" accept="image/*" multiple hidden></label>' : '<span class="ab-chip" style="background:var(--ab-primary-weak);color:var(--ab-primary)">' + t('admin.categories.staticHint') + '</span>') + '</div>' +
       (cloudOn() ? '' : '<div class="ab-card"><div class="ab-empty"><div class="ab-empty-ico">🖼</div><p>' + t('admin.media.cloudOnly') + '</p></div></div>');
     if (!cloudOn()) return;
-    content.innerHTML += '<div class="ab-media-grid" id="abMediaGrid"><span class="ab-spin"></span></div>';
+    content.innerHTML += '<div class="ab-toolbar"><div class="ab-search"><input class="ab-input" id="abMediaKw" placeholder="' + t('admin.media.search') + '"></div>' +
+      '<div class="ab-row" style="gap:10px;align-items:center;flex-wrap:wrap"><label class="ab-hint" style="display:flex;align-items:center;gap:6px;cursor:pointer;margin:0"><input type="checkbox" id="abMediaAll"> ' + t('admin.media.selectAll') + '</label>' +
+      '<span class="ab-muted" id="abMediaSelInfo"></span>' +
+      '<button class="ab-btn danger" id="abMediaBatchDel" disabled>' + icon('trash', 14) + ' ' + t('admin.media.batchDelete') + '</button></div></div>' +
+      '<div class="ab-media-grid" id="abMediaGrid"><span class="ab-spin"></span></div><div class="ab-pagination" id="abMediaPage"></div>';
     var up = content.querySelector('#abUpload');
     up.addEventListener('change', function () { uploadFiles(content, up.files); });
+    var kw = content.querySelector('#abMediaKw');
+    kw.value = mediaState.kw;
+    kw.addEventListener('input', debounce(function () { mediaState.kw = (kw.value || '').trim().toLowerCase(); mediaState.page = 1; renderMediaGrid(content); }, 200));
+    content.querySelector('#abMediaAll').addEventListener('change', function () { toggleSelectAll(content, this.checked); });
+    content.querySelector('#abMediaBatchDel').addEventListener('click', function () { batchDeleteMedia(content); });
+    mediaState.selected = {};
     loadMedia(content);
   }
   async function loadMedia(content) {
     var grid = content.querySelector('#abMediaGrid');
+    if (!grid) return;
     grid.innerHTML = '<span class="ab-spin"></span> ' + t('admin.postList.loading');
     try {
       var d = await api('api/media');
-      var list = (d && d.media) || [];
-      grid.innerHTML = list.length ? list.map(function (m) {
-        return '<div class="ab-media-card">' +
-          '<div class="ab-media-thumb"><img src="' + esc(m.thumbUrl || m.thumb_url || m.url) + '" alt="' + esc(m.name || '') + '"></div>' +
-          '<div class="ab-media-meta"><div class="ab-media-name">' + esc(m.name || t('admin.media.colImage')) + '</div><div class="ab-media-size">' + fmtSize(m.size) + '</div></div>' +
-          '<div class="ab-media-actions"><button class="ab-btn sm" data-copy="' + enc(m.url) + '">' + t('admin.media.copy') + '</button><button class="ab-btn sm danger" data-delmedia="' + enc(m.id) + '">' + t('admin.media.delete') + '</button></div>' +
-        '</div>';
-      }).join('') : '<div class="ab-card ab-empty"><div class="ab-empty-ico">🖼</div><p>' + t('admin.media.empty') + '</p></div>';
-      grid.querySelectorAll('[data-copy]').forEach(function (b) { b.addEventListener('click', function () { copyText(dec(b.getAttribute('data-copy'))); toast(t('admin.media.copied'), 'ok'); }); });
-      grid.querySelectorAll('[data-delmedia]').forEach(function (b) { b.addEventListener('click', function () {
-        var mid = dec(b.getAttribute('data-delmedia'));
-        confirmModal(t('admin.media.delete'), '<p class="ab-muted">' + t('admin.media.deleteConfirm') + '</p>', async function () {
-          try { await api('api/media/' + enc(mid), { method: 'DELETE' }); toast(t('admin.media.deleted'), 'ok'); loadMedia(content); } catch (e) { toast(t('admin.postList.opFail') + (e.message || e), 'err'); }
-        }, t('admin.comments.delete'));
-      }); });
+      mediaState.list = ((d && d.media) || []).slice();
+      mediaState.selected = {};
+      renderMediaGrid(content);
     } catch (e) { grid.innerHTML = '<div class="ab-empty"><p>' + t('admin.postList.loadFail') + esc(e.message || e) + '</p></div>'; }
   }
+  function mediaFiltered() {
+    var kw = mediaState.kw;
+    if (!kw) return mediaState.list;
+    return mediaState.list.filter(function (m) { return String(m.name || '').toLowerCase().indexOf(kw) >= 0; });
+  }
+  function renderMediaGrid(content) {
+    var grid = content.querySelector('#abMediaGrid');
+    var pg = content.querySelector('#abMediaPage');
+    if (!grid) return;
+    var list = mediaFiltered();
+    var per = mediaState.per;
+    var totalPages = Math.max(1, Math.ceil(list.length / per));
+    if (mediaState.page > totalPages) mediaState.page = totalPages;
+    var page = mediaState.page;
+    var view = list.slice((page - 1) * per, page * per);
+    grid.innerHTML = view.length ? view.map(function (m) {
+      var sel = !!mediaState.selected[m.id];
+      return '<div class="ab-media-card' + (sel ? ' selected' : '') + '">' +
+        '<label class="ab-media-check"><input type="checkbox" data-pick="' + enc(m.id) + '"' + (sel ? ' checked' : '') + '></label>' +
+        '<div class="ab-media-thumb" data-preview="' + enc(m.id) + '" title="' + t('admin.media.preview') + '"><img src="' + esc(m.thumbUrl || m.thumb_url || m.url) + '" alt="' + esc(m.name || '') + '"></div>' +
+        '<div class="ab-media-meta"><div class="ab-media-name">' + esc(m.name || t('admin.media.colImage')) + '</div><div class="ab-media-size">' + fmtSize(m.size) + '</div></div>' +
+        '<div class="ab-media-actions"><button class="ab-btn sm" data-copy="' + enc(m.url) + '">' + t('admin.media.copy') + '</button><button class="ab-btn sm" data-mdimg="' + enc(m.url) + '" data-mdname="' + esc(m.name || '') + '">' + t('admin.media.copyMarkdown') + '</button><button class="ab-btn sm danger" data-delmedia="' + enc(m.id) + '">' + t('admin.media.delete') + '</button></div>' +
+      '</div>';
+    }).join('') : '<div class="ab-card ab-empty" style="grid-column:1/-1"><div class="ab-empty-ico">🖼</div><p>' + (mediaState.kw ? t('admin.media.noMatch') : t('admin.media.empty')) + '</p></div>';
+    if (pg) {
+      pg.innerHTML = list.length > per
+        ? (page > 1 ? '<button class="ab-page-btn" data-p="' + (page - 1) + '">' + t('pagination.prev') + '</button>' : '') +
+          '<button class="ab-page-btn active">' + page + ' / ' + totalPages + '</button>' +
+          (page < totalPages ? '<button class="ab-page-btn" data-p="' + (page + 1) + '">' + t('pagination.next') + '</button>' : '')
+        : '';
+      pg.querySelectorAll('[data-p]').forEach(function (b) { b.addEventListener('click', function () { mediaState.page = parseInt(b.getAttribute('data-p'), 10) || 1; renderMediaGrid(content); }); });
+    }
+    grid.querySelectorAll('[data-pick]').forEach(function (cb) {
+      cb.addEventListener('change', function () {
+        var id = dec(cb.getAttribute('data-pick'));
+        if (cb.checked) mediaState.selected[id] = true; else delete mediaState.selected[id];
+        var card = cb.closest('.ab-media-card');
+        if (card) card.classList.toggle('selected', cb.checked);
+        syncMediaSelection(content);
+      });
+    });
+    grid.querySelectorAll('[data-copy]').forEach(function (b) { b.addEventListener('click', function () { copyText(dec(b.getAttribute('data-copy'))); toast(t('admin.media.copied'), 'ok'); }); });
+    grid.querySelectorAll('[data-mdimg]').forEach(function (b) {
+      b.addEventListener('click', function () {
+        var md = '![' + (b.getAttribute('data-mdname') || '') + '](' + dec(b.getAttribute('data-mdimg')) + ')';
+        copyText(md); toast(t('admin.media.copiedMd'), 'ok');
+      });
+    });
+    grid.querySelectorAll('[data-preview]').forEach(function (el) {
+      el.addEventListener('click', function () { openMediaLightbox(dec(el.getAttribute('data-preview'))); });
+    });
+    grid.querySelectorAll('[data-delmedia]').forEach(function (b) { b.addEventListener('click', function () {
+      var mid = dec(b.getAttribute('data-delmedia'));
+      confirmModal(t('admin.media.delete'), '<p class="ab-muted">' + t('admin.media.deleteConfirm') + '</p>', async function () {
+        try { await api('api/media/' + enc(mid), { method: 'DELETE' }); toast(t('admin.media.deleted'), 'ok'); loadMedia(content); } catch (e) { toast(t('admin.postList.opFail') + (e.message || e), 'err'); }
+      }, t('admin.comments.delete'));
+    }); });
+    syncMediaSelection(content);
+  }
+  var mediaLightbox = { list: [], index: 0, el: null };
+  function ensureMediaLightbox() {
+    if (mediaLightbox.el) return mediaLightbox.el;
+    var el = document.createElement('div');
+    el.className = 'ab-lightbox';
+    el.setAttribute('role', 'dialog');
+    el.setAttribute('aria-modal', 'true');
+    el.innerHTML = '<button type="button" class="ab-lb-close" data-lb="close" aria-label="' + t('lightbox.close') + '">✕</button>' +
+      '<button type="button" class="ab-lb-nav prev" data-lb="prev" aria-label="' + t('lightbox.prev') + '">‹</button>' +
+      '<img class="ab-lb-img" alt="">' +
+      '<button type="button" class="ab-lb-nav next" data-lb="next" aria-label="' + t('lightbox.next') + '">›</button>' +
+      '<div class="ab-lb-counter"></div>';
+    document.body.appendChild(el);
+    el.addEventListener('click', function (e) {
+      var act = (e.target && e.target.getAttribute) ? e.target.getAttribute('data-lb') : '';
+      if (act === 'close' || e.target === el) closeMediaLightbox();
+      else if (act === 'prev') stepMediaLightbox(-1);
+      else if (act === 'next') stepMediaLightbox(1);
+    });
+    document.addEventListener('keydown', function (e) {
+      if (!mediaLightbox.el || !mediaLightbox.el.classList.contains('open')) return;
+      if (e.key === 'Escape') closeMediaLightbox();
+      else if (e.key === 'ArrowLeft') stepMediaLightbox(-1);
+      else if (e.key === 'ArrowRight') stepMediaLightbox(1);
+    });
+    mediaLightbox.el = el;
+    return el;
+  }
+  function openMediaLightbox(id) {
+    var list = mediaFiltered();
+    var idx = -1;
+    for (var i = 0; i < list.length; i++) if (list[i].id === id) idx = i;
+    if (idx < 0) return;
+    mediaLightbox.list = list;
+    mediaLightbox.index = idx;
+    var el = ensureMediaLightbox();
+    el.classList.add('open');
+    showMediaLightbox();
+  }
+  function showMediaLightbox() {
+    var el = mediaLightbox.el;
+    if (!el) return;
+    var item = mediaLightbox.list[mediaLightbox.index];
+    if (!item) return;
+    var img = el.querySelector('.ab-lb-img');
+    if (img) { img.src = item.url || item.thumbUrl || item.thumb_url || ''; img.alt = item.name || ''; }
+    var counter = el.querySelector('.ab-lb-counter');
+    if (counter) counter.textContent = t('lightbox.counter', { current: mediaLightbox.index + 1, total: mediaLightbox.list.length });
+  }
+  function stepMediaLightbox(delta) {
+    var n = mediaLightbox.list.length;
+    if (!n) return;
+    mediaLightbox.index = (mediaLightbox.index + delta + n) % n;
+    showMediaLightbox();
+  }
+  function closeMediaLightbox() {
+    if (mediaLightbox.el) mediaLightbox.el.classList.remove('open');
+  }
+  function syncMediaSelection(content) {
+    var ids = Object.keys(mediaState.selected);
+    var info = content.querySelector('#abMediaSelInfo');
+    var btn = content.querySelector('#abMediaBatchDel');
+    var all = content.querySelector('#abMediaAll');
+    if (info) info.textContent = ids.length ? t('admin.media.selectedItems', { n: ids.length }) : '';
+    if (btn) btn.disabled = ids.length === 0;
+    if (all) {
+      var list = mediaFiltered();
+      all.checked = list.length > 0 && list.every(function (m) { return !!mediaState.selected[m.id]; });
+    }
+  }
+  function toggleSelectAll(content, on) {
+    mediaFiltered().forEach(function (m) { if (on) mediaState.selected[m.id] = true; else delete mediaState.selected[m.id]; });
+    renderMediaGrid(content);
+  }
+  async function batchDeleteMedia(content) {
+    var ids = Object.keys(mediaState.selected);
+    if (!ids.length) return;
+    confirmModal(t('admin.media.batchDelete'), '<p class="ab-muted">' + t('admin.media.batchConfirm', { n: ids.length }) + '</p>', async function () {
+      var ok = 0;
+      for (var i = 0; i < ids.length; i++) {
+        try { await api('api/media/' + enc(ids[i]), { method: 'DELETE' }); ok++; } catch (e) {}
+      }
+      toast(ok ? t('admin.media.batchDeleted', { n: ok }) : t('admin.postList.opFail'), ok ? 'ok' : 'err');
+      mediaState.selected = {};
+      loadMedia(content);
+    }, t('admin.comments.delete'));
+  }
+
   function copyText(t) {
     try { if (navigator.clipboard) navigator.clipboard.writeText(t); else { var ta = document.createElement('textarea'); ta.value = t; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove(); } } catch (e) {}
   }
@@ -2697,32 +3722,89 @@
     if (status === 'pending') return t('admin.subscribers.pending');
     return t('admin.subscribers.unsubscribed');
   }
+  var subState = { list: [], groups: [], enabled: false, kw: '', status: 'all', group: 'all', page: 1, per: 20 };
   function pageSubscribers(content) {
     content.innerHTML = '<div class="ab-page-head"><div><h1 class="ab-page-title">' + t('admin.subscribers.title') + '</h1><p class="ab-page-sub">' + t('admin.subscribers.desc') + '</p></div>' +
-      '<div class="ab-row" style="gap:8px"><button class="ab-btn" id="abSubExport">' + icon('download', 14) + ' ' + t('admin.subscribers.export') + '</button><button class="ab-btn" id="abSubRefresh">' + icon('refresh', 14) + ' ' + t('admin.backup.refresh') + '</button></div></div>' +
-      '<div class="ab-grid cols-3" id="abSubStats"></div><div class="ab-card" id="abSubNotice" style="margin-bottom:16px"></div>' +
-      '<div class="ab-card"><div class="ab-table-wrap"><table class="ab-table"><thead><tr><th>' + t('admin.subscribers.colEmail') + '</th><th>' + t('admin.subscribers.colStatus') + '</th><th>' + t('admin.subscribers.colDate') + '</th><th class="col-actions">' + t('admin.postList.colActions') + '</th></tr></thead><tbody id="abSubBody"></tbody></table></div></div>';
+      '<div class="ab-row" style="gap:8px"><button class="ab-btn primary" id="abSubBroadcast">' + icon('send', 14) + ' ' + t('admin.subscribers.broadcast') + '</button><button class="ab-btn" id="abSubExport">' + icon('download', 14) + ' ' + t('admin.subscribers.export') + '</button><button class="ab-btn" id="abSubRefresh">' + icon('refresh', 14) + ' ' + t('admin.backup.refresh') + '</button></div></div>' +
+      '<div class="ab-grid cols-4" id="abSubStats"></div><div class="ab-card" id="abSubNotice" style="margin-bottom:16px"></div>' +
+      '<div class="ab-toolbar"><div class="ab-search"><input class="ab-input" id="abSubKw" placeholder="' + t('admin.subscribers.search') + '"></div>' +
+      '<select class="ab-select" id="abSubStatus" style="max-width:170px"><option value="all">' + t('admin.subscribers.filterAll') + '</option><option value="active">' + t('admin.subscribers.active') + '</option><option value="pending">' + t('admin.subscribers.pending') + '</option><option value="unsubscribed">' + t('admin.subscribers.unsubscribed') + '</option></select>' +
+      '<select class="ab-select" id="abSubGroup" style="max-width:190px"></select></div>' +
+      '<div class="ab-card"><div class="ab-table-wrap"><table class="ab-table"><thead><tr><th>' + t('admin.subscribers.colEmail') + '</th><th>' + t('admin.subscribers.colGroups') + '</th><th>' + t('admin.subscribers.colStatus') + '</th><th>' + t('admin.subscribers.colDate') + '</th><th class="col-actions">' + t('admin.postList.colActions') + '</th></tr></thead><tbody id="abSubBody"></tbody></table></div><div class="ab-pagination" id="abSubPage" style="padding:0 4px 6px"></div></div>';
+    var kw = content.querySelector('#abSubKw');
+    kw.value = subState.kw;
+    kw.addEventListener('input', debounce(function () { subState.kw = (kw.value || '').trim().toLowerCase(); subState.page = 1; renderSubscribers(content); }, 200));
+    var st = content.querySelector('#abSubStatus');
+    st.value = subState.status;
+    st.addEventListener('change', function () { subState.status = st.value; subState.page = 1; renderSubscribers(content); });
+    var grp = content.querySelector('#abSubGroup');
+    grp.addEventListener('change', function () { subState.group = grp.value; subState.page = 1; renderSubscribers(content); });
     content.querySelector('#abSubRefresh').addEventListener('click', function () { loadSubscribers(content); });
     content.querySelector('#abSubExport').addEventListener('click', function () { exportSubscribers(content); });
+    content.querySelector('#abSubBroadcast').addEventListener('click', function () { openBroadcastModal(content); });
     loadSubscribers(content);
   }
   async function loadSubscribers(content) {
     var body = content.querySelector('#abSubBody');
-    body.innerHTML = '<tr><td colspan="4" style="text-align:center;padding:30px"><span class="ab-spin"></span> ' + t('site.loading') + '</td></tr>';
+    body.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:30px"><span class="ab-spin"></span> ' + t('site.loading') + '</td></tr>';
     try {
       var d = await api('api/admin/subscribers');
       var counts = (d && d.counts) || { total: 0, active: 0, pending: 0, unsubscribed: 0 };
+      subState.groups = (d && d.groups) || [];
+      subState.enabled = !!(d && d.enabled);
       content.querySelector('#abSubStats').innerHTML = [
         { label: t('admin.subscribers.total'), value: counts.total, icon: 'send' },
         { label: t('admin.subscribers.active'), value: counts.active, icon: 'check' },
-        { label: t('admin.subscribers.pending'), value: counts.pending, icon: 'clock' }
+        { label: t('admin.subscribers.pending'), value: counts.pending, icon: 'clock' },
+        { label: t('admin.subscribers.statGroups'), value: subState.groups.length, icon: 'list' }
       ].map(function (x) { return '<div class="ab-card ab-stat"><div class="ab-stat-label">' + icon(x.icon, 16) + esc(x.label) + '</div><div class="ab-stat-value">' + esc(String(x.value)) + '</div></div>'; }).join('');
       content.querySelector('#abSubNotice').innerHTML = d && d.enabled ? '<div class="ab-row" style="gap:8px;align-items:center"><span class="ab-chip">' + icon('send', 13) + ' Resend</span><b>' + t('admin.subscribers.enabled') + '</b></div>' : '<div class="ab-row" style="gap:8px;align-items:center"><span class="ab-chip">' + t('admin.backup.disabledChip') + '</span><b>' + t('admin.subscribers.disabled') + '</b><span class="ab-muted">RESEND_API_KEY / BLOG_MAIL_FROM / SITE_URL</span></div>';
-      var list = (d && d.subscribers) || [];
-      if (!list.length) { body.innerHTML = '<tr><td colspan="4" style="text-align:center;padding:34px" class="ab-muted">' + t('admin.subscribers.empty') + '</td></tr>'; return; }
-      body.innerHTML = list.map(function (sub) {
-        return '<tr><td>' + esc(sub.email) + '</td><td><span class="ab-status ' + (sub.status === 'active' ? 'published' : sub.status === 'pending' ? 'scheduled' : 'draft') + '">' + esc(subscriberStatusLabel(sub.status)) + '</span></td><td>' + esc(fmtTimestamp(sub.created_at)) + '</td><td class="col-actions"><button class="ab-btn sm danger" data-sub-delete="' + esc(sub.id) + '">' + icon('trash', 12) + ' ' + t('admin.comments.delete') + '</button></td></tr>';
+      var groupSel = content.querySelector('#abSubGroup');
+      if (groupSel) {
+        groupSel.innerHTML = '<option value="all">' + t('admin.subscribers.filterGroup') + '</option>' + subState.groups.map(function (g) { return '<option value="' + esc(g.name) + '">' + esc(g.name) + ' (' + Number(g.count || 0) + ')</option>'; }).join('');
+        var stillThere = subState.group === 'all' || subState.groups.some(function (g) { return g.name === subState.group; });
+        if (!stillThere) subState.group = 'all';
+        groupSel.value = subState.group;
+      }
+      subState.list = ((d && d.subscribers) || []).slice();
+      renderSubscribers(content);
+    } catch (e) { body.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:30px" class="ab-muted">' + esc(e.message || e) + '</td></tr>'; }
+  }
+  /** 订阅者列表：关键字 + 状态过滤，分页渲染（每页 20） */
+  function filteredSubscribers() {
+    var list = subState.list;
+    if (subState.status !== 'all') list = list.filter(function (s) { return s.status === subState.status; });
+    if (subState.group !== 'all') list = list.filter(function (s) { return (s.groups || []).indexOf(subState.group) >= 0; });
+    if (subState.kw) list = list.filter(function (s) { return String(s.email || '').toLowerCase().indexOf(subState.kw) >= 0; });
+    return list;
+  }
+  function renderSubscribers(content) {
+    var body = content.querySelector('#abSubBody');
+    var pg = content.querySelector('#abSubPage');
+    if (!body) return;
+    var list = filteredSubscribers();
+    var per = subState.per;
+    var totalPages = Math.max(1, Math.ceil(list.length / per));
+    if (subState.page > totalPages) subState.page = totalPages;
+    var page = subState.page;
+    var view = list.slice((page - 1) * per, page * per);
+    if (!view.length) {
+      body.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:34px" class="ab-muted">' + ((subState.kw || subState.status !== 'all' || subState.group !== 'all') ? t('admin.subscribers.noMatch') : t('admin.subscribers.empty')) + '</td></tr>';
+    } else {
+      body.innerHTML = view.map(function (sub) {
+        var groups = Array.isArray(sub.groups) ? sub.groups : [];
+        var groupCell = (groups.length ? groups.map(function (g) { return '<span class="ab-chip cat">' + esc(g) + '</span>'; }).join(' ') : '<span class="ab-muted">' + t('admin.subscribers.groupNone') + '</span>') +
+          ' <button class="ab-btn sm" data-sub-groups="' + esc(sub.id) + '">' + icon('pen', 11) + ' ' + t('admin.subscribers.editGroups') + '</button>';
+        return '<tr><td>' + esc(sub.email) + '</td><td class="ab-td-tags">' + groupCell + '</td><td><span class="ab-status ' + (sub.status === 'active' ? 'published' : sub.status === 'pending' ? 'scheduled' : 'draft') + '">' + esc(subscriberStatusLabel(sub.status)) + '</span></td><td>' + esc(fmtTimestamp(sub.created_at)) + '</td><td class="col-actions"><button class="ab-btn sm danger" data-sub-delete="' + esc(sub.id) + '">' + icon('trash', 12) + ' ' + t('admin.comments.delete') + '</button></td></tr>';
       }).join('');
+      body.querySelectorAll('[data-sub-groups]').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          var sid = btn.getAttribute('data-sub-groups');
+          var target = null;
+          for (var i = 0; i < subState.list.length; i++) { if (String(subState.list[i].id) === String(sid)) { target = subState.list[i]; break; } }
+          if (target) editSubscriberGroups(content, target);
+        });
+      });
       body.querySelectorAll('[data-sub-delete]').forEach(function (btn) {
         btn.addEventListener('click', function () {
           var id = btn.getAttribute('data-sub-delete');
@@ -2732,16 +3814,118 @@
           }, t('admin.comments.delete'));
         });
       });
-    } catch (e) { body.innerHTML = '<tr><td colspan="4" style="text-align:center;padding:30px" class="ab-muted">' + esc(e.message || e) + '</td></tr>'; }
+    }
+    if (pg) {
+      pg.innerHTML = list.length > per
+        ? (page > 1 ? '<button class="ab-page-btn" data-p="' + (page - 1) + '">' + t('pagination.prev') + '</button>' : '') +
+          '<button class="ab-page-btn active">' + page + ' / ' + totalPages + '</button>' +
+          (page < totalPages ? '<button class="ab-page-btn" data-p="' + (page + 1) + '">' + t('pagination.next') + '</button>' : '')
+        : '';
+      pg.querySelectorAll('[data-p]').forEach(function (b) { b.addEventListener('click', function () { subState.page = parseInt(b.getAttribute('data-p'), 10) || 1; renderSubscribers(content); }); });
+    }
   }
   async function exportSubscribers(content) {
     try {
-      var d = await api('api/admin/subscribers');
+      // 导出遵循当前搜索 / 状态筛选；未筛选时导出全部
+      var list = subState.list.length ? filteredSubscribers() : ((await api('api/admin/subscribers')).subscribers || []);
       var rows = [['email', 'status', 'created_at']];
-      ((d && d.subscribers) || []).forEach(function (s) { rows.push([s.email, s.status, new Date(Number(s.created_at) || 0).toISOString()]); });
+      list.forEach(function (s) { rows.push([s.email, s.status, s.created_at ? new Date(Number(s.created_at) || 0).toISOString() : '']); });
       var csv = rows.map(function (r) { return r.map(function (v) { return '"' + String(v).replace(/"/g, '""') + '"'; }).join(','); }).join('\n');
       transferDownloadText('subscribers-' + transferStamp() + '.csv', '\ufeff' + csv, 'text/csv;charset=utf-8');
     } catch (e) { toast(t('admin.subscribers.exportFail') + (e.message || e), 'err'); }
+  }
+
+  /* 生成草稿预览分享链接（带签名，7 天有效） */
+  async function openPreviewLink(content, route) {
+    if (!route.id) { toast(t('admin.editor.previewNeedSave'), 'err'); return; }
+    try {
+      var r = await api('api/admin/preview-link', { method: 'POST', body: JSON.stringify({ postId: route.id, ttlDays: 7 }) });
+      if (!r || !r.url) throw new Error(t('admin.editor.previewFail'));
+      var mask = document.createElement('div');
+      mask.className = 'ab-modal-mask';
+      mask.innerHTML = '<div class="ab-modal"><h3>' + t('admin.editor.previewTitle') + '</h3>' +
+        '<input class="ab-input" id="abPvUrl" readonly value="' + esc(r.url) + '" style="width:100%">' +
+        '<label class="ab-hint">' + t('admin.editor.previewHint') + '</label>' +
+        '<div class="ab-modal-actions"><button class="ab-btn ghost" data-act="cancel">' + t('confirm.cancel') + '</button>' +
+        '<button class="ab-btn" id="abPvCopy">' + t('admin.editor.previewCopy') + '</button>' +
+        '<button class="ab-btn primary" id="abPvOpen">' + t('admin.editor.previewOpen') + '</button></div></div>';
+      document.body.appendChild(mask);
+      mask.addEventListener('click', function (e) { if (e.target === mask || e.target.getAttribute('data-act') === 'cancel') mask.remove(); });
+      var input = mask.querySelector('#abPvUrl');
+      input.addEventListener('focus', function () { try { input.select(); } catch (e) {} });
+      mask.querySelector('#abPvCopy').addEventListener('click', function () {
+        try { input.select(); } catch (e) {}
+        function done() { toast(t('admin.editor.previewCopied'), 'ok'); }
+        try {
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(input.value).then(done, function () { try { document.execCommand('copy'); done(); } catch (e) {} });
+            return;
+          }
+        } catch (e) {}
+        try { document.execCommand('copy'); done(); } catch (e) {}
+      });
+      mask.querySelector('#abPvOpen').addEventListener('click', function () { try { window.open(input.value, '_blank'); } catch (e) {} });
+    } catch (e) { toast(t('admin.editor.previewFail') + (e.message || e), 'err'); }
+  }
+
+  function editSubscriberGroups(content, sub) {
+    var mask = document.createElement('div');
+    mask.className = 'ab-modal-mask';
+    mask.innerHTML = '<div class="ab-modal"><h3>' + t('admin.subscribers.editGroups') + '</h3>' +
+      '<p class="ab-muted" style="margin:0 0 10px">' + esc(sub.email) + '</p>' +
+      '<input class="ab-input" id="abSubGroupsInput" placeholder="' + t('admin.subscribers.groupsPlaceholder') + '" value="' + esc((sub.groups || []).join(', ')) + '">' +
+      '<label class="ab-hint">' + t('admin.subscribers.groupsHint') + '</label>' +
+      '<div class="ab-modal-actions"><button class="ab-btn ghost" data-act="cancel">' + t('confirm.cancel') + '</button><button class="ab-btn primary" id="abSubGroupsSave">' + t('confirm.yes') + '</button></div></div>';
+    document.body.appendChild(mask);
+    mask.addEventListener('click', function (e) { if (e.target === mask || e.target.getAttribute('data-act') === 'cancel') mask.remove(); });
+    var input = mask.querySelector('#abSubGroupsInput');
+    if (input) input.focus();
+    mask.querySelector('#abSubGroupsSave').addEventListener('click', async function () {
+      var raw = input ? input.value : '';
+      var groups = raw.split(/[,，]/).map(function (x) { return x.trim(); }).filter(Boolean);
+      try {
+        await api('api/admin/subscribers/' + enc(sub.id), { method: 'PUT', body: JSON.stringify({ groups: groups }) });
+        mask.remove();
+        toast(t('admin.subscribers.groupsSaved'), 'ok');
+        loadSubscribers(content);
+      } catch (e) { toast(t('admin.subscribers.groupsSaveFail') + (e.message || e), 'err'); }
+    });
+  }
+  /* 群发邮件：按分组多选（留空=全部已确认订阅者）写入发件箱 */
+  function openBroadcastModal(content) {
+    if (!subState.enabled) { toast(t('admin.subscribers.broadcastMailDisabled'), 'err'); return; }
+    var groupBoxes = (subState.groups || []).map(function (g) {
+      return '<label style="display:flex;align-items:center;gap:6px;font-size:13px"><input type="checkbox" class="ab-bc-group" value="' + esc(g.name) + '"> ' + esc(g.name) + ' <span class="ab-muted">(' + Number(g.count || 0) + ')</span></label>';
+    }).join('');
+    var mask = document.createElement('div');
+    mask.className = 'ab-modal-mask';
+    mask.innerHTML = '<div class="ab-modal" style="max-width:560px"><h3>' + t('admin.subscribers.broadcastTitle') + '</h3>' +
+      '<div class="ab-field"><label class="ab-label">' + t('admin.subscribers.broadcastTarget') + '</label>' +
+      (groupBoxes ? '<div style="display:flex;flex-wrap:wrap;gap:10px;max-height:120px;overflow:auto">' + groupBoxes + '</div>' : '') +
+      '<label class="ab-hint">' + t('admin.subscribers.broadcastGroupsHint') + '</label></div>' +
+      '<div class="ab-field"><label class="ab-label">' + t('admin.subscribers.broadcastSubject') + '</label><input class="ab-input" id="abBcSubject" maxlength="160"></div>' +
+      '<div class="ab-field"><label class="ab-label">' + t('admin.subscribers.broadcastBody') + '</label><textarea class="ab-textarea" id="abBcBody" style="min-height:160px" maxlength="20000"></textarea></div>' +
+      '<div class="ab-modal-actions"><button class="ab-btn ghost" data-act="cancel">' + t('confirm.cancel') + '</button><button class="ab-btn primary" id="abBcSend">' + t('admin.subscribers.broadcastSend') + '</button></div></div>';
+    document.body.appendChild(mask);
+    mask.addEventListener('click', function (e) { if (e.target === mask || e.target.getAttribute('data-act') === 'cancel') mask.remove(); });
+    mask.querySelector('#abBcSend').addEventListener('click', async function () {
+      var subject = mask.querySelector('#abBcSubject').value.trim();
+      var text = mask.querySelector('#abBcBody').value.trim();
+      var groups = [];
+      mask.querySelectorAll('.ab-bc-group').forEach(function (cb) { if (cb.checked) groups.push(cb.value); });
+      if (!subject) { toast(t('admin.subscribers.broadcastNeedSubject'), 'err'); return; }
+      if (!text) { toast(t('admin.subscribers.broadcastNeedBody'), 'err'); return; }
+      var btn = mask.querySelector('#abBcSend');
+      btn.disabled = true;
+      try {
+        var r = await api('api/admin/subscribers/broadcast', { method: 'POST', body: JSON.stringify({ subject: subject, body: text, groups: groups }) });
+        var n = (r && r.queued) || 0;
+        if (n > 0) toast(t('admin.subscribers.broadcastQueued', { n: n }), 'ok');
+        else toast(t('admin.subscribers.broadcastEmpty'), 'err');
+        mask.remove();
+      } catch (e) { toast(t('admin.subscribers.broadcastFail') + (e.message || e), 'err'); }
+      btn.disabled = false;
+    });
   }
 
   /* ====================== 备份与恢复 ====================== */
@@ -2750,35 +3934,67 @@
     if (reason === 'pre-restore') return t('admin.backup.reasonSafety');
     return t('admin.backup.reasonManual');
   }
+  var backupState = { list: [], page: 1, per: 10 };
   function pageBackups(content) {
     content.innerHTML =
       '<div class="ab-page-head"><div><h1 class="ab-page-title">' + t('admin.backup.title') + '</h1><p class="ab-page-sub">' + t('admin.backup.desc') + '</p></div>' +
         '<div class="ab-row" style="gap:8px"><button class="ab-btn" id="abBackupRefresh">' + icon('refresh', 14) + ' ' + t('admin.backup.refresh') + '</button>' +
         '<button class="ab-btn primary" id="abBackupCreate">' + icon('save', 14) + ' ' + t('admin.backup.create') + '</button></div></div>' +
       '<div class="ab-card" id="abBackupNotice" style="margin-bottom:16px"></div>' +
-      '<div class="ab-card"><div class="ab-section-title">' + icon('save', 16) + ' ' + t('admin.backup.history') + '</div>' +
-        '<div class="ab-table-wrap" style="margin-top:12px"><table class="ab-table"><thead><tr><th>' + t('admin.backup.colTime') + '</th><th>' + t('admin.backup.colReason') + '</th><th>' + t('admin.backup.colSize') + '</th><th class="col-actions">' + t('admin.postList.colActions') + '</th></tr></thead><tbody id="abBackupBody"></tbody></table></div></div>';
+      '<div class="ab-card"><div class="ab-section-title">' + icon('save', 16) + ' ' + t('admin.backup.history') +
+        '<span class="ab-muted" id="abBackupTotal" style="font-weight:400;font-size:12.5px;margin-left:8px"></span></div>' +
+        '<div class="ab-table-wrap" style="margin-top:12px"><table class="ab-table"><thead><tr><th>' + t('admin.backup.colTime') + '</th><th>' + t('admin.backup.colReason') + '</th><th>' + t('admin.backup.colContents') + '</th><th>' + t('admin.backup.colSize') + '</th><th class="col-actions">' + t('admin.postList.colActions') + '</th></tr></thead><tbody id="abBackupBody"></tbody></table></div><div class="ab-pagination" id="abBackupPage" style="padding:0 4px 6px"></div></div>';
     content.querySelector('#abBackupRefresh').addEventListener('click', function () { loadBackups(content); });
     content.querySelector('#abBackupCreate').addEventListener('click', function () { createBackupManual(content); });
     loadBackups(content);
   }
+  /** 备份内容摘要：文章 / 评论 / 媒体 / 音乐 / 订阅者 */
+  function backupCountsHtml(counts) {
+    counts = counts || {};
+    var parts = [];
+    if (counts.posts) parts.push(t('admin.backup.cPosts') + ' ' + Number(counts.posts || 0));
+    if (counts.comments) parts.push(t('admin.backup.cComments') + ' ' + Number(counts.comments || 0));
+    if (counts.media) parts.push(t('admin.backup.cMedia') + ' ' + Number(counts.media || 0));
+    if (counts.music) parts.push(t('admin.backup.cMusic') + ' ' + Number(counts.music || 0));
+    if (counts.subscribers) parts.push(t('admin.backup.cSubs') + ' ' + Number(counts.subscribers || 0));
+    return parts.length ? '<span class="ab-muted" style="font-size:12.5px">' + esc(parts.join(' · ')) + '</span>' : '<span class="ab-muted">—</span>';
+  }
   async function loadBackups(content) {
     var body = content.querySelector('#abBackupBody');
     var notice = content.querySelector('#abBackupNotice');
-    body.innerHTML = '<tr><td colspan="4" style="text-align:center;padding:30px"><span class="ab-spin"></span> ' + t('site.loading') + '</td></tr>';
+    body.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:30px"><span class="ab-spin"></span> ' + t('site.loading') + '</td></tr>';
     try {
       var d = await api('api/admin/backups');
       var configured = !!(d && d.configured);
-      var list = (d && d.backups) || [];
+      backupState.list = (d && d.backups) || [];
       notice.innerHTML = configured
         ? '<div class="ab-row" style="align-items:center;gap:8px;flex-wrap:wrap"><span class="ab-chip">' + icon('cloud', 13) + ' R2</span><b>' + t('admin.backup.enabled') + '</b><span class="ab-muted">' + t('admin.backup.schedule') + '</span></div>'
         : '<div class="ab-row" style="align-items:center;gap:8px;flex-wrap:wrap"><span class="ab-chip">' + t('admin.backup.disabledChip') + '</span><b>' + t('admin.backup.disabled') + '</b><span class="ab-muted">' + t('admin.backup.configureHint') + '</span></div>';
-      if (!list.length) {
-        body.innerHTML = '<tr><td colspan="4" style="text-align:center;padding:34px" class="ab-muted">' + t('admin.backup.empty') + '</td></tr>';
-        return;
-      }
-      body.innerHTML = list.map(function (b) {
-        return '<tr><td>' + esc(fmtTimestamp(b.createdAt)) + '</td><td><span class="ab-chip">' + esc(backupReasonLabel(b.reason)) + '</span></td><td>' + esc(fmtSize(b.size)) + '</td>' +
+      renderBackups(content);
+    } catch (e) {
+      notice.innerHTML = '<span class="ab-muted">' + esc(t('admin.backup.loadFail') + (e.message || e)) + '</span>';
+      body.innerHTML = '';
+    }
+  }
+  /** 备份列表：分页渲染（每页 10），显示内容摘要 */
+  function renderBackups(content) {
+    var body = content.querySelector('#abBackupBody');
+    var pg = content.querySelector('#abBackupPage');
+    var totalEl = content.querySelector('#abBackupTotal');
+    if (!body) return;
+    var list = backupState.list;
+    if (totalEl) totalEl.textContent = list.length ? t('admin.backup.total', { n: list.length }) : '';
+    var per = backupState.per;
+    var totalPages = Math.max(1, Math.ceil(list.length / per));
+    if (backupState.page > totalPages) backupState.page = totalPages;
+    var page = backupState.page;
+    var view = list.slice((page - 1) * per, page * per);
+    if (!view.length) {
+      body.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:34px" class="ab-muted">' + t('admin.backup.empty') + '</td></tr>';
+    } else {
+      body.innerHTML = view.map(function (b) {
+        return '<tr><td>' + esc(fmtTimestamp(b.createdAt)) + '</td><td><span class="ab-chip">' + esc(backupReasonLabel(b.reason)) + '</span></td>' +
+          '<td>' + backupCountsHtml(b.counts) + '</td><td>' + esc(fmtSize(b.size)) + '</td>' +
           '<td class="col-actions"><button class="ab-btn sm" data-backup-download="' + esc(b.id) + '">' + icon('download', 12) + ' ' + t('admin.backup.download') + '</button> ' +
           '<button class="ab-btn sm" data-backup-restore="' + esc(b.id) + '">' + icon('refresh', 12) + ' ' + t('admin.backup.restore') + '</button> ' +
           '<button class="ab-btn sm danger" data-backup-delete="' + esc(b.id) + '">' + icon('trash', 12) + ' ' + t('admin.comments.delete') + '</button></td></tr>';
@@ -2808,9 +4024,14 @@
           }, t('admin.comments.delete'));
         });
       });
-    } catch (e) {
-      notice.innerHTML = '<span class="ab-muted">' + esc(t('admin.backup.loadFail') + (e.message || e)) + '</span>';
-      body.innerHTML = '';
+    }
+    if (pg) {
+      pg.innerHTML = list.length > per
+        ? (page > 1 ? '<button class="ab-page-btn" data-p="' + (page - 1) + '">' + t('pagination.prev') + '</button>' : '') +
+          '<button class="ab-page-btn active">' + page + ' / ' + totalPages + '</button>' +
+          (page < totalPages ? '<button class="ab-page-btn" data-p="' + (page + 1) + '">' + t('pagination.next') + '</button>' : '')
+        : '';
+      pg.querySelectorAll('[data-p]').forEach(function (b) { b.addEventListener('click', function () { backupState.page = parseInt(b.getAttribute('data-p'), 10) || 1; renderBackups(content); }); });
     }
   }
   async function createBackupManual(content) {
@@ -2832,8 +4053,243 @@
     } catch (e) { toast(t('admin.backup.downloadFail') + (e.message || e), 'err'); }
   }
 
+
+  /* ====================== 操作审计日志 ====================== */
+  var auditState = { logs: [], action: 'all', from: '', to: '', page: 1, per: 20 };
+  var AUDIT_ACTIONS = ['post.delete', 'media.delete', 'settings.update', 'backup.create', 'backup.restore', 'backup.delete', 'audit.clear'];
+  function auditActionLabel(a) {
+    var key = 'admin.audit.a.' + String(a || '').replace(/[^a-z.]/g, '');
+    var label = t(key);
+    return (label && label !== key) ? label : String(a || '—');
+  }
+  /** 按日期范围过滤（端点为当天 00:00 / 23:59:59） */
+  function auditFiltered() {
+    var list = auditState.logs;
+    if (auditState.from) {
+      var f = new Date(auditState.from + 'T00:00:00').getTime();
+      if (!isNaN(f)) list = list.filter(function (r) { return Number(r.created_at) >= f; });
+    }
+    if (auditState.to) {
+      var e2 = new Date(auditState.to + 'T23:59:59').getTime();
+      if (!isNaN(e2)) list = list.filter(function (r) { return Number(r.created_at) <= e2; });
+    }
+    return list;
+  }
+  function pageAudit(content) {
+    content.innerHTML = '<div class="ab-page-head"><div><h1 class="ab-page-title">' + t('admin.audit.title') + '</h1><p class="ab-page-sub">' + t('admin.audit.desc') + '</p></div>' +
+      '<div class="ab-row" style="gap:8px"><button class="ab-btn" id="abAuditExport">' + icon('download', 14) + ' ' + t('admin.audit.export') + '</button>' +
+      '<button class="ab-btn" id="abAuditRefresh">' + icon('refresh', 14) + ' ' + t('admin.backup.refresh') + '</button>' +
+      '<button class="ab-btn danger" id="abAuditClear">' + icon('trash', 14) + ' ' + t('admin.audit.clear') + '</button></div></div>' +
+      '<div class="ab-toolbar" style="flex-wrap:wrap;gap:10px">' +
+        '<select class="ab-select" id="abAuditFilter" style="max-width:200px"><option value="all">' + t('admin.audit.allTypes') + '</option>' +
+          AUDIT_ACTIONS.map(function (a) { return '<option value="' + a + '">' + esc(auditActionLabel(a)) + '</option>'; }).join('') + '</select>' +
+        '<input class="ab-input" type="date" id="abAuditFrom" style="max-width:160px" aria-label="' + t('admin.audit.from') + '">' +
+        '<span class="ab-muted">—</span>' +
+        '<input class="ab-input" type="date" id="abAuditTo" style="max-width:160px" aria-label="' + t('admin.audit.to') + '">' +
+        '<button class="ab-btn sm" id="abAuditReset">' + t('admin.audit.reset') + '</button>' +
+        '<span class="ab-muted" id="abAuditInfo"></span></div>' +
+      '<div class="ab-card"><div class="ab-table-wrap"><table class="ab-table"><thead><tr><th>' + t('admin.backup.colTime') + '</th><th>' + t('admin.audit.colAction') + '</th><th>' + t('admin.audit.colTarget') + '</th><th>' + t('admin.audit.colIp') + '</th></tr></thead><tbody id="abAuditBody"></tbody></table></div><div class="ab-pagination" id="abAuditPage" style="padding:0 4px 6px"></div></div>';
+    content.querySelector('#abAuditRefresh').addEventListener('click', function () { loadAudit(content); });
+    content.querySelector('#abAuditExport').addEventListener('click', function () { exportAudit(content); });
+    var f = content.querySelector('#abAuditFilter');
+    f.value = auditState.action;
+    f.addEventListener('change', function () { auditState.action = f.value; auditState.page = 1; renderAudit(content); });
+    var from = content.querySelector('#abAuditFrom');
+    var to = content.querySelector('#abAuditTo');
+    from.value = auditState.from;
+    to.value = auditState.to;
+    from.addEventListener('change', function () { auditState.from = from.value; auditState.page = 1; renderAudit(content); });
+    to.addEventListener('change', function () { auditState.to = to.value; auditState.page = 1; renderAudit(content); });
+    content.querySelector('#abAuditReset').addEventListener('click', function () {
+      auditState.action = 'all'; auditState.from = ''; auditState.to = ''; auditState.page = 1;
+      f.value = 'all'; from.value = ''; to.value = '';
+      renderAudit(content);
+    });
+    content.querySelector('#abAuditClear').addEventListener('click', function () {
+      confirmModal(t('admin.audit.clear'), '<p class="ab-muted">' + t('admin.audit.clearConfirm') + '</p>', async function () {
+        try { await api('api/admin/audit', { method: 'DELETE' }); toast(t('admin.audit.cleared'), 'ok'); loadAudit(content); }
+        catch (e) { toast(t('admin.postList.opFail') + (e.message || e), 'err'); }
+      }, t('admin.audit.clear'));
+    });
+    loadAudit(content);
+  }
+  async function loadAudit(content) {
+    var body = content.querySelector('#abAuditBody');
+    if (!body) return;
+    body.innerHTML = '<tr><td colspan="4" style="text-align:center;padding:30px"><span class="ab-spin"></span> ' + t('site.loading') + '</td></tr>';
+    try {
+      var url = 'api/admin/audit?limit=500' + (auditState.action !== 'all' ? '&action=' + enc(auditState.action) : '');
+      var d = await api(url);
+      auditState.logs = (d && d.logs) || [];
+      renderAudit(content);
+    } catch (e) { body.innerHTML = '<tr><td colspan="4" style="text-align:center;padding:30px" class="ab-muted">' + esc(e.message || e) + '</td></tr>'; }
+  }
+  /** 列表渲染：日期过滤 + 分页（每页 20） */
+  function renderAudit(content) {
+    var body = content.querySelector('#abAuditBody');
+    var pg = content.querySelector('#abAuditPage');
+    var info = content.querySelector('#abAuditInfo');
+    if (!body) return;
+    var list = auditFiltered();
+    if (info) info.textContent = t('admin.audit.total', { n: list.length });
+    var per = auditState.per;
+    var totalPages = Math.max(1, Math.ceil(list.length / per));
+    if (auditState.page > totalPages) auditState.page = totalPages;
+    var page = auditState.page;
+    var view = list.slice((page - 1) * per, page * per);
+    if (!view.length) {
+      body.innerHTML = '<tr><td colspan="4" style="text-align:center;padding:34px" class="ab-muted">' + t('admin.audit.empty') + '</td></tr>';
+    } else {
+      body.innerHTML = view.map(function (r) {
+        return '<tr><td class="ab-td-date">' + esc(fmtTimestamp(r.created_at)) + '</td>' +
+          '<td><span class="ab-chip">' + esc(auditActionLabel(r.action)) + '</span></td>' +
+          '<td style="max-width:340px"><div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(((r.target || '') + (r.detail ? ' · ' + r.detail : '')) || '—') + '</div></td>' +
+          '<td class="ab-muted">' + esc(r.ip || '—') + '</td></tr>';
+      }).join('');
+    }
+    if (pg) {
+      pg.innerHTML = list.length > per
+        ? (page > 1 ? '<button class="ab-page-btn" data-p="' + (page - 1) + '">' + t('pagination.prev') + '</button>' : '') +
+          '<button class="ab-page-btn active">' + page + ' / ' + totalPages + '</button>' +
+          (page < totalPages ? '<button class="ab-page-btn" data-p="' + (page + 1) + '">' + t('pagination.next') + '</button>' : '')
+        : '';
+      pg.querySelectorAll('[data-p]').forEach(function (b) { b.addEventListener('click', function () { auditState.page = parseInt(b.getAttribute('data-p'), 10) || 1; renderAudit(content); }); });
+    }
+  }
+  /** 导出当前筛选结果为 CSV */
+  function exportAudit(content) {
+    try {
+      var list = auditFiltered();
+      var rows = [['time', 'action', 'target', 'detail', 'ip']];
+      list.forEach(function (r) {
+        rows.push([
+          r.created_at ? new Date(Number(r.created_at)).toISOString() : '',
+          r.action || '', r.target || '', r.detail || '', r.ip || ''
+        ]);
+      });
+      var csv = rows.map(function (r) { return r.map(function (v) { return '"' + String(v).replace(/"/g, '""') + '"'; }).join(','); }).join('\n');
+      transferDownloadText('audit-' + transferStamp() + '.csv', '\ufeff' + csv, 'text/csv;charset=utf-8');
+      toast(t('admin.audit.exported'), 'ok');
+    } catch (e) { toast(t('admin.postList.opFail') + (e.message || e), 'err'); }
+  }
+
+  /* ====================== 站点健康检查 ====================== */
+  var HEALTH_LABELS = { db: 'admin.health.db', kv: 'admin.health.kv', r2media: 'admin.health.r2media', r2backup: 'admin.health.r2backup', ai: 'admin.health.ai', mail: 'admin.health.mail' };
+  async function pageHealth(content) {
+    content.innerHTML = '<div class="ab-page-head"><div><h1 class="ab-page-title">' + t('admin.health.title') + '</h1><p class="ab-page-sub">' + t('admin.health.desc') + '</p></div>' +
+      '<button class="ab-btn" id="abHealthRefresh">' + icon('refresh', 14) + ' ' + t('admin.backup.refresh') + '</button></div>' +
+      '<div class="ab-card"><div id="abHealthBody"><span class="ab-spin"></span> ' + t('site.loading') + '</div></div>';
+    content.querySelector('#abHealthRefresh').addEventListener('click', function () { loadHealth(content); });
+    loadHealth(content);
+  }
+  async function loadHealth(content) {
+    var box = content.querySelector('#abHealthBody');
+    if (!box) return;
+    box.innerHTML = '<span class="ab-spin"></span> ' + t('site.loading');
+    try {
+      var d = await api('api/admin/health');
+      var items = (d && d.items) || [];
+      box.innerHTML = items.map(function (it) {
+        var label = t(HEALTH_LABELS[it.key] || it.key);
+        var chip = it.ok ? '<span class="ab-status approved">' + t('admin.health.ok') + '</span>' : '<span class="ab-status pending">' + t('admin.health.missing') + '</span>';
+        var extra = '';
+        if (it.key === 'db' && it.counts) {
+          extra = '<div class="ab-muted" style="font-size:12px;margin-top:4px">' + Object.keys(it.counts).map(function (k) { return esc(k) + ' ' + (it.counts[k] === null ? '—' : it.counts[k]); }).join(' · ') + '</div>';
+        }
+        return '<div class="ab-row" style="justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid var(--ab-border)"><div><b>' + esc(label) + '</b>' + extra + '</div>' + chip + '</div>';
+      }).join('');
+    } catch (e) { box.innerHTML = '<div class="ab-empty"><p>' + esc(e.message || e) + '</p></div>'; }
+  }
+
+  /* ====================== 前端错误日志 ====================== */
+  var errState = { list: [], total: 0, sumHits: 0, kw: '' };
+  async function pageErrors(content) {
+    content.innerHTML = '<div class="ab-page-head"><div><h1 class="ab-page-title">' + t('admin.errors.title') + '</h1><p class="ab-page-sub">' + t('admin.errors.desc') + '</p></div>' +
+      '<div class="ab-row" style="gap:8px"><button class="ab-btn danger" id="abErrClear">' + icon('trash', 14) + ' ' + t('admin.errors.clear') + '</button><button class="ab-btn" id="abErrRefresh">' + icon('refresh', 14) + ' ' + t('admin.backup.refresh') + '</button></div></div>' +
+      '<div class="ab-grid cols-2" id="abErrStats"></div>' +
+      '<div class="ab-toolbar"><div class="ab-search"><input class="ab-input" id="abErrKw" placeholder="' + t('admin.errors.search') + '"></div></div>' +
+      '<div class="ab-card"><div class="ab-table-wrap"><table class="ab-table"><thead><tr><th>' + t('admin.errors.colTime') + '</th><th>' + t('admin.errors.colKind') + '</th><th>' + t('admin.errors.colMessage') + '</th><th>' + t('admin.errors.colUrl') + '</th><th>' + t('admin.errors.colHits') + '</th></tr></thead><tbody id="abErrBody"></tbody></table></div></div>';
+    var kw = content.querySelector('#abErrKw');
+    kw.value = errState.kw;
+    kw.addEventListener('input', debounce(function () { errState.kw = (kw.value || '').trim().toLowerCase(); renderErrors(content); }, 200));
+    content.querySelector('#abErrRefresh').addEventListener('click', function () { loadErrors(content); });
+    content.querySelector('#abErrClear').addEventListener('click', function () {
+      confirmModal(t('admin.errors.clear'), '<p class="ab-muted">' + t('admin.errors.clearConfirm') + '</p>', async function () {
+        try { await api('api/admin/errors', { method: 'DELETE' }); toast(t('admin.errors.cleared'), 'ok'); loadErrors(content); }
+        catch (e) { toast(t('admin.errors.clearFail') + (e.message || e), 'err'); }
+      }, t('admin.errors.clear'));
+    });
+    loadErrors(content);
+  }
+  async function loadErrors(content) {
+    var body = content.querySelector('#abErrBody');
+    if (!body) return;
+    body.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:30px"><span class="ab-spin"></span> ' + t('admin.postList.loading') + '</td></tr>';
+    try {
+      var d = await api('api/admin/errors');
+      errState.list = (d && d.errors) || [];
+      errState.total = Number(d && d.total) || 0;
+      errState.sumHits = Number(d && d.sumHits) || 0;
+      content.querySelector('#abErrStats').innerHTML = [
+        { label: t('admin.errors.statKinds'), value: errState.total, icon: 'bug' },
+        { label: t('admin.errors.statHits'), value: errState.sumHits, icon: 'gauge' }
+      ].map(function (x) { return '<div class="ab-card ab-stat"><div class="ab-stat-label">' + icon(x.icon, 16) + esc(x.label) + '</div><div class="ab-stat-value">' + esc(String(x.value)) + '</div></div>'; }).join('');
+      renderErrors(content);
+    } catch (e) { body.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:30px" class="ab-muted">' + t('admin.postList.loadFail') + esc(e.message || e) + '</td></tr>'; }
+  }
+  function renderErrors(content) {
+    var body = content.querySelector('#abErrBody');
+    if (!body) return;
+    var list = errState.list;
+    if (errState.kw) list = list.filter(function (x) { return ((x.message || '') + ' ' + (x.source || '') + ' ' + (x.url || '')).toLowerCase().indexOf(errState.kw) >= 0; });
+    if (!list.length) { body.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:34px" class="ab-muted">' + t('admin.errors.empty') + '</td></tr>'; return; }
+    body.innerHTML = list.map(function (x) {
+      var kind = x.kind === 'promise' ? t('admin.errors.kindPromise') : t('admin.errors.kindError');
+      return '<tr><td style="white-space:nowrap">' + esc(fmtTimestamp(x.last_at)) + '</td>' +
+        '<td><span class="ab-status ' + (x.kind === 'promise' ? 'scheduled' : 'draft') + '">' + esc(kind) + '</span></td>' +
+        '<td style="max-width:420px"><div title="' + esc((x.stack || x.message || '').slice(0, 800)) + '">' + esc((x.message || '').slice(0, 160)) + '</div>' +
+        (x.source ? '<div class="ab-muted" style="font-size:12px">' + esc(x.source) + '</div>' : '') + '</td>' +
+        '<td style="max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(x.url || '') + '">' + esc(x.url || '—') + '</td>' +
+        '<td style="text-align:center">' + esc(String(Number(x.hits) || 1)) + '</td></tr>';
+    }).join('');
+  }
+
+  /* ====================== Webmention 引用管理 ====================== */
+  async function pageWebmentions(content) {
+    content.innerHTML = '<div class="ab-page-head"><div><h1 class="ab-page-title">' + t('admin.webmentions.title') + '</h1><p class="ab-page-sub">' + t('admin.webmentions.desc') + '</p></div>' +
+      '<button class="ab-btn" id="abWmRefresh">' + icon('refresh', 14) + ' ' + t('admin.backup.refresh') + '</button></div>' +
+      '<div class="ab-card"><div class="ab-table-wrap"><table class="ab-table"><thead><tr><th>' + t('admin.webmentions.colSource') + '</th><th>' + t('admin.webmentions.colTarget') + '</th><th>' + t('admin.webmentions.colAuthor') + '</th><th>' + t('admin.webmentions.colDate') + '</th><th class="col-actions">' + t('admin.postList.colActions') + '</th></tr></thead><tbody id="abWmBody"></tbody></table></div></div>';
+    content.querySelector('#abWmRefresh').addEventListener('click', function () { loadWebmentionsAdmin(content); });
+    loadWebmentionsAdmin(content);
+  }
+  async function loadWebmentionsAdmin(content) {
+    var body = content.querySelector('#abWmBody');
+    body.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:30px"><span class="ab-spin"></span> ' + t('admin.postList.loading') + '</td></tr>';
+    try {
+      var d = await api('api/admin/webmentions');
+      var list = (d && d.mentions) || [];
+      if (!list.length) { body.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:34px" class="ab-muted">' + t('admin.webmentions.empty') + '</td></tr>'; return; }
+      body.innerHTML = list.map(function (m) {
+        return '<tr><td style="max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><a href="' + esc(m.source) + '" target="_blank" rel="noopener nofollow">' + esc(m.source) + '</a></td>' +
+          '<td><code style="font-size:12px">' + esc(m.post_id || m.target) + '</code></td>' +
+          '<td>' + esc(m.author_name || '—') + '</td>' +
+          '<td>' + esc(fmtTimestamp(m.created_at)) + '</td>' +
+          '<td class="col-actions"><button class="ab-btn sm danger" data-wm-del="' + m.id + '">' + icon('trash', 12) + ' ' + t('admin.comments.delete') + '</button></td></tr>';
+      }).join('');
+      body.querySelectorAll('[data-wm-del]').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          confirmModal(t('admin.comments.delete'), '<p class="ab-muted">' + t('admin.webmentions.deleteConfirm') + '</p>', async function () {
+            try { await api('api/admin/webmentions/' + enc(btn.getAttribute('data-wm-del')), { method: 'DELETE' }); toast(t('admin.webmentions.deleted'), 'ok'); loadWebmentionsAdmin(content); }
+            catch (e) { toast(t('admin.webmentions.deleteFail') + (e.message || e), 'err'); }
+          }, t('admin.comments.delete'));
+        });
+      });
+    } catch (e) { body.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:30px" class="ab-muted">' + t('admin.postList.loadFail') + esc(e.message || e) + '</td></tr>'; }
+  }
+
   /* ====================== 博客设置 ====================== */
   /* ====================== 音乐管理（R2 直传 + D1 列表） ====================== */
+  var musicState = { list: [], kw: '', page: 1, per: 15 };
   function pageMusic(content) {
     content.innerHTML = '<div class="ab-page-head"><div><h1 class="ab-page-title">' + t('admin.music.title') + '</h1>' +
       '<p class="ab-page-sub">' + t('admin.music.desc') + '</p></div></div>';
@@ -2855,9 +4311,13 @@
         '<div class="ab-progress" id="abMusicBar" style="display:none;height:6px;border-radius:999px;background:var(--ab-border);margin-top:10px;overflow:hidden">' +
           '<div id="abMusicBarFill" style="width:0%;height:100%;background:var(--ab-primary);transition:width .2s"></div></div>' +
       '</div></div>' +
+      '<div class="ab-toolbar"><div class="ab-search"><input class="ab-input" id="abMusicKw" placeholder="' + t('admin.music.search') + '"></div></div>' +
       '<div class="ab-card"><div class="ab-table-wrap ab-music-list"><table class="ab-table"><thead><tr>' +
         '<th>' + t('admin.music.colTitle') + '</th><th>' + t('admin.music.colSize') + '</th><th class="col-actions">' + t('admin.music.colActions') + '</th>' +
-      '</tr></thead><tbody id="abMusicBody"></tbody></table></div></div>');
+      '</tr></thead><tbody id="abMusicBody"></tbody></table></div><div class="ab-pagination" id="abMusicPage" style="padding:0 4px 6px"></div></div>');
+    var mKw = content.querySelector('#abMusicKw');
+    mKw.value = musicState.kw;
+    mKw.addEventListener('input', debounce(function () { musicState.kw = (mKw.value || '').trim().toLowerCase(); musicState.page = 1; renderMusicList(content); }, 200));
     bindMusic(content);
     loadMusic(content);
   }
@@ -2914,28 +4374,48 @@
       body.innerHTML = '<tr><td colspan="3" style="text-align:center;padding:30px" class="ab-muted">' + esc(e.message || e) + '</td></tr>';
       return;
     }
-    var list = (d && d.music) || [];
-    if (!list.length) {
-      body.innerHTML = '<tr><td colspan="3" style="text-align:center;padding:34px" class="ab-muted">' + t('admin.music.empty') + '</td></tr>';
-      return;
-    }
-    body.innerHTML = list.map(function (s) {
-      return '<tr data-mid="' + enc(s.id) + '">' +
-        '<td><div style="display:flex;align-items:center;gap:11px;min-width:0">' +
-          (s.cover ? '<img src="' + esc(s.cover) + '" alt="" style="width:38px;height:38px;border-radius:10px;object-fit:cover;flex:0 0 auto">'
-            : '<span class="ab-cover-ph">' + icon('music', 17) + '</span>') +
-          '<div style="min-width:0"><div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:700;font-size:15px;color:var(--ab-text)">' + esc(s.title) + '</div>' +
-          '<div class="ab-muted" style="font-size:12.5px;margin-top:2px">' + esc(s.artist || '—') + '</div></div></div></td>' +
-        '<td class="ab-muted">' + fmtSize(s.size) + '</td>' +
-        '<td class="col-actions"><div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end">' +
-          '<button type="button" class="ab-play" data-src="' + enc(s.url) + '" title="' + t('player.play') + '">' + icon('play', 14) + '</button>' +
-          '<span class="ab-player-bar" title="' + t('player.seek') + '"><span class="ab-player-fill"></span></span>' +
-          '<span class="ab-player-time ab-muted">0:00</span>' +
-          '<button type="button" class="ab-btn sm" data-act="edit" title="' + t('admin.music.edit') + '">' + icon('pen', 13) + '</button>' +
-          '<button type="button" class="ab-btn sm danger" data-act="del" title="' + t('admin.music.delete') + '">' + icon('trash', 13) + '</button>' +
-        '</div></td>' +
-      '</tr>';
-    }).join('');
+    musicState.list = (d && d.music) || [];
+    renderMusicList(content);
+  }
+  /** 关键字过滤（歌名 + 歌手） */
+  function musicFiltered() {
+    var kw = musicState.kw;
+    if (!kw) return musicState.list;
+    return musicState.list.filter(function (s) {
+      return (String(s.title || '') + ' ' + String(s.artist || '')).toLowerCase().indexOf(kw) >= 0;
+    });
+  }
+  /** 音乐列表：过滤 + 分页（每页 15） */
+  function renderMusicList(content) {
+    var body = content.querySelector('#abMusicBody');
+    var pg = content.querySelector('#abMusicPage');
+    if (!body) return;
+    var list = musicFiltered();
+    var per = musicState.per;
+    var totalPages = Math.max(1, Math.ceil(list.length / per));
+    if (musicState.page > totalPages) musicState.page = totalPages;
+    var page = musicState.page;
+    var view = list.slice((page - 1) * per, page * per);
+    if (!view.length) {
+      body.innerHTML = '<tr><td colspan="3" style="text-align:center;padding:34px" class="ab-muted">' + (musicState.kw ? t('admin.music.noMatch') : t('admin.music.empty')) + '</td></tr>';
+    } else {
+      body.innerHTML = view.map(function (s) {
+        return '<tr data-mid="' + enc(s.id) + '">' +
+          '<td><div style="display:flex;align-items:center;gap:11px;min-width:0">' +
+            (s.cover ? '<img src="' + esc(s.cover) + '" alt="" style="width:38px;height:38px;border-radius:10px;object-fit:cover;flex:0 0 auto">'
+              : '<span class="ab-cover-ph">' + icon('music', 17) + '</span>') +
+            '<div style="min-width:0"><div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:700;font-size:15px;color:var(--ab-text)">' + esc(s.title) + '</div>' +
+            '<div class="ab-muted" style="font-size:12.5px;margin-top:2px">' + esc(s.artist || '—') + '</div></div></div></td>' +
+          '<td class="ab-muted">' + fmtSize(s.size) + '</td>' +
+          '<td class="col-actions"><div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end">' +
+            '<button type="button" class="ab-play" data-src="' + enc(s.url) + '" title="' + t('player.play') + '">' + icon('play', 14) + '</button>' +
+            '<span class="ab-player-bar" title="' + t('player.seek') + '"><span class="ab-player-fill"></span></span>' +
+            '<span class="ab-player-time ab-muted">0:00</span>' +
+            '<button type="button" class="ab-btn sm" data-act="edit" title="' + t('admin.music.edit') + '">' + icon('pen', 13) + '</button>' +
+            '<button type="button" class="ab-btn sm danger" data-act="del" title="' + t('admin.music.delete') + '">' + icon('trash', 13) + '</button>' +
+          '</div></td>' +
+        '</tr>';
+      }).join('');
     body.querySelectorAll('button[data-act]').forEach(function (btn) {
       btn.addEventListener('click', function () {
         var tr = btn.closest('tr');
@@ -2944,7 +4424,7 @@
         if (btn.getAttribute('data-act') === 'del') confirmModal(t('admin.music.delete'), esc(t('admin.music.deleteConfirm')), async function () {
           try {
             await api('api/music/' + id, { method: 'DELETE' });
-            loadMusic(content); // 音乐表仅 3 列，不走 seamlessRemoveRow（其按 6 列判断），直接全量刷新
+            loadMusic(content);
             toast(t('admin.music.deleted'), 'ok');
           } catch (e) { toast(esc(e.message || e), 'err'); }
         }, t('admin.music.delete'));
@@ -2952,6 +4432,15 @@
       });
     });
     bindRowPlayers(body);
+  }
+    if (pg) {
+      pg.innerHTML = list.length > per
+        ? (page > 1 ? '<button class="ab-page-btn" data-p="' + (page - 1) + '">' + t('pagination.prev') + '</button>' : '') +
+          '<button class="ab-page-btn active">' + page + ' / ' + totalPages + '</button>' +
+          (page < totalPages ? '<button class="ab-page-btn" data-p="' + (page + 1) + '">' + t('pagination.next') + '</button>' : '')
+        : '';
+      pg.querySelectorAll('[data-p]').forEach(function (b) { b.addEventListener('click', function () { musicState.page = parseInt(b.getAttribute('data-p'), 10) || 1; renderMusicList(content); }); });
+    }
   }
   /* 行内迷你播放器：单个共享 Audio，同一时刻只播一首；进度条可点击跳转 */
   function fmtTime(sec) {
@@ -3069,20 +4558,37 @@
       (cloudOn() ? '' : '<div class="ab-card"><div class="ab-empty"><div class="ab-empty-ico">⚙️</div><p>' + t('admin.settings.cloudOnly') + '</p></div></div>');
     if (!cloudOn()) return;
     content.innerHTML += '<div class="ab-tabs">' +
-      '<div class="ab-tab active" data-tab="site">' + t('admin.settings.siteInfo') + '</div>' +
+      '<div class="ab-tab" data-tab="site">' + t('admin.settings.siteInfo') + '</div>' +
+      '<div class="ab-tab" data-tab="features">' + t('admin.settings.features') + '</div>' +
       '<div class="ab-tab" data-tab="profile">' + t('admin.settings.profile') + '</div>' +
       '<div class="ab-tab" data-tab="nav">' + t('admin.settings.navMenu') + '</div>' +
       '<div class="ab-tab" data-tab="footerNav">' + t('admin.settings.footerNav') + '</div>' +
       '<div class="ab-tab" data-tab="friends">' + t('admin.settings.friendLinks') + '</div>' +
       '</div><div id="abSettingsBody"></div>';
-    content.querySelectorAll('.ab-tab').forEach(function (t) { t.addEventListener('click', function () { saveTabToDraft(content); content.querySelectorAll('.ab-tab').forEach(function (x) { x.classList.remove('active'); }); t.classList.add('active'); renderSettingsTab(content, t.getAttribute('data-tab')); }); });
-    renderSettingsTab(content, 'site');
+    content.querySelectorAll('.ab-tab').forEach(function (t) { t.addEventListener('click', function () { saveTabToDraft(content); content.querySelectorAll('.ab-tab').forEach(function (x) { x.classList.remove('active'); }); t.classList.add('active'); var key = t.getAttribute('data-tab'); rememberSettingsTab(key); renderSettingsTab(content, key); }); });
+    // 恢复上次停留的标签页；记录里的标签已不存在（如后台改版增删了 tab）则回落到第一个
+    var tabsEl = content.querySelectorAll('.ab-tab');
+    var last = readSettingsTab();
+    var restored = null;
+    tabsEl.forEach(function (x) { if (x.getAttribute('data-tab') === last) restored = x; });
+    if (!restored) restored = tabsEl[0];
+    if (restored) restored.classList.add('active');
+    renderSettingsTab(content, restored ? restored.getAttribute('data-tab') : 'site');
     content.querySelector('#abSaveSettings').addEventListener('click', function () { saveSettings(content); });
     loadSettings(content);
   }
   var settingsCache = {};
   // 内存草稿：各 tab 未保存的输入在此暂存，切换 tab 不丢失数据
-  var settingsDraft = { site: {}, profile: {}, nav: [], footerNav: [], links: [] };
+  var settingsDraft = { site: {}, features: { pageSize: 8, ads: {} }, profile: {}, nav: [], footerNav: [], links: [] };
+  // 记住「博客设置」上次停留的标签页，刷新页面后不再跳回「站点基础信息」
+  function settingsTabKey() { return 'qingyu.settingsTab'; }
+  function readSettingsTab() {
+    try { return String(localStorage.getItem(settingsTabKey()) || ''); } catch (e) { return ''; }
+  }
+  function rememberSettingsTab(tab) {
+    if (!tab) return;
+    try { localStorage.setItem(settingsTabKey(), String(tab)); } catch (e) {}
+  }
   async function loadSettings(content) {
     try { var d = await api('api/settings'); settingsCache = (d && d.settings) || {}; } catch (e) { settingsCache = {}; }
     // 同步到前台全局变量，确保前台渲染时读取到最新的站点设置
@@ -3091,6 +4597,7 @@
     writeAdminProfile(settingsDraft.profile);
     fillSettings(content);
   }
+  var NAV_DEFAULTS_VERSION = 1;
   /** 从服务端数据初始化草稿（仅首次或重置时调用，避免覆盖用户未保存的输入） */
   function syncDraftFromServer() {
     var s = settingsCache;
@@ -3103,24 +4610,66 @@
       copyright: site.copyright || (cfg().footer && cfg().footer.copyrightName) || '',
       footerText: site.footerText || (cfg().footer && cfg().footer.decl) || '',
       about: site.about || '',
+      homeTheme: site.homeTheme === 'magazine' ? 'magazine' : 'classic',
+      announceEnabled: !!site.announceEnabled,
+      announceText: site.announceText || '',
+      announceLink: site.announceLink || '',
+      announceLinkText: site.announceLinkText || '',
+      announceClosable: site.announceClosable !== false,
       moderate: s.moderate_comments === '1'
     };
+    syncFeaturesDraft();
     settingsDraft.profile = {
       name: prof.name || '', bio: prof.bio || '', avatar: prof.avatar || '', email: prof.email || ''
     };
-    settingsDraft.nav = parseArr(s.nav_menu, defaultNavItems());
+    var navItems = parseArr(s.nav_menu, defaultNavItems());
+    if (Number(s.nav_defaults_version || 0) < NAV_DEFAULTS_VERSION) navItems = mergeDefaultNavItems(navItems);
+    settingsDraft.nav = navItems;
+    settingsServerLoaded = true;
+    navUserEdited = false;
+    settingsDraft.blocklist = String(s.comment_blocklist || '');
+
     settingsDraft.footerNav = parseArr(s.footer_nav, defaultFooterNav());
+    settingsDraft.homeTags = parseArr(s.home_tags, []).map(function (x) { return String(x).trim(); }).filter(Boolean);
     settingsDraft.links = parseArr(s.friend_links, defaultFriendLinks());
   }
   /** 默认顶部导航（与前台渲染兜底一致）：站点未自定义导航时作为基础项 */
   function defaultNavItems() {
     return [
-      { i18n: 'nav.home',      text: t('nav.home'),      url: '/' },
-      { i18n: 'nav.tags',      text: t('nav.tags'),      url: '/tags' },
-      { i18n: 'nav.archive',   text: t('nav.archive'),   url: '/archive' },
-      { i18n: 'nav.guestbook', text: t('nav.guestbook'), url: '/guestbook' },
-      { i18n: 'nav.about',     text: t('nav.about'),     url: '/about' }
+      { i18n: 'nav.home',       text: t('nav.home'),       url: '/' },
+      { i18n: 'nav.tags',       text: t('nav.tags'),       url: '/tags' },
+      { i18n: 'nav.categories', text: t('nav.categories'), url: '/categories' },
+      { i18n: 'nav.history',    text: t('nav.history'),    url: '/history' },
+      { i18n: 'nav.series',     text: t('nav.series'),     url: '/series' },
+      { i18n: 'nav.popular',    text: t('nav.popular'),    url: '/popular' },
+      { i18n: 'nav.archive',    text: t('nav.archive'),    url: '/archive' },
+      { i18n: 'nav.guestbook',  text: t('nav.guestbook'),  url: '/guestbook' },
+      { i18n: 'nav.about',      text: t('nav.about'),      url: '/about' }
     ];
+  }
+  function navUrlKey(it) {
+    var u = String((it && it.url) || '/').replace(/^#/, '');
+    if (u.charAt(0) !== '/') return u;
+    return u.replace(/\/+$/, '') || '/';
+  }
+  function mergeDefaultNavItems(items) {
+    var defs = defaultNavItems();
+    if (!Array.isArray(items) || !items.length) return defs;
+    var out = items.slice();
+    var order = {};
+    defs.forEach(function (it, i) { order[navUrlKey(it)] = i; });
+    defs.forEach(function (def) {
+      var key = navUrlKey(def);
+      if (out.some(function (it) { return navUrlKey(it) === key; })) return;
+      var insertAt = out.length;
+      for (var i = 0; i < out.length; i++) {
+        var curKey = navUrlKey(out[i]);
+        var curOrder = Object.prototype.hasOwnProperty.call(order, curKey) ? order[curKey] : Infinity;
+        if (curOrder > order[key]) { insertAt = i; break; }
+      }
+      out.splice(insertAt, 0, def);
+    });
+    return out;
   }
   /** 默认底部导航：优先沿用 config.js footer.contact，方便老配置无缝衔接 */
   function defaultFooterNav() {
@@ -3143,52 +4692,114 @@
     return fallback;
   }
   // 从当前 DOM 把可见 tab 的输入保存进草稿（tab 切换/保存前调用，保证不丢数据）
+  function syncFeaturesDraft() {
+    var feat = safeJson(settingsCache.features);
+    var cfgNow = cfg() || {};
+    var baseAds = (cfgNow.ads && typeof cfgNow.ads === 'object') ? cfgNow.ads : {};
+    var featAds = (feat && typeof feat.ads === 'object' && feat.ads) ? feat.ads : {};
+    var baseSize = Number(cfgNow.pageSize);
+    settingsDraft.features = {
+      pageSize: (feat && feat.pageSize != null) ? Number(feat.pageSize) : (isFinite(baseSize) && baseSize >= 0 ? Math.floor(baseSize) : 8),
+      ads: Object.assign({}, baseAds, featAds),
+      errorReport: !(feat && feat.errorReport === false),
+      commentGuard: !(feat && feat.commentGuard === false),
+      richContent: !(feat && feat.richContent === false),
+      navExtras: !(feat && feat.navExtras === false),
+      readingFont: !(feat && feat.readingFont === false),
+      highlight: !(feat && feat.highlight === false),
+      bookmark: !(feat && feat.bookmark === false),
+      musicPlayer: !(feat && feat.musicPlayer === false)
+    };
+  }
   function saveTabToDraft(content) {
     if (content.querySelector('#abSiteName') !== null) {
       settingsDraft.site = {
         name: val(content, '#abSiteName'), desc: val(content, '#abSiteDesc'), avatar: val(content, '#abSiteAvatar'),
+        homeTheme: content.querySelector('#abHomeTheme') ? val(content, '#abHomeTheme') : (settingsDraft.site.homeTheme || 'classic'),
         copyright: val(content, '#abFooterCopyright'), footerText: val(content, '#abFooterText'),
         about: val(content, '#abSiteAbout'),
+        announceEnabled: content.querySelector('#abAnnounceEnabled') ? content.querySelector('#abAnnounceEnabled').checked : settingsDraft.site.announceEnabled,
+        announceText: content.querySelector('#abAnnounceText') ? val(content, '#abAnnounceText') : settingsDraft.site.announceText,
+        announceLink: content.querySelector('#abAnnounceLink') ? val(content, '#abAnnounceLink') : settingsDraft.site.announceLink,
+        announceLinkText: content.querySelector('#abAnnounceLinkText') ? val(content, '#abAnnounceLinkText') : settingsDraft.site.announceLinkText,
+        announceClosable: content.querySelector('#abAnnounceClosable') ? content.querySelector('#abAnnounceClosable').checked : settingsDraft.site.announceClosable,
         moderate: content.querySelector('#abModerate') ? content.querySelector('#abModerate').checked : settingsDraft.site.moderate
       };
     }
+    if (content.querySelector('#abBlocklist') !== null) settingsDraft.blocklist = val(content, '#abBlocklist');
     if (content.querySelector('#abProfileName') !== null) {
       settingsDraft.profile = {
         name: val(content, '#abProfileName'), bio: val(content, '#abProfileBio'),
         avatar: val(content, '#abProfileAvatar'), email: val(content, '#abProfileEmail')
       };
     }
+    if (content.querySelector('#abFeatPageSize') !== null) {
+      var psRaw = val(content, '#abFeatPageSize');
+      var prevSize = (settingsDraft.features && settingsDraft.features.pageSize != null) ? settingsDraft.features.pageSize : 8;
+      var everyRaw = val(content, '#abAdsBetweenEvery');
+      settingsDraft.features = {
+        pageSize: psRaw === '' ? prevSize : Math.max(0, Math.floor(Number(psRaw) || 0)),
+        ads: {
+          enabled: content.querySelector('#abAdsEnabled') ? content.querySelector('#abAdsEnabled').checked : false,
+          client: val(content, '#abAdsClient').trim(),
+          belowSearch: val(content, '#abAdsBelowSearch'),
+          between: val(content, '#abAdsBetween'),
+          betweenEvery: Math.max(1, Math.floor(Number(everyRaw) || 3)),
+          content: val(content, '#abAdsContent')
+        },
+        errorReport: content.querySelector('#abFeatErrReport') ? content.querySelector('#abFeatErrReport').checked : true,
+        commentGuard: content.querySelector('#abFeatCommentGuard') ? content.querySelector('#abFeatCommentGuard').checked : true,
+        richContent: content.querySelector('#abFeatRichContent') ? content.querySelector('#abFeatRichContent').checked : true,
+        navExtras: content.querySelector('#abFeatNavExtras') ? content.querySelector('#abFeatNavExtras').checked : true,
+        readingFont: content.querySelector('#abFeatReadingFont') ? content.querySelector('#abFeatReadingFont').checked : true,
+        highlight: content.querySelector('#abFeatHighlight') ? content.querySelector('#abFeatHighlight').checked : true,
+        bookmark: content.querySelector('#abFeatBookmark') ? content.querySelector('#abFeatBookmark').checked : true,
+        musicPlayer: content.querySelector('#abFeatMusicPlayer') ? content.querySelector('#abFeatMusicPlayer').checked : true
+      };
+    }
+    if (content.querySelector('#abHomeTags')) collectHomeTagsFromDom(content);
     if (content.querySelector('#abNavVisual')) collectNavFromDom(content);
     if (content.querySelector('#abFooterNavVisual')) collectLinksFromDom(content, 'footerNav', '#abFooterNavVisual');
     if (content.querySelector('#abFriendsVisual')) collectLinksFromDom(content, 'links', '#abFriendsVisual');
   }
-  /** 从顶部导航可视化 DOM 收集当前编辑结果到 settingsDraft.nav 并持久化草稿 */
+  /** 从顶部导航可视化 DOM 收集当前编辑结果到 settingsDraft.nav 并持久化草稿。
+   *  保留每项的 i18n / path / discover 等元信息，只覆盖用户可见的文案与链接。 */
   function collectNavFromDom(content) {
     var wrap = content.querySelector('#abNavVisual');
     if (!wrap) return;
     var newItems = [];
-    wrap.querySelectorAll('.ab-nav-row').forEach(function (row) {
-      if (row.classList.contains('child')) return; // 子项在父项中处理
-      var idx = parseInt(row.querySelector('[data-idx]').getAttribute('data-idx'), 10);
+    wrap.querySelectorAll('.ab-nav-row:not(.child)').forEach(function (row) {
+      var idx = parseInt(row.getAttribute('data-idx'), 10);
       var text = (row.querySelector('.ab-nav-text') || {}).value || '';
       var url = (row.querySelector('.ab-nav-url') || {}).value || '';
-      var children = [];
-      wrap.querySelectorAll('.ab-nav-row.child[data-idx="' + idx + '"]').forEach(function (cr) {
-        children.push({ text: (cr.querySelector('.ab-nav-text') || {}).value || '', url: (cr.querySelector('.ab-nav-url') || {}).value || '' });
-      });
       var old = settingsDraft.nav[idx] || {};
       var item = { text: text, url: url };
-      if (old.i18n) item.i18n = old.i18n;
-      if (children.length) {
-        item.children = children.map(function (c, ci) {
-          var childOld = (old.children && old.children[ci]) || {};
-          if (childOld.i18n) c.i18n = childOld.i18n;
-          return c;
+      ['i18n', 'path', 'discover'].forEach(function (k) {
+        if (old[k] !== undefined && old[k] !== null && old[k] !== '') item[k] = old[k];
+      });
+      var rowDiscover = row.getAttribute('data-discover');
+      if (rowDiscover === '1') item.discover = true;
+      else if (rowDiscover === '0') item.discover = false;
+      var childRows = wrap.querySelectorAll('.ab-nav-row.child[data-idx="' + idx + '"]');
+      if (childRows.length) {
+        item.children = [];
+        childRows.forEach(function (cr, ci) {
+          var c = {
+            text: (cr.querySelector('.ab-nav-text') || {}).value || '',
+            url: (cr.querySelector('.ab-nav-url') || {}).value || ''
+          };
+          var cOld = (old.children && old.children[ci]) || {};
+          if (cOld.i18n) c.i18n = cOld.i18n;
+          item.children.push(c);
         });
+      } else if (old.children && old.children.length) {
+        // DOM 里没有子行不等于用户要删子菜单，保留原值防止二级菜单被静默抹掉
+        item.children = old.children;
       }
       newItems.push(item);
     });
     settingsDraft.nav = newItems;
+    navUserEdited = true;
     try { localStorage.setItem(navDraftKey(), JSON.stringify(settingsDraft.nav)); } catch (e) {}
   }
   /** 从底部导航/友情链接的可视化 DOM 收集当前编辑结果到草稿 */
@@ -3213,25 +4824,210 @@
     if (content.querySelector('#abFooterCopyright')) content.querySelector('#abFooterCopyright').value = site.copyright || '';
     if (content.querySelector('#abFooterText')) content.querySelector('#abFooterText').value = site.footerText || '';
     if (content.querySelector('#abSiteAbout')) content.querySelector('#abSiteAbout').value = site.about || '';
+    if (content.querySelector('#abHomeTheme')) {
+      content.querySelector('#abHomeTheme').value = site.homeTheme === 'magazine' ? 'magazine' : 'classic';
+      syncThemeCards(content);   // 隐藏输入回填后，同步可视化卡片的选中态
+    }
     if (content.querySelector('#abModerate')) content.querySelector('#abModerate').checked = !!site.moderate;
+    if (content.querySelector('#abBlocklist')) content.querySelector('#abBlocklist').value = String(settingsDraft.blocklist || '');
+
+    if (content.querySelector('#abAnnounceEnabled')) content.querySelector('#abAnnounceEnabled').checked = !!site.announceEnabled;
+    if (content.querySelector('#abAnnounceText')) content.querySelector('#abAnnounceText').value = site.announceText || '';
+    if (content.querySelector('#abAnnounceLink')) content.querySelector('#abAnnounceLink').value = site.announceLink || '';
+    if (content.querySelector('#abAnnounceLinkText')) content.querySelector('#abAnnounceLinkText').value = site.announceLinkText || '';
+    if (content.querySelector('#abAnnounceClosable')) content.querySelector('#abAnnounceClosable').checked = site.announceClosable !== false;
+    var feat = settingsDraft.features || {};
+    var fads = feat.ads || {};
+    if (content.querySelector('#abFeatPageSize')) content.querySelector('#abFeatPageSize').value = (feat.pageSize != null ? feat.pageSize : '');
+    if (content.querySelector('#abAdsEnabled')) content.querySelector('#abAdsEnabled').checked = !!fads.enabled;
+    if (content.querySelector('#abAdsClient')) content.querySelector('#abAdsClient').value = fads.client || '';
+    if (content.querySelector('#abAdsBelowSearch')) content.querySelector('#abAdsBelowSearch').value = fads.belowSearch || '';
+    if (content.querySelector('#abAdsBetween')) content.querySelector('#abAdsBetween').value = fads.between || '';
+    if (content.querySelector('#abAdsBetweenEvery')) content.querySelector('#abAdsBetweenEvery').value = (fads.betweenEvery != null ? fads.betweenEvery : 3);
+    if (content.querySelector('#abAdsContent')) content.querySelector('#abAdsContent').value = fads.content || '';
+    if (content.querySelector('#abFeatErrReport')) content.querySelector('#abFeatErrReport').checked = (feat.errorReport !== false);
+    if (content.querySelector('#abFeatCommentGuard')) content.querySelector('#abFeatCommentGuard').checked = (feat.commentGuard !== false);
+    if (content.querySelector('#abFeatRichContent')) content.querySelector('#abFeatRichContent').checked = (feat.richContent !== false);
+    if (content.querySelector('#abFeatNavExtras')) content.querySelector('#abFeatNavExtras').checked = (feat.navExtras !== false);
+    if (content.querySelector('#abFeatReadingFont')) content.querySelector('#abFeatReadingFont').checked = (feat.readingFont !== false);
+    if (content.querySelector('#abFeatHighlight')) content.querySelector('#abFeatHighlight').checked = (feat.highlight !== false);
+    if (content.querySelector('#abFeatBookmark')) content.querySelector('#abFeatBookmark').checked = (feat.bookmark !== false);
+    if (content.querySelector('#abFeatMusicPlayer')) content.querySelector('#abFeatMusicPlayer').checked = (feat.musicPlayer !== false);
     if (content.querySelector('#abProfileName')) content.querySelector('#abProfileName').value = prof.name || '';
     if (content.querySelector('#abProfileBio')) content.querySelector('#abProfileBio').value = prof.bio || '';
     if (content.querySelector('#abProfileAvatar')) content.querySelector('#abProfileAvatar').value = prof.avatar || '';
     if (content.querySelector('#abProfileEmail')) content.querySelector('#abProfileEmail').value = prof.email || '';
+    // 服务端数据回来后重画一次导航编辑器，补上二级菜单与自定义项（用户已手动改过则不覆盖）
+    if (content.querySelector('#abNavVisual') && !navUserEdited) renderNavVisual(content);
   }
   function safeJson(v) { if (!v) return {}; if (typeof v === 'object') return v; try { return JSON.parse(v); } catch (e) { return {}; } }
+  /* ---------- 首页标签显示管理 ----------
+   * 文章一多，标签会越堆越多，首页标签条会被拉得很长。这里让站长自己勾选
+   * 「首页要显示哪些标签」：白名单存site_settings.home_tags（JSON 数组），
+   * 为空 = 保持原样全部显示；前台 renderHomeTagRow 只渲染白名单内的标签。
+   * 支持手动补一个「暂时还没有文章使用」的标签，避免必须先发文章才能选它。 */
+  function homeTagCounts() {
+    // 优先用前台已渲染的标签统计（页面刚打开时同步可用），否则退回已加载的文章列表
+    var counts = {};
+    try {
+      var chips = document.querySelectorAll('.home-tag-text');
+      for (var i = 0; i < chips.length; i++) {
+        var n = String(chips[i].textContent || '').trim();
+        if (n) counts[n] = 0;
+      }
+    } catch (e) {}
+    return counts;
+  }
+  function mergeTagCounts(counts, list) {
+    (list || []).forEach(function (p) {
+      (p && p.tags ? p.tags : []).forEach(function (t) {
+        var k = String(t).trim(); if (k) counts[k] = (counts[k] || 0) + 1;
+      });
+    });
+    return counts;
+  }
+  function renderHomeTagPicker(content) {
+    var box = content.querySelector('#abHomeTags');
+    if (!box) return;
+    var counts = homeTagCounts();
+    var chosen = (settingsDraft.homeTags || []).slice();
+    box.innerHTML = '<span class="ab-hint">' + t('admin.settings.featHomeTagsLoading') + '</span>';
+    listFullPosts().then(function (list) {
+      mergeTagCounts(counts, list);
+      draw();
+    }).catch(function () { draw(); });
+    function draw() {
+      var names = Object.keys(counts).sort(function (a, b) {
+        var d = (counts[b] || 0) - (counts[a] || 0);
+        return d !== 0 ? d : a.localeCompare(b);
+      });
+      // 已选但当前没有文章的标签也要显示出来，否则选了就看不见、也删不掉
+      chosen.forEach(function (n) { if (names.indexOf(n) < 0) names.push(n); });
+      var html = '';
+      if (!names.length) {
+        html = '<span class="ab-hint">' + t('admin.settings.featHomeTagsEmpty') + '</span>';
+      } else {
+        html = names.map(function (n) {
+          var on = chosen.indexOf(n) >= 0;
+          var c = counts[n] || 0;
+          return '<button type="button" class="ab-tagchip' + (on ? ' on' : '') + '" data-tagpick="' + esc(n) + '">'
+            + esc(n) + (c ? '<span class="ab-tagchip-n">' + c + '</span>' : '') + '</button>';
+        }).join('');
+      }
+      box.innerHTML = html;
+      box.querySelectorAll('[data-tagpick]').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          var n = btn.getAttribute('data-tagpick');
+          var i = chosen.indexOf(n);
+          if (i >= 0) chosen.splice(i, 1); else chosen.push(n);
+          settingsDraft.homeTags = chosen.slice();
+          draw();
+        });
+      });
+    }
+    function addTag() {
+      var inp = content.querySelector('#abHomeTagInput');
+      var n = String((inp && inp.value) || '').trim();
+      if (!n) return;
+      if (chosen.indexOf(n) < 0) chosen.push(n);
+      counts[n] = counts[n] || 0;
+      settingsDraft.homeTags = chosen.slice();
+      if (inp) inp.value = '';
+      draw();
+    }
+    var addBtn = content.querySelector('#abHomeTagAdd');
+    if (addBtn) addBtn.addEventListener('click', addTag);
+    var clrBtn = content.querySelector('#abHomeTagClear');
+    if (clrBtn) clrBtn.addEventListener('click', function () {
+      chosen = []; settingsDraft.homeTags = []; draw();
+    });
+    var inp = content.querySelector('#abHomeTagInput');
+    if (inp) inp.addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); addTag(); } });
+    draw();
+  }
+  function collectHomeTagsFromDom(content) {
+    var box = content.querySelector('#abHomeTags');
+    if (!box) return;
+    var out = [];
+    box.querySelectorAll('[data-tagpick]').forEach(function (btn) {
+      if (btn.classList.contains('on')) out.push(btn.getAttribute('data-tagpick'));
+    });
+    settingsDraft.homeTags = out;
+  }
   function renderSettingsTab(content, tab) {
     var body = content.querySelector('#abSettingsBody');
     if (tab === 'site') {
       body.innerHTML = '<div class="ab-card" style="max-width:620px">' +
         '<div class="ab-field"><label class="ab-label">' + t('admin.settings.siteName') + '</label><input class="ab-input" id="abSiteName"></div>' +
         '<div class="ab-field"><label class="ab-label">' + t('admin.settings.siteDesc') + '</label><textarea class="ab-textarea" id="abSiteDesc" style="min-height:70px"></textarea></div>' +
+        '<div class="ab-field"><label class="ab-label">' + t('admin.settings.homeTheme') + '</label>' +
+        '<div class="ab-themes" id="abHomeThemePicker">' +
+          '<button type="button" class="ab-theme" data-theme="classic">' +
+            '<span class="ab-theme-shot shot-classic"><b class="s-head"></b><b class="s-line w80"></b><b class="s-line w55"></b>' +
+              '<b class="s-row"><i class="s-txt"><i class="s-line w90"></i><i class="s-line w60"></i></i><i class="s-thumb"></i></b>' +
+              '<b class="s-row"><i class="s-txt"><i class="s-line w85"></i><i class="s-line w50"></i></i><i class="s-thumb"></i></b>' +
+            '</span>' +
+            '<span class="ab-theme-name">' + t('admin.settings.homeThemeClassic') + '</span>' +
+            '<span class="ab-theme-desc">' + t('admin.settings.homeThemeClassicDesc') + '</span>' +
+          '</button>' +
+          '<button type="button" class="ab-theme" data-theme="magazine">' +
+            '<span class="ab-theme-shot shot-magazine"><b class="s-hero"><i class="s-hero-txt"><i class="s-line w70"></i><i class="s-line w45"></i></i></b>' +
+              '<b class="s-cols"><i class="s-main"><i class="s-line w95"></i><i class="s-line w80"></i><i class="s-line w88"></i></i><i class="s-side"><i class="s-blk"></i><i class="s-blk"></i><i class="s-blk"></i></i></b>' +
+            '</span>' +
+            '<span class="ab-theme-name">' + t('admin.settings.homeThemeMagazine') + '</span>' +
+            '<span class="ab-theme-desc">' + t('admin.settings.homeThemeMagazineDesc') + '</span>' +
+          '</button>' +
+        '</div>' +
+        '<input type="hidden" id="abHomeTheme" value="classic">' +
+        '<label class="ab-hint">' + t('admin.settings.homeThemeHint') + '</label></div>' +
         '<div class="ab-field"><label class="ab-label">' + t('admin.settings.siteAvatar') + '</label><input class="ab-input" id="abSiteAvatar"></div>' +
         '<div class="ab-field"><label class="ab-label">' + t('admin.settings.about') + '</label><label class="ab-hint" style="font-size:12px">' + t('admin.settings.aboutHint') + '</label><textarea class="ab-textarea" id="abSiteAbout" style="min-height:120px" placeholder="' + t('admin.settings.aboutPlaceholder') + '"></textarea></div>' +
         '<div class="ab-field"><label class="ab-label">' + t('admin.settings.footerCopyright') + '</label><input class="ab-input" id="abFooterCopyright"></div>' +
         '<div class="ab-field"><label class="ab-label">' + t('admin.settings.footerDecl') + '</label><textarea class="ab-textarea" id="abFooterText" style="min-height:70px"></textarea></div>' +
         '<div class="ab-field"><label style="display:flex;align-items:center;gap:8px;font-size:14px;cursor:pointer"><input type="checkbox" id="abModerate"> ' + t('admin.settings.moderateComments') + '</label></div>' +
+        '<div class="ab-field"><label class="ab-label">' + t('admin.settings.blocklist') + '</label><label class="ab-hint" style="font-size:12px">' + t('admin.settings.blocklistHint') + '</label><textarea class="ab-textarea" id="abBlocklist" style="min-height:80px"></textarea></div>' +
+
+        '<div class="ab-section-title" style="margin-top:14px">' + icon('spark', 15) + ' ' + t('admin.settings.announceTitle') + '</div>' +
+        '<div class="ab-field"><label style="display:flex;align-items:center;gap:8px;font-size:14px;cursor:pointer"><input type="checkbox" id="abAnnounceEnabled"> ' + t('admin.settings.announceEnable') + '</label></div>' +
+        '<div class="ab-field"><label class="ab-label">' + t('admin.settings.announceText') + '</label><textarea class="ab-textarea" id="abAnnounceText" style="min-height:60px"></textarea></div>' +
+        '<div class="ab-field"><label class="ab-label">' + t('admin.settings.announceLink') + '</label><input class="ab-input" id="abAnnounceLink" placeholder="/about"></div>' +
+        '<div class="ab-field"><label class="ab-label">' + t('admin.settings.announceLinkText') + '</label><input class="ab-input" id="abAnnounceLinkText"></div>' +
+        '<div class="ab-field"><label style="display:flex;align-items:center;gap:8px;font-size:14px;cursor:pointer"><input type="checkbox" id="abAnnounceClosable"> ' + t('admin.settings.announceClosable') + '</label></div>' +
       '</div>';
+    } else if (tab === 'features') {
+      body.innerHTML = '<div class="ab-card" style="max-width:700px">' +
+        '<div class="ab-section-title">' + icon('doc', 15) + ' ' + t('admin.settings.featPaging') + '</div>' +
+        '<div class="ab-field"><label class="ab-label">' + t('admin.settings.featPageSize') + '</label><input class="ab-input" id="abFeatPageSize" type="number" min="0" step="1" style="max-width:180px"><label class="ab-hint">' + t('admin.settings.featPageSizeHint') + '</label></div>' +
+        '<div class="ab-section-title" style="margin-top:16px">' + icon('link', 15) + ' ' + t('admin.settings.featNavigation') + '</div>' +
+        '<div class="ab-field"><label style="display:flex;align-items:center;gap:8px;font-size:14px;cursor:pointer"><input type="checkbox" id="abFeatNavExtras"> ' + t('admin.settings.featNavExtras') + '</label><label class="ab-hint">' + t('admin.settings.featNavExtrasHint') + '</label></div>' +
+        '<div class="ab-section-title" style="margin-top:16px">' + icon('doc', 15) + ' ' + t('admin.settings.featReading') + '</div>' +
+        '<div class="ab-field"><label style="display:flex;align-items:center;gap:8px;font-size:14px;cursor:pointer"><input type="checkbox" id="abFeatReadingFont"> ' + t('admin.settings.featReadingFont') + '</label><label class="ab-hint">' + t('admin.settings.featReadingFontHint') + '</label></div>' +
+        '<div class="ab-field"><label style="display:flex;align-items:center;gap:8px;font-size:14px;cursor:pointer"><input type="checkbox" id="abFeatHighlight"> ' + t('admin.settings.featHighlight') + '</label><label class="ab-hint">' + t('admin.settings.featHighlightHint') + '</label></div>' +
+        '<div class="ab-field"><label style="display:flex;align-items:center;gap:8px;font-size:14px;cursor:pointer"><input type="checkbox" id="abFeatBookmark"> ' + t('admin.settings.featBookmark') + '</label><label class="ab-hint">' + t('admin.settings.featBookmarkHint') + '</label></div>' +
+        '<div class="ab-field"><label style="display:flex;align-items:center;gap:8px;font-size:14px;cursor:pointer"><input type="checkbox" id="abFeatMusicPlayer"> ' + t('admin.settings.featMusicPlayer') + '</label><label class="ab-hint">' + t('admin.settings.featMusicPlayerHint') + '</label></div>' +
+        '<div class="ab-section-title" style="margin-top:16px">' + icon('image', 15) + ' ' + t('admin.settings.featRich') + '</div>' +
+        '<div class="ab-field"><label style="display:flex;align-items:center;gap:8px;font-size:14px;cursor:pointer"><input type="checkbox" id="abFeatRichContent"> ' + t('admin.settings.featRichContent') + '</label><label class="ab-hint">' + t('admin.settings.featRichContentHint') + '</label></div>' +
+        '<div class="ab-section-title" style="margin-top:16px">' + icon('bug', 15) + ' ' + t('admin.settings.featDiag') + '</div>' +
+        '<div class="ab-field"><label style="display:flex;align-items:center;gap:8px;font-size:14px;cursor:pointer"><input type="checkbox" id="abFeatErrReport"> ' + t('admin.settings.featErrReport') + '</label><label class="ab-hint">' + t('admin.settings.featErrReportHint') + '</label></div>' +
+        '<div class="ab-section-title" style="margin-top:16px">' + icon('quote', 15) + ' ' + t('admin.settings.featAntiSpam') + '</div>' +
+        '<div class="ab-field"><label style="display:flex;align-items:center;gap:8px;font-size:14px;cursor:pointer"><input type="checkbox" id="abFeatCommentGuard"> ' + t('admin.settings.featCommentGuard') + '</label><label class="ab-hint">' + t('admin.settings.featCommentGuardHint') + '</label></div>' +
+        '<div class="ab-section-title" style="margin-top:16px">' + icon('tag', 15) + ' ' + t('admin.settings.featHomeTags') + '</div>' +
+        '<div class="ab-field"><label class="ab-hint">' + t('admin.settings.featHomeTagsHint') + '</label>' +
+        '<div id="abHomeTags" class="ab-tagpick"></div>' +
+        '<div class="ab-row" style="gap:8px;margin-top:10px;flex-wrap:wrap">' +
+        '<input class="ab-input" id="abHomeTagInput" style="flex:1;min-width:160px" placeholder="' + t('admin.settings.featHomeTagAdd') + '">' +
+        '<button class="ab-btn" id="abHomeTagAdd">' + icon('plus', 14) + ' ' + t('admin.settings.featHomeTagAddBtn') + '</button>' +
+        '<button class="ab-btn" id="abHomeTagClear">' + t('admin.settings.featHomeTagClear') + '</button></div></div>' +
+        '<div class="ab-section-title" style="margin-top:16px">' + icon('spark', 15) + ' ' + t('admin.settings.featAds') + '</div>' +
+        '<div class="ab-field"><label style="display:flex;align-items:center;gap:8px;font-size:14px;cursor:pointer"><input type="checkbox" id="abAdsEnabled"> ' + t('admin.settings.featAdsEnable') + '</label><label class="ab-hint">' + t('admin.settings.featAdsEnableHint') + '</label></div>' +
+        '<div class="ab-field"><label class="ab-label">' + t('admin.settings.featAdsClient') + '</label><input class="ab-input" id="abAdsClient" placeholder="ca-pub-xxxxxxxxxxxxxxxx"></div>' +
+        '<div class="ab-field"><label class="ab-label">' + t('admin.settings.featAdsBelow') + '</label><textarea class="ab-textarea" id="abAdsBelowSearch" style="min-height:80px"></textarea></div>' +
+        '<div class="ab-field"><label class="ab-label">' + t('admin.settings.featAdsBetween') + '</label><textarea class="ab-textarea" id="abAdsBetween" style="min-height:80px"></textarea></div>' +
+        '<div class="ab-field"><label class="ab-label">' + t('admin.settings.featAdsBetweenEvery') + '</label><input class="ab-input" id="abAdsBetweenEvery" type="number" min="1" step="1" style="max-width:180px"></div>' +
+        '<div class="ab-field"><label class="ab-label">' + t('admin.settings.featAdsContent') + '</label><textarea class="ab-textarea" id="abAdsContent" style="min-height:80px"></textarea></div>' +
+        '<label class="ab-hint">' + t('admin.settings.featAdsCodeHint') + '</label>' +
+        '</div>';
+      renderHomeTagPicker(content);
     } else if (tab === 'profile') {
       body.innerHTML = '<div class="ab-card" style="max-width:620px">' +
         '<div class="ab-avatar-edit"><img class="ab-avatar-prev" id="abProfPrev" src=""><div><div class="ab-label" style="margin:0">' + t('admin.settings.profileAvatar') + '</div><div class="ab-hint">' + t('admin.settings.avatarUrl') + '</div></div></div>' +
@@ -3267,6 +5063,32 @@
       renderLinkVisual(content, 'links', '#abFriendsVisual');
     }
     fillSettings(content);
+    bindThemeCards(content);
+  }
+  /* ---------- 首页风格：可视化卡片选择 ----------
+   * 真正的取值仍是隐藏的 #abHomeTheme，保存逻辑（草稿 / PUT / 回填）完全不用改，
+   * 这里只负责把值与卡片的选中态互相同步。 */
+  function syncThemeCards(content) {
+    var input = content.querySelector('#abHomeTheme');
+    var picker = content.querySelector('#abHomeThemePicker');
+    if (!input || !picker) return;
+    var cur = input.value === 'magazine' ? 'magazine' : 'classic';
+    picker.querySelectorAll('.ab-theme').forEach(function (card) {
+      card.classList.toggle('active', card.getAttribute('data-theme') === cur);
+    });
+  }
+  function bindThemeCards(content) {
+    var picker = content.querySelector('#abHomeThemePicker');
+    var input = content.querySelector('#abHomeTheme');
+    if (!picker || !input || picker.__bound) return;
+    picker.__bound = true;
+    picker.addEventListener('click', function (e) {
+      var card = e.target.closest ? e.target.closest('.ab-theme') : null;
+      if (!card) return;
+      input.value = card.getAttribute('data-theme') === 'magazine' ? 'magazine' : 'classic';
+      syncThemeCards(content);
+    });
+    syncThemeCards(content);
   }
   /** 通用链接可视化编辑器：底部导航 / 友情链接共用 */
   function renderLinkVisual(content, key, sel) {
@@ -3309,15 +5131,34 @@
     var payload = {
       site_info: {
         name: site.name || '', desc: site.desc || '', avatar: site.avatar || '',
-        copyright: site.copyright || '', footerText: site.footerText || '', about: site.about || ''
+        homeTheme: site.homeTheme === 'magazine' ? 'magazine' : 'classic',
+        copyright: site.copyright || '', footerText: site.footerText || '', about: site.about || '',
+        announceEnabled: !!site.announceEnabled, announceText: site.announceText || '',
+        announceLink: site.announceLink || '', announceLinkText: site.announceLinkText || '',
+        announceClosable: site.announceClosable !== false
       },
       profile: {
         name: prof.name || '', bio: prof.bio || '', avatar: prof.avatar || '', email: prof.email || ''
       },
       nav_menu: JSON.stringify(Array.isArray(settingsDraft.nav) ? settingsDraft.nav : []),
+      nav_defaults_version: String(NAV_DEFAULTS_VERSION),
+      home_tags: JSON.stringify(Array.isArray(settingsDraft.homeTags) ? settingsDraft.homeTags : []),
       footer_nav: JSON.stringify(Array.isArray(settingsDraft.footerNav) ? settingsDraft.footerNav : []),
       friend_links: JSON.stringify(Array.isArray(settingsDraft.links) ? settingsDraft.links : []),
-      moderate_comments: site.moderate ? '1' : '0'
+      moderate_comments: site.moderate ? '1' : '0',
+      comment_blocklist: String(settingsDraft.blocklist || ''),
+      features: JSON.stringify({
+        pageSize: (settingsDraft.features && settingsDraft.features.pageSize != null) ? settingsDraft.features.pageSize : 8,
+        ads: (settingsDraft.features && settingsDraft.features.ads) || {},
+        errorReport: !(settingsDraft.features && settingsDraft.features.errorReport === false),
+        commentGuard: !(settingsDraft.features && settingsDraft.features.commentGuard === false),
+        richContent: !(settingsDraft.features && settingsDraft.features.richContent === false),
+        navExtras: !(settingsDraft.features && settingsDraft.features.navExtras === false),
+        readingFont: !(settingsDraft.features && settingsDraft.features.readingFont === false),
+        highlight: !(settingsDraft.features && settingsDraft.features.highlight === false),
+        bookmark: !(settingsDraft.features && settingsDraft.features.bookmark === false),
+        musicPlayer: !(settingsDraft.features && settingsDraft.features.musicPlayer === false)
+      })
     };
     try {
       await api('api/settings', { method: 'PUT', body: JSON.stringify(payload) });
@@ -3325,11 +5166,14 @@
       settingsCache = Object.assign({}, settingsCache, {
         site_info: JSON.stringify(payload.site_info), profile: JSON.stringify(payload.profile),
         nav_menu: payload.nav_menu, footer_nav: payload.footer_nav, friend_links: payload.friend_links,
-        moderate_comments: payload.moderate_comments
+        nav_defaults_version: payload.nav_defaults_version,
+        home_tags: payload.home_tags,
+        moderate_comments: payload.moderate_comments, comment_blocklist: payload.comment_blocklist, features: payload.features
       });
       // 同步到前台全局变量，使站点名称/导航/页脚/友链等设置立即生效（无需刷新整页）
       window._siteSettings = settingsCache;
       writeAdminProfile(payload.profile);
+      if (typeof currentRoute === 'function' && currentRoute().path === '/' && typeof route === 'function') route();
       toast(t('admin.settings.saved'), 'ok');
     } catch (e) { toast(t('admin.settings.saveFail') + (e.message || e), 'err'); }
   }
@@ -3338,57 +5182,137 @@
   /* ---------- 可视化导航编辑器 ----------
    * 直接读写内存 settingsDraft.nav 数组，无需 JSON 中转，保存时由 saveSettings 统一取用。
    * 保留 localStorage 临时草稿，刷新/切页不丢失未保存的导航编辑。 */
+  var settingsServerLoaded = false;
+  var navUserEdited = false;
   function navDraftKey() { return 'qingyu.settingsNavDraft'; }
   function loadNavDraft() {
     try { var v = JSON.parse(localStorage.getItem(navDraftKey()) || 'null'); if (Array.isArray(v)) return v; } catch (e) {}
     return null;
   }
+  /* 内置「发现」二级入口（按路径识别，兼容旧数据）：这几个默认出现在「发现」下拉里；「分类」已独立为一级导航，不在此列表。 */
+  var NAV_DISCOVER_PATHS = { '/tags': 1, '/history': 1, '/series': 1, '/popular': 1 };
+  function navKeyOf(u) {
+    var v = String(u == null ? '/' : u).replace(/^#/, '');
+    if (v.charAt(0) !== '/') return v;
+    return v.replace(/\/+$/, '') || '/';
+  }
+  /** 合并导航草稿：以服务端 nav_menu 为底，草稿只覆盖文案/地址/发现开关与新增项；
+   *  二级菜单 children 以服务端为准（服务端没有时才用草稿里的），
+   *  避免一份过期草稿把整个二级菜单抹掉、或草稿新增的自定义项丢失。 */
+  function mergeNavDraft(base, draft) {
+    var b = Array.isArray(base) ? base : [];
+    var d = Array.isArray(draft) ? draft : null;
+    if (!d || !d.length) return b;
+    var out = b.map(function (it) {
+      var hit = null;
+      d.forEach(function (di) { if (!hit && navUrlKey(di) === navUrlKey(it)) hit = di; });
+      var merged = {};
+      Object.keys(it || {}).forEach(function (k) { merged[k] = it[k]; });
+      if (hit) {
+        if (hit.text !== undefined) merged.text = hit.text;
+        if (hit.url !== undefined) merged.url = hit.url;
+        if (hit.discover !== undefined) merged.discover = hit.discover;
+      }
+      var kids = (it && it.children && it.children.length) ? it.children : (hit && hit.children);
+      if (kids && kids.length) merged.children = kids;
+      else delete merged.children;
+      return merged;
+    });
+    d.forEach(function (di) {
+      var k = navUrlKey(di);
+      if (out.some(function (o) { return navUrlKey(o) === k; })) return;
+      var copy = {};
+      Object.keys(di || {}).forEach(function (key) { copy[key] = di[key]; });
+      out.push(copy);
+    });
+    return out;
+  }
+  /** 编辑器当前该显示哪份导航：服务端数据未回来之前不读草稿（否则默认值会被当成用户数据
+   *  写进草稿并永久遮蔽真实导航）；数据回来后以服务端为底合并本地草稿。 */
+  function resolveNavItems() {
+    var saved = settingsServerLoaded ? loadNavDraft() : null;
+    return mergeNavDraft(settingsDraft.nav, saved);
+  }
+  function isDiscoverNav(it) {
+    if (!it) return false;
+    // 与前台保持一致：discover === false 表示用户明确移出「发现」，内置入口也不例外
+    if (it.discover === false) return false;
+    return !!NAV_DISCOVER_PATHS[navKeyOf(it.url)] || !!it.discover;
+  }
+
   function renderNavVisual(content) {
     var wrap = content.querySelector('#abNavVisual');
     if (!wrap) return;
-    var saved = loadNavDraft();
-    var items = saved ? saved : settingsDraft.nav;
+    var items = resolveNavItems();
     if (!Array.isArray(items) || !items.length) items = defaultNavItems();
     settingsDraft.nav = items;
 
-    wrap.innerHTML = (items.length ? '<div class="ab-nav-list">' + items.map(function (it, i) {
-      var children = (it.children || []).map(function (ch, ci) {
-        return '<div class="ab-nav-row child">' +
-          '<span class="ab-nav-ico">└</span>' +
+    var dragSrc = null;
+
+    function persist() { if (!settingsServerLoaded) return; try { localStorage.setItem(navDraftKey(), JSON.stringify(settingsDraft.nav)); } catch (e) {} }
+    function refresh() { persist(); renderNavVisual(content); }
+
+    function childRowsHtml(it, i) {
+      return (it.children || []).map(function (ch, ci) {
+        return '<div class="ab-nav-row child" data-idx="' + i + '" data-cidx="' + ci + '">' +
+          '<span class="ab-nav-drag" draggable="true" data-idx="' + i + '" data-cidx="' + ci + '" title="' + t('admin.settings.navDragHandle') + '">' + icon('grip', 14) + '</span>' +
           '<input class="ab-input ab-nav-text" data-idx="' + i + '" data-cidx="' + ci + '" value="' + esc(ch.text || '') + '" placeholder="' + t('admin.settings.subMenu') + '">' +
           '<input class="ab-input ab-nav-url" data-idx="' + i + '" data-cidx="' + ci + '" value="' + esc(ch.url || '') + '" placeholder="/path">' +
+          '<span class="ab-nav-slot"></span><span class="ab-nav-slot"></span>' +
           '<button class="ab-btn-icon danger" data-rmchild="' + i + '-' + ci + '" title="' + t('admin.comments.delete') + '">' + icon('trash', 14) + '</button>' +
         '</div>';
       }).join('');
-      return '<div class="ab-nav-row">' +
-        '<span class="ab-nav-ico">' + icon('list', 14) + '</span>' +
-        '<input class="ab-input ab-nav-text" data-idx="' + i + '" value="' + esc(it.text || '') + '" placeholder="' + t('admin.settings.newMenu') + '">' +
-        '<input class="ab-input ab-nav-url" data-idx="' + i + '" value="' + esc(it.url || '') + '" placeholder="/path">' +
-        '<button class="ab-btn-icon" data-addchild="' + i + '" title="' + t('admin.settings.subMenu') + '">' + icon('plus', 14) + '</button>' +
-        '<button class="ab-btn-icon danger" data-rmitem="' + i + '" title="' + t('admin.comments.delete') + '">' + icon('trash', 14) + '</button>' +
-      '</div>' + children;
-    }).join('') + '</div>' : '<div class="ab-hint">' + t('admin.settings.navEmpty') + '</div>');
+    }
+
+    wrap.innerHTML = '<div class="ab-nav-tip">' + icon('grip', 13) + ' ' + t('admin.settings.navDragHint') + '</div>' +
+      (items.length ? '<div class="ab-nav-list">' + items.map(function (it, i) {
+        var builtin = !!NAV_DISCOVER_PATHS[navKeyOf(it.url)];
+        var inDiscover = isDiscoverNav(it);
+        // 三态：'1' 明确放入 / '0' 明确移出（含内置入口）/ null 未设置（内置项保持默认在「发现」里）
+        var state = it.discover === true ? '1' : (it.discover === false ? '0' : null);
+        var badge = (builtin && inDiscover) ? '<span class="ab-nav-badge">' + t('admin.settings.navDiscoverBadge') + '</span>' : '';
+        var toggle = badge + '<button class="ab-btn-icon' + (inDiscover ? ' is-on' : '') + '" data-toggle-discover="' + i + '"'
+          + ' title="' + t(inDiscover ? 'admin.settings.navDiscoverRemove' : 'admin.settings.navDiscoverToggle') + '">' + icon('layers', 14) + '</button>';
+        return '<div class="ab-nav-group"><div class="ab-nav-row' + (inDiscover ? ' is-discover' : '') + '" data-idx="' + i + '"'
+          + (state === null ? '' : ' data-discover="' + state + '"') + '>' +
+          '<span class="ab-nav-drag" draggable="true" data-idx="' + i + '" title="' + t('admin.settings.navDragHandle') + '">' + icon('grip', 14) + '</span>' +
+          '<input class="ab-input ab-nav-text" data-idx="' + i + '" value="' + esc(it.text || '') + '" placeholder="' + t('admin.settings.newMenu') + '">' +
+          '<input class="ab-input ab-nav-url" data-idx="' + i + '" value="' + esc(it.url || '') + '" placeholder="/path">' +
+          '<span class="ab-nav-discover">' + toggle + '</span>' +
+          '<button class="ab-btn-icon" data-addchild="' + i + '" title="' + t('admin.settings.subMenu') + '">' + icon('plus', 14) + '</button>' +
+          '<button class="ab-btn-icon danger" data-rmitem="' + i + '" title="' + t('admin.comments.delete') + '">' + icon('trash', 14) + '</button>' +
+        '</div>' + childRowsHtml(it, i) + '</div>';
+      }).join('') + '</div>' : '<div class="ab-hint">' + t('admin.settings.navEmpty') + '</div>');
 
     wrap.innerHTML += '<div class="ab-nav-actions" style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">' +
       '<button class="ab-btn sm" id="abNavAddItem">' + icon('plus', 13) + ' ' + t('admin.settings.addMenuItem') + '</button>' +
       '<button class="ab-btn sm ghost" id="abNavReset">' + icon('refresh', 13) + ' ' + t('admin.settings.resetDefault') + '</button>' +
     '</div>';
 
-    function persist() { try { localStorage.setItem(navDraftKey(), JSON.stringify(settingsDraft.nav)); } catch (e) {} }
-
-    wrap.querySelectorAll('input').forEach(function (inp) { inp.addEventListener('input', debounce(function () { collectNavFromDom(content); }, 250)); });
+    wrap.querySelectorAll('input').forEach(function (inp) {
+      inp.addEventListener('input', debounce(function () { collectNavFromDom(content); }, 250));
+    });
 
     wrap.querySelector('#abNavAddItem').addEventListener('click', function () {
       settingsDraft.nav.push({ text: t('admin.settings.newMenu'), url: '/' });
-      persist();
-      renderNavVisual(content);
+      refresh();
     });
 
     var resetBtn = wrap.querySelector('#abNavReset');
     if (resetBtn) resetBtn.addEventListener('click', function () {
       settingsDraft.nav = defaultNavItems();
-      persist();
-      renderNavVisual(content);
+      refresh();
+    });
+
+    wrap.querySelectorAll('[data-toggle-discover]').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        var idx = parseInt(btn.getAttribute('data-toggle-discover'), 10);
+        var it = settingsDraft.nav[idx];
+        if (!it) return;
+        // 再次点击即取消：内置入口（标签/历史/系列/热门）也能移出「发现」，回到一级导航
+        it.discover = isDiscoverNav(it) ? false : true;
+        refresh();
+      });
     });
 
     wrap.querySelectorAll('[data-addchild]').forEach(function (btn) {
@@ -3397,8 +5321,7 @@
         if (!settingsDraft.nav[idx]) return;
         if (!settingsDraft.nav[idx].children) settingsDraft.nav[idx].children = [];
         settingsDraft.nav[idx].children.push({ text: t('admin.settings.subMenu'), url: '/' });
-        persist();
-        renderNavVisual(content);
+        refresh();
       });
     });
 
@@ -3406,8 +5329,7 @@
       btn.addEventListener('click', function () {
         var idx = parseInt(btn.getAttribute('data-rmitem'), 10);
         settingsDraft.nav.splice(idx, 1);
-        persist();
-        renderNavVisual(content);
+        refresh();
       });
     });
 
@@ -3416,13 +5338,126 @@
         var parts = btn.getAttribute('data-rmchild').split('-');
         var idx = parseInt(parts[0], 10), cidx = parseInt(parts[1], 10);
         if (settingsDraft.nav[idx] && settingsDraft.nav[idx].children) settingsDraft.nav[idx].children.splice(cidx, 1);
-        persist();
-        renderNavVisual(content);
+        refresh();
+      });
+    });
+
+    /* ---------- 拖拽排序：一级项之间、一级与二级之间、二级之间都可拖动 ---------- */
+    function clearMarks() {
+      wrap.querySelectorAll('.ab-nav-row, .ab-nav-group').forEach(function (r) {
+        r.classList.remove('drop-before', 'drop-after', 'drop-into');
+      });
+    }
+    function applyDrop(src, row) {
+      if (!src || !row) return false;
+      var isChild = row.classList.contains('child');
+      // 父级行的落点标记画在整个分组（父级+子级）上，所以读标记要看分组
+      var mark = (!isChild && row.parentNode && row.parentNode.classList.contains('ab-nav-group')) ? row.parentNode : row;
+      if (src.kind === 'item' && isChild && parseInt(row.getAttribute('data-idx'), 10) === src.idx) return false; // 不能拖成自己的子级
+      var ridx = parseInt(row.getAttribute('data-idx'), 10);
+      if (src.kind === 'child') {
+        var parent = settingsDraft.nav[src.idx];
+        if (!parent || !parent.children || !parent.children[src.cidx]) return false;
+        var moving = parent.children.splice(src.cidx, 1)[0];
+        if (isChild && ridx === src.idx) {
+          var kids = settingsDraft.nav[src.idx].children;
+          var tc = parseInt(row.getAttribute('data-cidx'), 10);
+          var pos = tc + (mark.classList.contains('drop-after') ? 1 : 0);
+          if (mark.classList.contains('drop-into')) pos = kids.length;
+          kids.splice(Math.max(0, Math.min(pos, kids.length)), 0, moving);
+        } else if (isChild) {
+          var target = settingsDraft.nav[ridx];
+          if (!target) { parent.children.splice(src.cidx, 0, moving); return false; }
+          if (!target.children) target.children = [];
+          target.children.push(moving);
+        } else {
+          // 拖回一级：插到该行前面
+          var arr = settingsDraft.nav;
+          var pos2 = ridx + (mark.classList.contains('drop-after') ? 1 : 0);
+          if (pos2 > arr.length) pos2 = arr.length;
+          arr.splice(pos2, 0, moving);
+        }
+        return true;
+      }
+      var list = settingsDraft.nav;
+      if (!list[src.idx]) return false;
+      var item = list.splice(src.idx, 1)[0];
+      if (isChild) {
+        var host = settingsDraft.nav[ridx];
+        if (!host) { list.splice(Math.min(src.idx, list.length), 0, item); return false; }
+        if (!host.children) host.children = [];
+        var cpos = host.children.length;
+        if (mark.classList.contains('drop-after')) {
+          cpos = parseInt(row.getAttribute('data-cidx'), 10) + 1;
+        }
+        if (cpos > host.children.length) cpos = host.children.length;
+        host.children.splice(cpos, 0, item);
+      } else {
+        var pos = ridx + (mark.classList.contains('drop-after') ? 1 : 0);
+        if (pos > list.length) pos = list.length;
+        list.splice(pos, 0, item);
+      }
+      return true;
+    }
+
+    wrap.querySelectorAll('.ab-nav-drag').forEach(function (h) {
+      h.addEventListener('dragstart', function (e) {
+        var idx = parseInt(h.getAttribute('data-idx'), 10);
+        var cidx = h.getAttribute('data-cidx');
+        dragSrc = cidx === null ? { kind: 'item', idx: idx } : { kind: 'child', idx: idx, cidx: parseInt(cidx, 10) };
+        var row = h.closest ? h.closest('.ab-nav-row') : null;
+        if (row) row.classList.add('dragging');
+        // 父级：整组（父级 + 二级子级）一起高亮，让「成组拖拽」看得见
+        if (dragSrc.kind === 'item') {
+          var grp = h.closest ? h.closest('.ab-nav-group') : null;
+          if (grp) grp.classList.add('dragging');
+        }
+        try {
+          e.dataTransfer.effectAllowed = 'move';
+          e.dataTransfer.setData('text/plain', String(idx));
+        } catch (err) {}
+      });
+      h.addEventListener('dragend', function () {
+        dragSrc = null;
+        clearMarks();
+        wrap.querySelectorAll('.ab-nav-row').forEach(function (r) { r.classList.remove('dragging'); });
+        wrap.querySelectorAll('.ab-nav-group').forEach(function (g) { g.classList.remove('dragging'); });
+      });
+    });
+
+    wrap.querySelectorAll('.ab-nav-row').forEach(function (row) {
+      row.addEventListener('dragover', function (e) {
+        if (!dragSrc) return;
+        e.preventDefault();
+        try { e.dataTransfer.dropEffect = 'move'; } catch (err) {}
+        clearMarks();
+        var r = row.getBoundingClientRect();
+        var ratio = (e.clientY - r.top) / (r.height || 1);
+        if (row.classList.contains('child')) {
+          // 子项行：靠上/靠中拖进该子项的父级，靠下插到它后面
+          if (ratio < 0.34) { row.classList.add('drop-into'); row.classList.remove('drop-after'); }
+          else { row.classList.add('drop-after'); row.classList.remove('drop-into'); }
+        } else {
+          // 父级：落点标记画在整个分组上（父级 + 所有子级一起移动）
+          var grp2 = row.parentNode && row.parentNode.classList.contains('ab-nav-group') ? row.parentNode : row;
+          grp2.classList.add(ratio < 0.5 ? 'drop-before' : 'drop-after');
+        }
+      });
+      row.addEventListener('dragleave', function () {
+        row.classList.remove('drop-before', 'drop-after', 'drop-into');
+        var gl = row.parentNode;
+        if (gl && gl.classList && gl.classList.contains('ab-nav-group')) gl.classList.remove('drop-before', 'drop-after');
+      });
+      row.addEventListener('drop', function (e) {
+        if (!dragSrc) return;
+        e.preventDefault();
+        e.stopPropagation();
+        clearMarks();
+        if (applyDrop(dragSrc, row)) { dragSrc = null; refresh(); }
+        else { dragSrc = null; }
       });
     });
   }
-
-
   /* ====================== 修改密码 ====================== */
   function openPasswordModal(onSuccess) {
     var mask = document.createElement('div');
@@ -3436,7 +5471,7 @@
     mask.querySelector('#abDoPwd').addEventListener('click', async function () {
       var cur = mask.querySelector('#abCurPwd').value, pwd = mask.querySelector('#abNewPwd').value;
       if (!cur || !pwd) { toast(t('admin.pwdRequired'), 'err'); return; }
-      if (pwd.length < 6) { toast(t('admin.pwdModal.tooShort'), 'err'); return; }
+      if (pwd.length < 8) { toast(t('admin.pwdModal.tooShort'), 'err'); return; }
       try {
         await api('api/admin/password', { method: 'POST', body: JSON.stringify({ current: cur, password: pwd }) });
         toast(t('admin.pwdModal.success'), 'ok');
@@ -3465,7 +5500,12 @@
       zip: transferZipForPosts
     },
     _offline: { read: readOfflineQueue, queue: queueOfflinePost, flush: flushOfflineQueue, isNetworkFailure: isNetworkFailure },
+    _list: { paginatePosts: paginatePosts },
+    _settingsTab: { key: settingsTabKey, read: readSettingsTab, remember: rememberSettingsTab, page: pageSettings },
+    _navDraft: { key: navDraftKey, load: loadNavDraft, merge: mergeNavDraft, resolve: resolveNavItems, setServerLoaded: function (v) { settingsServerLoaded = !!v; }, setDraft: function (items) { settingsDraft.nav = items; }, state: function () { return { serverLoaded: settingsServerLoaded, edited: navUserEdited }; } },
+    _staticExport: { rebase: staticRebase, page: staticPageFromTemplate, postDir: staticPostDir },
     _editor: {
+      draft: { key: editorDraftKey, read: readEditorDraft, write: writeEditorDraft, clear: clearEditorDraft },
       toDateTimeLocal: toDateTimeLocal,
       normalizeEditorDate: normalizeEditorDate,
       fmtPostDate: fmtPostDate

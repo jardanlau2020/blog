@@ -12,12 +12,14 @@ const path = require('path');
 
 const dir = __dirname;
 const PUB = path.join(dir, 'public');
+// 需要随版本同步的文档（版本号 / 测试例数）
+const DOC_FILES = ['README.md', 'README_EN.md', 'DEVELOPMENT.md', 'DEVELOPMENT_EN.md'];
 
 /* ---------- 构造最小浏览器环境 ---------- */
 const stubEl = () => ({
   addEventListener() {}, removeEventListener() {}, textContent: '', innerHTML: '', value: '',
   style: {}, dataset: {}, classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
-  closest: () => null, focus() {}, disabled: false,
+  closest: () => null, focus() {}, disabled: false, insertAdjacentHTML() {},
   setAttribute() {}, getAttribute: () => '', removeAttribute() {}, hasAttribute: () => false,
   querySelector: () => null, querySelectorAll: () => [],
   click() {}, scrollIntoView() {},
@@ -387,6 +389,56 @@ tests.push(['云端模式引导：数据来自 API，写页显示发布按钮', 
   assert.ok(win.BLOG_POSTS.length >= 3, '捆绑示例仍在（作为静态兜底）');
 }]);
 
+/* 回归：弱网/丢包首屏兜底 —— 云端快照应让首页先出内容，而不是一直转圈 */
+tests.push(['云端快照兜底：接口失败时先用上次快照渲染，不卡在加载态', async () => {
+  const mem = {};
+  const store = {
+    getItem: (k) => (k in mem ? mem[k] : null),
+    setItem: (k, v) => { mem[k] = String(v); },
+    removeItem: (k) => { delete mem[k]; },
+  };
+  const goodFetch = async () => ({
+    ok: true, status: 200,
+    json: async () => ({ ok: true, posts: [{ id: 'sw1', title: '快照演示文章', date: '2025-01-05', tags: ['技术'], content: '' }] })
+  });
+  // 第一次正常访问：拉到云端文章并写入快照
+  await boot({ 'window.BLOG_CONFIG': { mode: 'api' }, fetch: goodFetch, localStorage: store }, '/');
+  assert.ok(mem['qingyu.snap.posts'], '成功访问后写入云端文章快照');
+  // 第二次访问：接口全部失败（模拟丢包/超时），仍应立刻用快照渲染出文章
+  const badFetch = async () => { throw new Error('network down'); };
+  const b = await boot({ 'window.BLOG_CONFIG': { mode: 'api' }, fetch: badFetch, localStorage: store }, '/');
+  assert.ok(b.html.includes('快照演示文章'), '接口不可用时用快照渲染出文章列表');
+}]);
+/* 部署链路守卫：wrangler 版本固定为 3.90.0（4.x 实测部署失败），且不得出现 run_worker_first */
+/* 回归：版本号三处必须一致（关于页/后台显示、SW 缓存、index.html 的 ?v=），否则关于页会显示旧版本 */
+tests.push(['版本号一致：app.js BLOG_VERSION = sw.js CACHE_VERSION = index.html ?v=', () => {
+  const app = fs.readFileSync(path.join(PUB, 'app.js'), 'utf8');
+  const sw = fs.readFileSync(path.join(PUB, 'sw.js'), 'utf8');
+  const html = fs.readFileSync(path.join(PUB, 'index.html'), 'utf8');
+  const av = (app.match(/var BLOG_VERSION = '([^']+)'/) || [])[1];
+  const sv = (sw.match(/var CACHE_VERSION = '([^']+)'/) || [])[1];
+  const hv = (html.match(/\?v=(\d+\.\d+\.\d+)/) || [])[1];
+  assert.ok(av, 'app.js 能解析出 BLOG_VERSION');
+  assert.strictEqual(av, sv, 'BLOG_VERSION 与 CACHE_VERSION 一致');
+  assert.strictEqual(av, hv, 'BLOG_VERSION 与 index.html 的 ?v= 一致');
+}]);
+tests.push(['文档不过期：文档标的版本与代码一致', () => {
+  const DOCS = path.join(dir, 'docs');
+  const app = fs.readFileSync(path.join(PUB, 'app.js'), 'utf8');
+  const ver = (app.match(/var BLOG_VERSION = '([^']+)'/) || [])[1];
+  assert.ok(ver, 'app.js 能解析出 BLOG_VERSION');
+  DOC_FILES.forEach((f) => {
+    const doc = fs.readFileSync(path.join(DOCS, f), 'utf8');
+    assert.ok(doc.includes(ver), f + ' 标的版本与代码一致（' + ver + '）');
+  });
+}]);
+tests.push(['部署配置：wrangler 固定 3.90.0（4.x 部署失败）', () => {
+  const ci = fs.readFileSync(path.join(dir, '.github', 'workflows', 'deploy.yml'), 'utf8');
+  assert.ok(/npm install -g wrangler@3\.90\.0/.test(ci), 'CI 默认安装 wrangler 3.90.0');
+  assert.ok(/wrangler deploy --config wrangler\.workers\.ci\.toml/.test(ci), '部署步骤直接调用 wrangler CLI（与安装版本一致）');
+  const w = fs.readFileSync(path.join(dir, 'wrangler.workers.toml'), 'utf8');
+  assert.ok(!/run_worker_first/.test(w.split('# 注意：')[0]), '未开启 run_worker_first（3.90 不支持，会导致部署失败）');
+}]);
 tests.push(['parseMdFile：frontmatter 与无 frontmatter', async () => {
   const { ctx } = await boot({ 'window.BLOG_CONFIG': { mode: 'static' } });
   const r = ctx.parseMdFile('---\ntitle: 导入的标题\ndate: 2025-02-01\ntags: a, b\nexcerpt: 摘要\n---\n正文内容', 'import.md');
@@ -462,9 +514,9 @@ function makeD1() {
   let seq = 0;   // 模拟 SQLite rowid（单调递增，保证插入顺序稳定）
   const t = {
     posts: new Map(), post_revisions: new Map(), backups: new Map(), subscribers: new Map(), mail_outbox: new Map(), comments: new Map(), stats: new Map(), media: new Map(),
-    admin_auth: new Map(), admin_sessions: new Map(), admin_fails: new Map()
+    admin_auth: new Map(), admin_sessions: new Map(), admin_fails: new Map(), audit_log: new Map(), site_settings: new Map(), stats_sources: new Map(), error_logs: new Map(), webmentions: new Map()
   };
-  const POST_COLS = ['id', 'title', 'date', 'excerpt', 'content', 'cover', 'og_image', 'pinned', 'protected', 'enc', 'tags', 'category', 'series', 'series_order', 'status', 'publish_at'];
+  const POST_COLS = ['id', 'title', 'date', 'excerpt', 'content', 'cover', 'og_image', 'pinned', 'protected', 'enc', 'tags', 'category', 'series', 'author', 'series_order', 'status', 'publish_at', 'seo'];
 
   function exec(sql, params) {
     const s = sql.replace(/\s+/g, ' ').trim();
@@ -480,6 +532,7 @@ function makeD1() {
     }
     if (s === 'SELECT 1 FROM posts WHERE id = ?') return t.posts.has(params[0]) ? { '1': 1 } : null;
     if (s === 'SELECT * FROM posts WHERE id = ?') return t.posts.get(params[0]) || null;
+    if (s === 'SELECT title FROM posts WHERE id = ?') { const row = t.posts.get(params[0]); return row ? { title: row.title } : null; }
     if (s === 'SELECT * FROM post_revisions WHERE post_id = ? ORDER BY created_at DESC, id DESC LIMIT 1') {
       return [...t.post_revisions.values()].filter((r) => r.post_id === params[0]).sort((a, b) => b.created_at - a.created_at || b.id - a.id)[0] || null;
     }
@@ -509,6 +562,11 @@ function makeD1() {
       return { success: true };
     }
     if (s === 'DELETE FROM posts WHERE id = ?') { t.posts.delete(params[0]); return { success: true }; }
+    if (s === 'UPDATE posts SET tags = ? WHERE id = ?') {
+      const row = t.posts.get(params[1]);
+      if (row) row.tags = params[0];
+      return { success: true };
+    }
     /* subscribers / mail outbox */
     if (s === 'SELECT * FROM subscribers WHERE email = ?') {
       return [...t.subscribers.values()].find((r) => r.email === params[0]) || null;
@@ -519,13 +577,16 @@ function makeD1() {
     if (s === "SELECT email FROM subscribers WHERE status = 'active'") {
       return [...t.subscribers.values()].filter((r) => r.status === 'active').map((r) => ({ email: r.email }));
     }
+    if (s === "SELECT * FROM subscribers WHERE status = 'active'") {
+      return [...t.subscribers.values()].filter((r) => r.status === 'active');
+    }
     if (s === 'SELECT * FROM subscribers ORDER BY created_at DESC') {
       return [...t.subscribers.values()].sort((a, b) => b.created_at - a.created_at);
     }
     if (/^INSERT INTO subscribers/.test(s)) {
       const [id,email,status,token,locale,created_at,confirmed_at,unsubscribed_at,last_notified_at] = params;
       const old = [...t.subscribers.values()].find((r) => r.email === email);
-      t.subscribers.set(old ? old.id : id, { id: old ? old.id : id, email, status, token, locale, created_at, confirmed_at, unsubscribed_at, last_notified_at });
+      t.subscribers.set(old ? old.id : id, { id: old ? old.id : id, email, status, token, locale, groups: (old && old.groups) || '[]', created_at, confirmed_at, unsubscribed_at, last_notified_at });
       return { success: true };
     }
     if (s === "UPDATE subscribers SET status = 'active', confirmed_at = ?, unsubscribed_at = NULL WHERE id = ?") {
@@ -534,22 +595,26 @@ function makeD1() {
     if (s === "UPDATE subscribers SET status = 'unsubscribed', unsubscribed_at = ? WHERE id = ?") {
       const row = t.subscribers.get(params[1]); if (row) { row.status = 'unsubscribed'; row.unsubscribed_at = params[0]; } return { success: true };
     }
+    if (s === 'UPDATE subscribers SET groups = ? WHERE id = ?') {
+      const row = t.subscribers.get(params[1]); if (row) row.groups = params[0]; return { success: true };
+    }
     if (s === 'UPDATE subscribers SET last_notified_at = ? WHERE email = ?') {
       const row = [...t.subscribers.values()].find((r) => r.email === params[1]); if (row) row.last_notified_at = params[0]; return { success: true };
     }
     if (s === 'DELETE FROM subscribers WHERE id = ?') { t.subscribers.delete(params[0]); return { success: true }; }
-    if (/^INSERT OR IGNORE INTO mail_outbox/.test(s)) {
-      const [post_id,to_email,status,attempts,error,created_at] = params;
+    if (/^INSERT(?: OR IGNORE)? INTO mail_outbox/.test(s)) {
+      const [post_id,to_email,status,attempts,error,created_at,kind,payload] = params;
       const key = post_id + '|' + to_email;
-      if (!t.mail_outbox.has(key)) t.mail_outbox.set(key, { id: ++seq, post_id, to_email, status, attempts, error, created_at, sent_at: null });
+      if (!t.mail_outbox.has(key)) t.mail_outbox.set(key, { id: ++seq, post_id, to_email, status, attempts, error, created_at, kind: kind || 'post', payload: payload || '', sent_at: null });
       return { success: true };
     }
     if (/^SELECT \* FROM mail_outbox WHERE status = 'pending' ORDER BY created_at ASC LIMIT \d+$/.test(s)) {
       const limit = Number(s.split('LIMIT ')[1]) || 20;
       return [...t.mail_outbox.values()].filter((r) => r.status === 'pending').sort((a, b) => a.created_at - b.created_at).slice(0, limit);
     }
-    if (s === "UPDATE mail_outbox SET status = 'skipped', error = 'article or subscriber unavailable', sent_at = ? WHERE id = ?") {
-      const row = t.mail_outbox.get([...t.mail_outbox.keys()].find((k) => t.mail_outbox.get(k).id === params[1])); if (row) { row.status = 'skipped'; row.error = 'article or subscriber unavailable'; row.sent_at = params[0]; } return { success: true };
+    const skipM = /^UPDATE mail_outbox SET status = 'skipped', error = '([^']*)', sent_at = \? WHERE id = \?$/.exec(s);
+    if (skipM) {
+      const row = [...t.mail_outbox.values()].find((r) => r.id === params[1]); if (row) { row.status = 'skipped'; row.error = skipM[1]; row.sent_at = params[0]; } return { success: true };
     }
     if (s === "UPDATE mail_outbox SET status = 'sent', sent_at = ?, attempts = attempts + 1, error = '' WHERE id = ?") {
       const row = [...t.mail_outbox.values()].find((r) => r.id === params[1]); if (row) { row.status = 'sent'; row.sent_at = params[0]; row.attempts++; row.error = ''; } return { success: true };
@@ -570,24 +635,91 @@ function makeD1() {
       t.backups.set(id, { id, object_key, size, reason, created_at, counts }); return { success: true };
     }
     if (s === 'DELETE FROM backups WHERE id = ?') { t.backups.delete(params[0]); return { success: true }; }
+    /* site_settings */
+    if (/^SELECT v FROM site_settings WHERE k = \?/.test(s)) {
+      const r = t.site_settings.get(params[0]);
+      return r ? { v: r.v } : null;
+    }
+    /* audit_log */
+    if (/^INSERT INTO audit_log/.test(s)) {
+      const [id, action, target, detail, ip, created_at] = params;
+      t.audit_log.set(id, { id, action, target, detail, ip, created_at });
+      return { success: true };
+    }
+    if (/^SELECT \* FROM audit_log/.test(s)) {
+      let rows = [...t.audit_log.values()];
+      if (s.indexOf('WHERE action = ?') >= 0) rows = rows.filter((r) => r.action === params[0]);
+      rows.sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
+      return rows;
+    }
+    if (/^DELETE FROM audit_log/.test(s)) { t.audit_log.clear(); return { success: true }; }
     /* comments */
-    if (s === 'SELECT * FROM comments WHERE post_id = ? ORDER BY rowid ASC'
-      || s === "SELECT * FROM comments WHERE post_id = ? AND (status = 'approved' OR status IS NULL) ORDER BY rowid ASC") {
-      return [...t.comments.values()].filter((r) => r.post_id === params[0])
-        .filter((r) => !s.includes('status') || (r.status === 'approved' || r.status == null))
-        .sort((a, b) => (a.__rowid || 0) - (b.__rowid || 0));
+    if (/^SELECT \*(, rowid AS rid)? FROM comments WHERE post_id = \?/.test(s) && /ORDER BY (rowid|COALESCE)/.test(s)) {
+      let rows = [...t.comments.values()].filter((r) => r.post_id === params[0]).map((r) => Object.assign({ rid: r.__rowid }, r));
+      if (s.includes('status')) rows = rows.filter((r) => r.status === 'approved' || r.status == null);
+      if (s.includes('COALESCE(pinned')) {
+        rows.sort((a, b) => (Number(b.pinned) || 0) - (Number(a.pinned) || 0)
+          || (Number(b.featured) || 0) - (Number(a.featured) || 0)
+          || (Number(b.likes) || 0) - (Number(a.likes) || 0)
+          || (s.indexOf('rowid DESC') >= 0 ? ((b.__rowid || 0) - (a.__rowid || 0)) : ((a.__rowid || 0) - (b.__rowid || 0))));
+      } else if (s.indexOf('rowid DESC') >= 0) {
+        rows.sort((a, b) => (b.__rowid || 0) - (a.__rowid || 0));
+      } else {
+        rows.sort((a, b) => (a.__rowid || 0) - (b.__rowid || 0));
+      }
+      return rows;
+    }
+    // 后台评论列表：comments LEFT JOIN posts（含文章标题）
+    if (/^SELECT c\.\*, p\.title AS post_title FROM comments c/.test(s)) {
+      let rows = [...t.comments.values()];
+      if (s.includes('WHERE c.status = ?')) rows = rows.filter((r) => r.status === params[0]);
+      rows.sort((a, b) => (b.__rowid || 0) - (a.__rowid || 0));
+      return rows.map((r) => Object.assign({}, r, { post_title: (t.posts.get(r.post_id) || {}).title || null }));
     }
     if (s === 'SELECT COUNT(*) AS c FROM comments WHERE post_id = ?') {
       let c = 0; for (const r of t.comments.values()) if (r.post_id === params[0]) c++;
       return { c };
     }
     if (/^INSERT INTO comments/.test(s)) {
-      const [id, post_id, author, content, date] = params;
-      t.comments.set(id, { id, post_id, author, content, date, __rowid: ++seq }); return { success: true };
+      const [id, post_id, author, content, date, status, parent_id] = params;
+      t.comments.set(id, { id, post_id, author, content, date, status, parent_id, likes: 0, featured: 0, pinned: 0, __rowid: ++seq });
+      return { success: true };
+    }
+    if (s === 'SELECT id FROM comments WHERE post_id = ? AND id = ?') {
+      const r = t.comments.get(params[1]);
+      return (r && r.post_id === params[0]) ? { id: r.id } : null;
     }
     if (s === 'SELECT 1 FROM comments WHERE post_id = ? AND id = ?') {
       const r = t.comments.get(params[1]);
       return (r && r.post_id === params[0]) ? { '1': 1 } : null;
+    }
+    if (s === 'SELECT post_id FROM comments WHERE id = ?') {
+      const r = t.comments.get(params[0]);
+      return r ? { post_id: r.post_id } : null;
+    }
+    if (s === 'SELECT likes FROM comments WHERE id = ?') {
+      const r = t.comments.get(params[0]);
+      return r ? { likes: Number(r.likes) || 0 } : null;
+    }
+    if (s === 'SELECT parent_id FROM comments WHERE post_id = ? AND id = ?') {
+      const r = t.comments.get(params[1]);
+      return (r && r.post_id === params[0]) ? { parent_id: r.parent_id === undefined ? null : r.parent_id } : null;
+    }
+    if (s === 'UPDATE comments SET likes = MIN(COALESCE(likes,0) + 1, 999999) WHERE id = ?') {
+      const r = t.comments.get(params[0]);
+      if (r) r.likes = Math.min((Number(r.likes) || 0) + 1, 999999);
+      return { success: true };
+    }
+    // 后台修改评论字段：UPDATE comments SET col = ?[, col2 = ?] WHERE id = ?
+    if (/^UPDATE comments SET [a-z_]+ = \?(, [a-z_]+ = \?)* WHERE id = \?$/.test(s)) {
+      const cols = s.slice('UPDATE comments SET '.length, s.indexOf(' WHERE id = ?')).split(',').map((x) => x.trim().split('=')[0].trim());
+      const id = params[params.length - 1];
+      const r = t.comments.get(id);
+      if (r) cols.forEach((col, i) => { r[col] = params[i]; });
+      return { success: true };
+    }
+    if (s === 'DELETE FROM comments WHERE id = ?') {
+      t.comments.delete(params[0]); return { success: true };
     }
     // 重复发送查重（api-core handleComments）：同分区 + 同昵称 + 同内容
     if (/^SELECT id FROM comments WHERE post_id = \? AND author = \? AND content = \? LIMIT 1$/.test(s)) {
@@ -630,11 +762,74 @@ function makeD1() {
     if (s === 'SELECT * FROM stats_daily') return [];
     /* stats_daily (聚合表，测试仅需不报错) */
     if (/^INSERT INTO stats_daily/.test(s)) { return { success: true }; }
+    /* stats_sources（访问来源 / 设备按天聚合） */
+    if (/^INSERT INTO stats_sources/.test(s)) {
+      const [post_id, date, kind, name] = params;
+      const key = [post_id, date, kind, name].join('|');
+      const row = t.stats_sources.get(key) || { post_id, date, kind, name, views: 0 };
+      row.views = (Number(row.views) || 0) + 1;
+      t.stats_sources.set(key, row);
+      return { success: true };
+    }
+    if (/^SELECT kind,name,SUM\(views\) AS views FROM stats_sources WHERE date >= \? GROUP BY kind,name ORDER BY views DESC$/.test(s)) {
+      const since = String(params[0] || '');
+      const agg = {};
+      [...t.stats_sources.values()].filter((r) => String(r.date) >= since).forEach((r) => {
+        const key = r.kind + '|' + r.name;
+        if (!agg[key]) agg[key] = { kind: r.kind, name: r.name, views: 0 };
+        agg[key].views += Number(r.views) || 0;
+      });
+      return Object.keys(agg).map((k) => agg[k]).sort((a, b) => b.views - a.views);
+    }
+    /* error_logs（前端错误日志：按 fingerprint 聚合） */
+    if (/^INSERT INTO error_logs/.test(s)) {
+      const [fingerprint, kind, message, source, stack, url, ua, created_at, last_at] = params;
+      const row = t.error_logs.get(fingerprint);
+      if (row) { row.hits = (Number(row.hits) || 0) + 1; row.last_at = last_at; row.url = url; row.ua = ua; row.stack = stack; }
+      else t.error_logs.set(fingerprint, { id: ++seq, fingerprint, kind, message, source, stack, url, ua, hits: 1, created_at, last_at });
+      return { success: true };
+    }
+    if (/^SELECT \* FROM error_logs ORDER BY last_at DESC LIMIT \d+$/.test(s)) {
+      return [...t.error_logs.values()].sort((a, b) => b.last_at - a.last_at);
+    }
+    if (s === 'SELECT COUNT(*) AS n, COALESCE(SUM(hits),0) AS h FROM error_logs') {
+      const vals = [...t.error_logs.values()];
+      return { n: vals.length, h: vals.reduce((a, r) => a + (Number(r.hits) || 0), 0) };
+    }
+    if (s === 'DELETE FROM error_logs') { t.error_logs.clear(); return { success: true }; }
+    if (/^DELETE FROM error_logs WHERE id NOT IN /.test(s)) return { success: true };
+    /* webmentions（外站引用） */
+    if (/^INSERT INTO webmentions/.test(s)) {
+      const [source, target, post_id, author_name, author_url, title, excerpt, status, created_at, updated_at] = params;
+      const key = source + '|' + target;
+      const old = t.webmentions.get(key);
+      const row = { id: old ? old.id : ++seq, source, target, post_id, author_name, author_url, title, excerpt, status, created_at: old ? old.created_at : created_at, updated_at };
+      t.webmentions.set(key, row);
+      return { success: true };
+    }
+    if (/^SELECT id,source,target,author_name,author_url,title,excerpt,created_at FROM webmentions WHERE target = \? AND status = 'approved'/.test(s)) {
+      return [...t.webmentions.values()].filter((r) => r.target === params[0] && r.status === 'approved').sort((a, b) => b.created_at - a.created_at);
+    }
+    if (s === 'SELECT * FROM webmentions ORDER BY created_at DESC LIMIT 200') {
+      return [...t.webmentions.values()].sort((a, b) => b.created_at - a.created_at);
+    }
+    if (s === 'DELETE FROM webmentions WHERE id = ?') {
+      for (const [k, r] of [...t.webmentions]) if (r.id === Number(params[0])) t.webmentions.delete(k);
+      return { success: true };
+    }
     /* admin_auth */
     if (s === "SELECT * FROM admin_auth WHERE k = ?") return t.admin_auth.get(params[0]) || null;
     if (/^INSERT INTO admin_auth/.test(s)) {
-      const [k, salt, hash, iter] = params;
-      t.admin_auth.set(k, { k, salt, hash, iter }); return { success: true };
+      const [k, salt, hash, iter, must_change] = params;
+      const prev = t.admin_auth.get(k) || {};
+      const row = Object.assign({}, prev, { k, salt, hash, iter });
+      if (params.length > 4) row.must_change = must_change;
+      t.admin_auth.set(k, row); return { success: true };
+    }
+    if (s === 'UPDATE admin_auth SET must_change = 0 WHERE k = ?') {
+      const row = t.admin_auth.get(params[0]);
+      if (row) row.must_change = 0;
+      return { success: true };
     }
     /* admin_sessions */
     if (s === 'SELECT * FROM admin_sessions WHERE token = ?') return t.admin_sessions.get(params[0]) || null;
@@ -643,6 +838,7 @@ function makeD1() {
       t.admin_sessions.set(token, { token, exp }); return { success: true };
     }
     if (s === 'DELETE FROM admin_sessions WHERE token = ?') { t.admin_sessions.delete(params[0]); return { success: true }; }
+    if (s === 'DELETE FROM admin_sessions') { t.admin_sessions.clear(); return { success: true }; }
     /* admin_fails */
     if (s === 'SELECT * FROM admin_fails WHERE ip = ?') return t.admin_fails.get(params[0]) || null;
     if (/^INSERT INTO admin_fails/.test(s)) {
@@ -857,6 +1053,8 @@ tests.push(['API：后台文章数据分析与权限', async () => {
   assert.strictEqual(data.items.length, 2, '后台分析包含草稿');
   assert.strictEqual(data.items.find((p) => p.id === 'ana-a').score, 20, '综合得分为浏览 + 点赞×3 + 评论×5');
   assert.strictEqual(data.summary.posts, 2, '汇总文章数正确');
+  assert.strictEqual(data.trendDays, 30, '默认返回近 30 天趋势');
+  assert.strictEqual(data.items[0].trend.length, 30, '每篇文章都带趋势数据');
 }]);
 
 tests.push(['备份：创建 R2 备份并登记列表', async () => {
@@ -937,6 +1135,29 @@ tests.push(['订阅：确认邮箱并发送新文章通知', async () => {
   }
 }]);
 
+tests.push(['邮件：新评论通知进入发件箱并发送给站长', async () => {
+  const { env, token, core } = await authEnv();
+  env.RESEND_API_KEY = 're_test';
+  env.BLOG_MAIL_FROM = 'blog@example.com';
+  env.SITE_URL = 'https://blog.example';
+  env.BLOG_ADMIN_EMAIL = 'owner@example.com';
+  const subscribe = await import('./functions/_lib/subscribe.js');
+  const authHeaders = { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token };
+  const created = await core.handlePosts(new Request('http://t/api/posts', { method: 'POST', headers: authHeaders, body: JSON.stringify({ id: 'notify-post', title: '评论通知文章', content: '正文' }) }), env);
+  assert.strictEqual(created.status, 201);
+  const posted = await core.handleComments(new Request('http://t/api/posts/notify-post/comments', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ author: '读者', content: '这是一条测试评论' }) }), env, 'notify-post');
+  assert.strictEqual(posted.status, 201);
+  const row = [...env._d1.mail_outbox.values()][0];
+  assert.ok(row && row.kind === 'comment' && row.to_email === 'owner@example.com', '新评论进入站长通知发件箱');
+  const originalFetch = global.fetch;
+  const emails = [];
+  global.fetch = async function (url, opts) { emails.push(JSON.parse(opts.body)); return new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } }); };
+  try {
+    const result = await subscribe.processMailOutbox(env, 20);
+    assert.strictEqual(result.sent, 1, '评论通知异步发送成功');
+    assert.ok(emails[0].subject.includes('评论通知文章') && emails[0].html.includes('这是一条测试评论'), '邮件正文包含文章和评论内容');
+  } finally { global.fetch = originalFetch; }
+}]);
 tests.push(['API：OG 分享图上传签名与文章字段', async () => {
   const { env, token, core } = await authEnv();
   env.R2_ACCESS_KEY_ID = 'test-key';
@@ -1209,6 +1430,65 @@ tests.push(['管理员认证：首次设置 / 密码验证 / 限流 429', async 
   assert.strictEqual(r.status, 401, '登出后 token 失效');
 }]);
 
+tests.push(['强制改密：mustChange 会话仅允许改密，完成后旧会话失效', async () => {
+  const core = await import('./functions/_lib/api-core.js');
+  const env = mockEnv();
+
+  // 未配置安装密钥时，首次登录自动初始化随机默认密码。
+  let r = await core.handleAdminLogin(new Request('http://t/api/admin/login', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ password: 'anything' })
+  }), env);
+  assert.strictEqual(r.status, 200, '自动初始化登录成功');
+  const login = await r.json();
+  assert.strictEqual(login.mustChange, true, '自动初始化返回 mustChange=true');
+  assert.ok(login.defaultPassword && login.token, '返回默认密码与会话 token');
+
+  const bearer = { 'Content-Type': 'application/json', Authorization: 'Bearer ' + login.token };
+  r = await core.handlePosts(new Request('http://t/api/posts', {
+    method: 'POST', headers: bearer,
+    body: JSON.stringify({ id: 'force-1', title: '应被拦截' })
+  }), env);
+  assert.strictEqual(r.status, 403, '未改密时写操作 403');
+  const blocked = await r.json();
+  assert.strictEqual(blocked.code, 'PASSWORD_CHANGE_REQUIRED', '返回强制改密错误码');
+
+  // 改密接口本身仍可用，但必须校验当前密码。
+  r = await core.handleAdminPassword(new Request('http://t/api/admin/password', {
+    method: 'POST', headers: bearer,
+    body: JSON.stringify({ current: 'wrong-pass', password: 'new-strong-pass' })
+  }), env);
+  assert.strictEqual(r.status, 401, '当前密码错误 401');
+
+  r = await core.handleAdminPassword(new Request('http://t/api/admin/password', {
+    method: 'POST', headers: bearer,
+    body: JSON.stringify({ current: login.defaultPassword, password: 'new-strong-pass' })
+  }), env);
+  assert.strictEqual(r.status, 200, '使用默认密码完成强制改密');
+  assert.strictEqual(env._d1.admin_auth.get('auth').must_change, 0, 'must_change 已清零');
+
+  // 改密成功后所有旧 token 被撤销。
+  r = await core.handlePosts(new Request('http://t/api/posts', {
+    method: 'POST', headers: bearer,
+    body: JSON.stringify({ id: 'force-2', title: '旧会话应失效' })
+  }), env);
+  assert.strictEqual(r.status, 401, '旧会话已失效');
+
+  r = await core.handleAdminLogin(new Request('http://t/api/admin/login', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ password: 'new-strong-pass' })
+  }), env);
+  assert.strictEqual(r.status, 200, '新密码可登录');
+  const relogin = await r.json();
+  assert.strictEqual(relogin.mustChange, false, '新会话不再要求改密');
+  r = await core.handlePosts(new Request('http://t/api/posts', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + relogin.token },
+    body: JSON.stringify({ id: 'force-3', title: '改密后可写' })
+  }), env);
+  assert.strictEqual(r.status, 201, '完成强制改密后可正常写操作');
+}]);
+
 tests.push(['安全加固：媒体 URL 白名单 / clientIp 忽略伪造 XFF / 响应携带安全头', async () => {
   const core = await import('./functions/_lib/api-core.js');
   const { env, token } = await authEnv();
@@ -1449,6 +1729,32 @@ tests.push(['详情页：标签链接可点击、复制链接按钮、阅读时�
   assert.ok(d.html.includes('分钟阅读'), '阅读时长');
 }]);
 
+tests.push(['详情页：分享菜单（复制链接 / 系统分享 / 社交平台）', async () => {
+  const d = await boot({ 'window.BLOG_CONFIG': { mode: 'static' } }, '/posts/hello-qingyu/');
+  assert.ok(d.html.includes('id="btnShare"'), '分享按钮存在');
+  assert.ok(d.html.includes('id="shareMenu"'), '分享菜单容器存在');
+  assert.ok(d.html.includes('data-share="copy"'), '复制链接项');
+  assert.ok(d.html.includes('data-share="weibo"'), '微博分享项');
+  assert.ok(d.html.includes('data-share="x"'), 'X 分享项');
+  assert.ok(d.html.includes('data-share="facebook"'), 'Facebook 分享项');
+  assert.ok(d.html.includes('data-share="telegram"'), 'Telegram 分享项');
+  assert.ok(d.html.includes('data-share="email"'), '邮件分享项');
+}]);
+
+tests.push(['站点公告：开启后前台渲染，含链接与关闭按钮', async () => {
+  const b = await boot({ 'window.BLOG_CONFIG': { mode: 'static' } });
+  b.ctx._siteSettings = { site_info: JSON.stringify({ announceEnabled: true, announceText: '本站已完成升级', announceLink: '/about', announceLinkText: '了解更多', announceClosable: true }) };
+  await b.ctx.route();
+  const html = b.ctx.document.querySelector('#app').innerHTML;
+  assert.ok(html.includes('id="announceBar"'), '渲染公告栏');
+  assert.ok(html.includes('本站已完成升级'), '公告文字');
+  assert.ok(html.includes('data-announce-close'), '关闭按钮');
+  assert.ok(html.includes('class="announce-link"'), '公告链接');
+  b.ctx._siteSettings = { site_info: JSON.stringify({ announceEnabled: false, announceText: 'x' }) };
+  await b.ctx.route();
+  assert.ok(!b.ctx.document.querySelector('#app').innerHTML.includes('announce-bar'), '未开启时不渲染');
+}]);
+
 tests.push(['非法路径不崩溃（decodeURIComponent 防护）', async () => {
   const n = await boot({ 'window.BLOG_CONFIG': { mode: 'static' } }, '/posts/%E4%B8%8D%E5%AE%8C%E6%95%B4%/');
   assert.ok(n.html.includes('内容不存在') || n.html.length > 0, '非法编码渲染兜底页');
@@ -1515,6 +1821,40 @@ tests.push(['广告位：默认关闭不输出；配置后出现在首页与详�
   assert.ok(detail.html.includes('END'), '详情底部广告');
 }]);
 
+/* 后台「功能开关」：site_settings.features 覆盖 config.js 的 pageSize / 广告位 */
+tests.push(['功能开关（后台）：features 覆盖 pageSize / 广告位并可即时关闭', async () => {
+  const b = await boot({ 'window.BLOG_CONFIG': { mode: 'static', siteUrl: 'https://blog.example', pageSize: 5, ads: { enabled: false, betweenEvery: 3, content: '<p>CFG</p>' } } });
+  b.ctx._siteSettings = {
+    features: JSON.stringify({ pageSize: 3, ads: { enabled: true, client: 'ca-pub-test', belowSearch: '<p>SITEAD</p>', between: '<p>MID</p>', betweenEvery: 1 } })
+  };
+  const config = b.ctx.getConfig();
+  assert.strictEqual(config.pageSize, 3, '后台覆盖首页每页文章数');
+  assert.strictEqual(config.ads.enabled, true, '后台开启广告位');
+  assert.strictEqual(config.ads.client, 'ca-pub-test', '后台写入 AdSense 客户端 ID');
+  assert.strictEqual(config.ads.content, '<p>CFG</p>', '未覆盖的广告位保留 config.js 默认（深合并）');
+  await b.ctx.route();
+  const html = b.ctx.document.querySelector('#app').innerHTML;
+  assert.ok(html.indexOf('SITEAD') >= 0 && html.indexOf('MID') >= 0, '后台开启后首页输出广告位');
+  b.ctx._siteSettings = { features: JSON.stringify({ pageSize: 3, ads: { enabled: false } }) };
+  await b.ctx.route();
+  const html2 = b.ctx.document.querySelector('#app').innerHTML;
+  assert.ok(html2.indexOf('SITEAD') < 0, '后台关闭后不再输出广告');
+}]);
+
+/* 后台设置页：功能开关标签与控件已接入 */
+tests.push(['后台设置：新增「功能开关」标签页（分页 / 广告位）', async () => {
+  const src = fs.readFileSync(path.join(PUB, 'admin.js'), 'utf8');
+  assert.ok(src.indexOf('data-tab="features"') >= 0, '功能开关标签');
+  assert.ok(src.indexOf('id="abFeatPageSize"') >= 0, '每页文章数输入');
+  assert.ok(src.indexOf('id="abFeatNavExtras"') >= 0, '新增导航显示开关');
+  assert.ok(src.indexOf('id="abAdsEnabled"') >= 0, '广告总开关');
+  assert.ok(src.indexOf('id="abAdsClient"') >= 0, 'AdSense 客户端 ID');
+  assert.ok(src.indexOf('features: JSON.stringify({') >= 0, '保存 features 配置');
+  assert.ok(src.indexOf('navExtras:') >= 0, '保存新增导航开关');
+  assert.ok(src.indexOf('ab-ai-text') >= 0 && src.indexOf('ab-ai-result\"><pre>') < 0, 'AI 结果不再直接按代码块显示');
+  assert.ok(src.indexOf('syncFeaturesDraft') >= 0, '载入 features 草稿');
+}]);
+
 tests.push(['API：评论 POST / GET / 校验 / 删除（需令牌）', async () => {
   const core = await import('./functions/_lib/api-core.js');
   const env = mockEnv();
@@ -1560,6 +1900,68 @@ tests.push(['API：评论 POST / GET / 校验 / 删除（需令牌）', async ()
   assert.strictEqual(r.status, 200, '带令牌删除 200');
   const after = await (await core.handleComments(new Request('http://t/api/posts/p1/comments'), env, 'p1')).json();
   assert.strictEqual(after.comments.length, 2, '删除后剩 2 条');
+}]);
+
+tests.push(['评论互动：点赞自增 / 置顶精选排序 / 未登录不可改', async () => {
+  const core = await import('./functions/_lib/api-core.js');
+  const env = mockEnv();
+  const post = (pid, body) => core.handleComments(new Request('http://t/api/posts/' + pid + '/comments', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+  }), env, pid);
+  const a = (await (await post('ci', { author: 'A', content: '第一条' })).json()).comment;
+  const b = (await (await post('ci', { author: 'B', content: '第二条' })).json()).comment;
+  const c = (await (await post('ci', { author: 'C', content: '第三条' })).json()).comment;
+
+  // 点赞：第一次返回 1，第二次返回 2
+  let r = await core.handleCommentLike(new Request('http://t/api/comments/' + c.id + '/like', { method: 'POST' }), env, c.id);
+  assert.strictEqual(r.status, 200, '点赞 200');
+  assert.strictEqual((await r.json()).likes, 1, '第一次点赞 = 1');
+  r = await core.handleCommentLike(new Request('http://t/api/comments/' + c.id + '/like', { method: 'POST' }), env, c.id);
+  assert.strictEqual((await r.json()).likes, 2, '第二次点赞 = 2');
+
+  // 点赞不存在的评论 → 404
+  const miss = await core.handleCommentLike(new Request('http://t/api/comments/nope/like', { method: 'POST' }), env, 'nope');
+  assert.strictEqual(miss.status, 404, '点赞不存在评论 404');
+
+  // 未登录不能改置顶 / 精选
+  let pu = await core.handleCommentUpdate(new Request('http://t/api/comments/' + a.id, {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pinned: true })
+  }), env, a.id);
+  assert.strictEqual(pu.status, 401, '未登录改置顶 401');
+
+  // 有令牌可置顶 / 精选
+  env.BLOG_WRITE_TOKEN = 'tok-cmt';
+  const auth = { 'Content-Type': 'application/json', Authorization: 'Bearer tok-cmt' };
+  pu = await core.handleCommentUpdate(new Request('http://t/api/comments/' + a.id, {
+    method: 'PUT', headers: auth, body: JSON.stringify({ pinned: true })
+  }), env, a.id);
+  assert.strictEqual(pu.status, 200, '置顶成功');
+  await core.handleCommentUpdate(new Request('http://t/api/comments/' + b.id, {
+    method: 'PUT', headers: auth, body: JSON.stringify({ featured: true })
+  }), env, b.id);
+
+  // 前台排序：置顶 > 精选 > 点赞 > 写入顺序
+  const ordering = await (await core.handleComments(new Request('http://t/api/posts/ci/comments'), env, 'ci')).json();
+  assert.strictEqual(ordering.comments[0].id, a.id, '置顶排最前');
+  assert.strictEqual(ordering.comments[1].id, b.id, '精选排第二');
+  assert.strictEqual(ordering.comments[2].id, c.id, '高赞排第三');
+
+  // 后台列表返回点赞 / 置顶 / 精选字段（含文章标题连接）
+  const admin = await (await core.handleCommentsList(new Request('http://t/api/comments?status=all', {
+    headers: { Authorization: 'Bearer tok-cmt' }
+  }), env)).json();
+  assert.strictEqual(admin.comments.length, 3, '后台列表 3 条');
+  const rowC = admin.comments.filter((x) => x.id === c.id)[0];
+  assert.strictEqual(Number(rowC.likes), 2, '后台列表带点赞数');
+  const rowA = admin.comments.filter((x) => x.id === a.id)[0];
+  assert.strictEqual(Number(rowA.pinned), 1, '后台列表带置顶状态');
+
+  // 取消置顶后就地更新
+  await core.handleCommentUpdate(new Request('http://t/api/comments/' + a.id, {
+    method: 'PUT', headers: auth, body: JSON.stringify({ pinned: false })
+  }), env, a.id);
+  const ordering2 = await (await core.handleComments(new Request('http://t/api/posts/ci/comments'), env, 'ci')).json();
+  assert.strictEqual(ordering2.comments[0].id, b.id, '取消置顶后精选顶到最前');
 }]);
 
 tests.push(['留言板（云端）：合成 id gb-note/gb-idea 复用评论管道，持久化 + 来源校验', async () => {
@@ -1666,7 +2068,379 @@ tests.push(['评论（静态模式）：保存在本浏览器并渲染', async (
   assert.ok(d.html.includes('comment-list') && d.html.includes('发表评论'), '评论表单在详情页');
 }]);
 
+tests.push(['评论（前端）：点赞按钮 / 置顶精选徽章 / commentSort 排序', async () => {
+  const { ctx } = await boot({ 'window.BLOG_CONFIG': { mode: 'static' } });
+  const list = [
+    { id: 'c1', author: '小甲', content: '普通评论', date: '2026-01-01' },
+    { id: 'c2', author: '小乙', content: '置顶评论', date: '2026-01-02', pinned: 1 },
+    { id: 'c3', author: '小丙', content: '精选评论', date: '2026-01-03', featured: 1 },
+    { id: 'c4', author: '小丁', content: '高赞评论', date: '2026-01-04', likes: 5 }
+  ];
+  const html = ctx.renderCommentTree(list, false);
+  assert.ok(html.includes('comment-like'), '渲染点赞按钮');
+  assert.ok(html.includes('data-like-id="c1"'), '点赞按钮携带评论 id');
+  assert.ok(html.includes('comment-badge pinned'), '渲染置顶徽章');
+  assert.ok(html.includes('comment-badge featured'), '渲染精选徽章');
+  assert.ok(html.includes('class="comment pinned') || html.includes('comment pinned'), '置顶评论带状态类');
+  // 排序：置顶 > 精选 > 点赞 > 普通
+  const sorted = list.slice().sort(ctx.commentSort).map((x) => x.id).join(',');
+  assert.strictEqual(sorted, 'c2,c3,c4,c1', 'commentSort 排序正确');
+  assert.ok(typeof ctx.handleCommentLikeClick !== 'undefined' || html.includes('comment-like'), '点赞交互已接入');
+}]);
+
+tests.push(['评论（前端）：最新/最热排序、顶层分页与加载更多', async () => {
+  const { ctx } = await boot({ 'window.BLOG_CONFIG': { mode: 'static' } });
+  const list = [];
+  for (let i = 1; i <= 20; i++) list.push({ id: 'c' + i, author: 'u' + i, content: 'x' + i, date: '2026-01-01', likes: i, rid: i });
+  assert.strictEqual(ctx.commentRootCount(list), 20, '顶层评论计数');
+  assert.strictEqual(list.slice().sort(ctx.commentSort)[0].id, 'c20', '最热按点赞排序');
+  const fresh = list.slice().sort(ctx.commentSortNew).map((c) => c.id);
+  assert.strictEqual(fresh[0], 'c20', '最新按写入顺序倒序');
+  assert.strictEqual(fresh[19], 'c1', '最新末尾是最早');
+  const html = ctx.renderCommentTree(list, false, { sorter: ctx.commentSort, limit: 8 });
+  assert.strictEqual((html.match(/class="comment"/g) || []).length, 8, '只渲染前 8 条顶层评论');
+  const withReply = list.slice(0, 3).concat([{ id: 'r1', author: 'r', content: 'reply', parent_id: 'c3', rid: 99 }]);
+  assert.strictEqual(ctx.commentRootCount(withReply), 3, '回复不计入顶层数量');
+  const d = await boot({ 'window.BLOG_CONFIG': { mode: 'static' } }, '/posts/hello-qingyu/');
+  assert.ok(d.html.includes('id="commentSort"') && d.html.includes('data-sort="new"'), '排序切换入口');
+  assert.ok(d.html.includes('id="commentMore"'), '加载更多容器');
+}]);
+
+tests.push(['阅读体验：正文字号调节 + 移动端浮动目录', async () => {
+  const d = await boot({ 'window.BLOG_CONFIG': { mode: 'static' } }, '/posts/markdown-cheatsheet/');
+  assert.ok(d.html.includes('class="reading-tools"'), '字号调节控件');
+  assert.ok(d.html.includes('data-rs="1"'), 'A+ 按钮');
+  assert.ok(d.html.includes('id="tocFab"'), '浮动目录按钮');
+  assert.ok(d.html.includes('id="tocSheet"'), '目录抽屉');
+  assert.strictEqual(d.ctx.setReadingScale(1.2), 1.2, '字号 1.2');
+  assert.strictEqual(d.ctx.getReadingScale(), 1.2, '读回字号');
+  assert.strictEqual(d.ctx.setReadingScale(99), 1.5, '字号上限 1.5');
+  assert.strictEqual(d.ctx.setReadingScale(0.1), 0.85, '字号下限 0.85');
+  d.ctx.setReadingScale(1);
+}]);
+
+tests.push(['后台媒体库：搜索 / 分页 / 批量删除 已接入', async () => {
+  const src = fs.readFileSync(path.join(PUB, 'admin.js'), 'utf8');
+  assert.ok(src.includes('abMediaKw'), '搜索框');
+  assert.ok(src.includes('abMediaBatchDel'), '批量删除按钮');
+  assert.ok(src.includes('abMediaPage'), '分页容器');
+  assert.ok(src.includes('renderMediaGrid'), '网格渲染函数');
+  assert.ok(src.includes('batchDeleteMedia'), '批量删除逻辑');
+  assert.ok(src.includes('ab-media-check'), '单项勾选框');
+  const acss = fs.readFileSync(path.join(PUB, 'admin.css'), 'utf8');
+  assert.ok(acss.includes('.ab-media-check'), '选择框样式');
+}]);
+
+tests.push(['后台订阅者：搜索 / 状态筛选 / 分页 / 导出 已接入', async () => {
+  const src = fs.readFileSync(path.join(PUB, 'admin.js'), 'utf8');
+  assert.ok(src.includes('abSubKw'), '搜索框');
+  assert.ok(src.includes('abSubStatus'), '状态筛选');
+  assert.ok(src.includes('abSubPage'), '分页容器');
+  assert.ok(src.includes('filteredSubscribers'), '筛选逻辑');
+  assert.ok(src.includes('renderSubscribers'), '列表渲染');
+  assert.ok(src.includes('subState'), '分页状态');
+}]);
+
+tests.push(['后台文章列表：批量置顶 / 取消置顶 / 删除 已接入', async () => {
+  const src = fs.readFileSync(path.join(PUB, 'admin.js'), 'utf8');
+  assert.ok(src.includes('abPostBulk'), '批量操作条');
+  assert.ok(src.includes('abPostAll'), '本页全选');
+  assert.ok(src.includes('bulkPinPosts'), '批量置顶逻辑');
+  assert.ok(src.includes('bulkDeletePosts'), '批量删除逻辑');
+  assert.ok(src.includes('data-pick'), '行内勾选框');
+  assert.ok(src.includes('syncPostSelection'), '选中态同步');
+  const acss = fs.readFileSync(path.join(PUB, 'admin.css'), 'utf8');
+  assert.ok(acss.includes('.ab-bulk'), '批量条样式');
+}]);
+
+tests.push(['编辑器工具栏：表格 / 任务列表 / 分割线 / 代码块语言 已接入', async () => {
+  const src = fs.readFileSync(path.join(PUB, 'admin.js'), 'utf8');
+  assert.ok(src.includes('data-md="table"'), '表格按钮');
+  assert.ok(src.includes('data-md="task"'), '任务列表按钮');
+  assert.ok(src.includes('data-md="hr"'), '分割线按钮');
+  assert.ok(src.includes('data-md="codeblock"'), '代码块按钮');
+  assert.ok(src.includes('abMdLang'), '代码块语言选择器');
+  assert.ok(src.includes("type === 'table'") && src.includes("type === 'codeblock'"), '插入逻辑');
+  const acss = fs.readFileSync(path.join(PUB, 'admin.css'), 'utf8');
+  assert.ok(acss.includes('.ab-tool-select'), '语言选择器样式');
+}]);
+
+tests.push(['编辑器：字数统计 / 阅读时长 / 快捷键 已接入', async () => {
+  const src = fs.readFileSync(path.join(PUB, 'admin.js'), 'utf8');
+  assert.ok(src.includes('abEditorStats'), '统计条 DOM');
+  assert.ok(src.includes('editorCounts') && src.includes('updateEditorStats'), '字数统计逻辑');
+  assert.ok(src.includes("k === 's'"), 'Ctrl+S 存草稿');
+  assert.ok(src.includes("k === 'k'"), 'Ctrl+K 链接');
+  const acss = fs.readFileSync(path.join(PUB, 'admin.css'), 'utf8');
+  assert.ok(acss.includes('.ab-editor-stats'), '统计条样式');
+}]);
+
+tests.push(['后台媒体库：大图预览与复制 Markdown 已接入', async () => {
+  const src = fs.readFileSync(path.join(PUB, 'admin.js'), 'utf8');
+  assert.ok(src.includes('data-preview'), '缩略图预览入口');
+  assert.ok(src.includes('data-mdimg'), '复制 Markdown 按钮');
+  assert.ok(src.includes('openMediaLightbox') && src.includes('stepMediaLightbox'), '灯箱逻辑');
+  assert.ok(src.includes('ab-lb-counter'), '灯箱计数');
+  const acss = fs.readFileSync(path.join(PUB, 'admin.css'), 'utf8');
+  assert.ok(acss.includes('.ab-lightbox') && acss.includes('.ab-lb-nav'), '灯箱样式');
+}]);
+
+tests.push(['后台音乐管理：搜索与分页 已接入', async () => {
+  const src = fs.readFileSync(path.join(PUB, 'admin.js'), 'utf8');
+  assert.ok(src.includes('abMusicKw'), '搜索框');
+  assert.ok(src.includes('abMusicPage'), '分页容器');
+  assert.ok(src.includes('musicFiltered') && src.includes('renderMusicList'), '过滤与分页渲染');
+  assert.ok(src.includes('musicState'), '分页状态');
+}]);
+
+tests.push(['后台备份：列表分页与内容摘要 已接入', async () => {
+  const src = fs.readFileSync(path.join(PUB, 'admin.js'), 'utf8');
+  assert.ok(src.includes('abBackupPage'), '分页容器');
+  assert.ok(src.includes('renderBackups'), '分页渲染');
+  assert.ok(src.includes('backupCountsHtml'), '内容摘要');
+  assert.ok(src.includes('backupState'), '分页状态');
+  assert.ok(src.includes('admin.backup.total'), '总数文案');
+}]);
+
+tests.push(['后台仪表盘：存储与订阅概览卡片 已接入', async () => {
+  const src = fs.readFileSync(path.join(PUB, 'admin.js'), 'utf8');
+  assert.ok(src.includes('abStorageCard'), '概览卡片容器');
+  assert.ok(src.includes('loadStorageOverview'), '概览加载函数');
+  assert.ok(src.includes('admin.dashboard.sMedia') && src.includes('admin.dashboard.sBackups'), '概览指标文案');
+  assert.ok(src.includes("api('api/admin/subscribers')") && src.includes("api('api/admin/backups')"), '数据来源');
+}]);
+
+tests.push(['后台：操作审计日志 记录 / 过滤 / 清空（含分页与导出）', async () => {
+  const core = await import('./functions/_lib/api-core.js');
+  const env = mockEnv();
+  env.BLOG_WRITE_TOKEN = 'tok-audit';
+  const auth = { Authorization: 'Bearer tok-audit' };
+  await core.recordAudit(env, new Request('http://t/x', { headers: auth }), 'post.delete', 'p1');
+  await core.recordAudit(env, new Request('http://t/x', { headers: auth }), 'backup.create', 'b1');
+  let r = await core.handleAuditLog(new Request('http://t/api/admin/audit', { headers: auth }), env);
+  assert.strictEqual(r.status, 200, '列表 200');
+  let d = await r.json();
+  assert.strictEqual(d.logs.length, 2, '写入两条日志');
+  assert.strictEqual(d.counts['post.delete'], 1, '按类型统计');
+  r = await core.handleAuditLog(new Request('http://t/api/admin/audit?action=backup.create', { headers: auth }), env);
+  d = await r.json();
+  assert.strictEqual(d.logs.length, 1, '按类型过滤');
+  r = await core.handleAuditLog(new Request('http://t/api/admin/audit'), env);
+  assert.strictEqual(r.status, 401, '未登录读取 401');
+  r = await core.handleAuditLog(new Request('http://t/api/admin/audit', { method: 'DELETE', headers: auth }), env);
+  assert.strictEqual(r.status, 200, '清空 200');
+  d = await (await core.handleAuditLog(new Request('http://t/api/admin/audit', { headers: auth }), env)).json();
+  assert.strictEqual(d.logs.length, 1, '清空后仅保留清空动作本身');
+}]);
+
+tests.push(['阅读位置记忆：保存 / 读取 / 清理', async () => {
+  const { ctx } = await boot({ 'window.BLOG_CONFIG': { mode: 'static' } });
+  ctx.saveReadPos('p1', 1234);
+  assert.strictEqual(ctx.getReadPos('p1'), 1234, '保存后可读回');
+  ctx.clearReadPos('p1');
+  assert.strictEqual(ctx.getReadPos('p1'), 0, '清理后为 0');
+  const d = await boot({ 'window.BLOG_CONFIG': { mode: 'static' } }, '/posts/markdown-cheatsheet/');
+  assert.ok(d.ctx.getReadPos('markdown-cheatsheet') >= 0, '文章页已接入位置记忆');
+}]);
+
+tests.push(['正文划线高亮：存储接口与渲染函数已接入', async () => {
+  const { ctx } = await boot({ 'window.BLOG_CONFIG': { mode: 'static' } });
+  ctx.hlSave('p1', [{ t: '句子一', n: '备注' }]);
+  assert.strictEqual(ctx.hlList('p1')[0].n, '备注', '高亮备注可读回');
+  assert.strictEqual(ctx.hlList('p1')[0].t, '句子一', '高亮文本可读回');
+  ctx.hlSave('p1', []);
+  assert.strictEqual(JSON.stringify(ctx.hlList('p1')), '[]', '可清空');
+  assert.strictEqual(typeof ctx.applyHighlights, 'function', '高亮渲染函数');
+  assert.strictEqual(typeof ctx.clearHighlights, 'function', '高亮清除函数');
+}]);
+
+tests.push(['高亮导出 / 导入 已接入', async () => {
+  const src = fs.readFileSync(path.join(PUB, 'app.js'), 'utf8');
+  assert.ok(src.includes('btnHlExport'), '导出按钮');
+  assert.ok(src.includes('btnHlImport'), '导入按钮');
+  assert.ok(src.includes('post.hlImported'), '导入结果提示');
+}]);
+
+tests.push(['编辑器：分类选择 已接入', async () => {
+  const src = fs.readFileSync(path.join(PUB, 'admin.js'), 'utf8');
+  assert.ok(src.includes('abCategory'), '分类输入框');
+  assert.ok(src.includes('category: categoryValue'), '保存分类字段');
+  assert.ok(src.includes('fillCategoryOptions'), '分类候选填充');
+}]);
+
+tests.push(['编辑文章：未传日期时保留原日期（不刷新为今天）', async () => {
+  const core = await import('./functions/_lib/api-core.js');
+  const env = mockEnv();
+  env.BLOG_WRITE_TOKEN = 'tok-date';
+  const auth = { 'Content-Type': 'application/json', Authorization: 'Bearer tok-date' };
+  await core.handlePosts(new Request('http://t/api/posts', { method: 'POST', headers: auth, body: JSON.stringify({ id: 'dp1', title: '旧文', date: '2020-01-02', content: 'x' }) }), env);
+  await core.handlePostId(new Request('http://t/api/posts/dp1', { method: 'PUT', headers: auth, body: JSON.stringify({ title: '旧文改', content: 'y' }) }), env, 'dp1');
+  const row = env._d1.posts.get('dp1');
+  assert.strictEqual(row.date, '2020-01-02', '未传日期时保留原日期');
+  assert.strictEqual(row.title, '旧文改', '标题已更新');
+}]);
+
+tests.push(['后台文章列表：服务端搜索与分页', async () => {
+  const core = await import('./functions/_lib/api-core.js');
+  const env = mockEnv();
+  env.BLOG_WRITE_TOKEN = 'tok-sp';
+  const auth = { 'Content-Type': 'application/json', Authorization: 'Bearer tok-sp' };
+  for (let i = 0; i < 25; i++) {
+    await core.handlePosts(new Request('http://t/api/posts', { method: 'POST', headers: auth, body: JSON.stringify({ id: 'sp' + i, title: '文章' + i, date: '2026-01-01', content: 'body', tags: i % 2 ? ['技术'] : ['随笔'] }) }), env);
+  }
+  let r = await core.handlePosts(new Request('http://t/api/posts?page=2&per=10&status=all', { headers: auth }), env);
+  let d = await r.json();
+  assert.strictEqual(d.total, 25, '服务端返回总数');
+  assert.strictEqual(d.posts.length, 10, '第二页 10 条');
+  assert.strictEqual(d.pages, 3, '共 3 页');
+  r = await core.handlePosts(new Request('http://t/api/posts?page=1&per=10&q=' + encodeURIComponent('技术'), { headers: auth }), env);
+  d = await r.json();
+  assert.strictEqual(d.total, 12, '按标签搜索命中 12 篇');
+  r = await core.handlePosts(new Request('http://t/api/posts?page=1&per=10', {}), env);
+  assert.strictEqual(r.status, 401, '未登录分页查询 401');
+}]);
+
+tests.push(['路由：未知路径返回 404、已知路由仍 200', async () => {
+  const src = fs.readFileSync(path.join(dir, 'worker.js'), 'utf8');
+  assert.ok(src.includes('isKnownSpaRoute'), '存在已知路由判定');
+  assert.ok(src.includes('spaNotFound ? 404 : res.status'), '未知路径改用 404 状态');
+  assert.ok(src.includes('archive|tags|categories|history|links|about|guestbook|popular|subscribe|series|write'), '已知路由白名单');
+}]);
+
+tests.push(['音乐接口：Workers 与 Pages 双形态均可用', async () => {
+  const files = ['functions/api/music.js', 'functions/api/music/upload-url.js', 'functions/api/music/[id].js'];
+  for (const f of files) {
+    assert.ok(fs.existsSync(path.join(dir, f)), '存在 ' + f);
+    const src = fs.readFileSync(path.join(dir, f), 'utf8');
+    assert.ok(src.includes("from '../_lib/music.js'") || src.includes("from '../../_lib/music.js'"), f + ' 复用共享处理器');
+  }
+  const cap = fs.readFileSync(path.join(dir, 'functions/api/[[path]].js'), 'utf8');
+  assert.ok(cap.includes('api\\/music'), 'catch-all 白名单已登记音乐路由');
+}]);
+
+tests.push(['分类：分类页 / 首页筛选 / 路由白名单', async () => {
+  const { ctx } = await boot({ 'window.BLOG_CONFIG': { mode: 'static' } });
+  ctx.window.BLOG_POSTS = [{ id: 'c1', title: '技术文', date: '2026-01-02', category: '技术', content: 'x', tags: [] }, { id: 'c2', title: '随笔文', date: '2026-01-01', category: '随笔', content: 'y', tags: [] }];
+  setRoute(ctx, '/categories');
+  await ctx.route();
+  const html = ctx.document.querySelector('#app').innerHTML;
+  assert.ok(html.includes('分类'), '分类页渲染');
+  assert.ok(html.includes('技术') && html.includes('随笔'), '列出分类');
+  setRoute(ctx, '/?category=' + encodeURIComponent('技术'));
+  await ctx.route();
+  const home = ctx.document.querySelector('#app').innerHTML;
+  assert.ok(home.includes('技术文'), '按分类筛选命中');
+  assert.ok(!home.includes('随笔文'), '其他分类被过滤');
+  const w = fs.readFileSync(path.join(dir, 'worker.js'), 'utf8');
+  assert.ok(w.includes('categories'), 'worker 路由白名单含 /categories');
+}]);
+
+tests.push(['评论敏感词：命中拒绝、正常放行', async () => {
+  const core = await import('./functions/_lib/api-core.js');
+  assert.strictEqual(core.commentBlocklistHit('欢迎 广告 内容', ['广告']), '广告', '纯函数命中');
+  assert.strictEqual(core.commentBlocklistHit('正常内容', ['广告']), '', '纯函数不命中');
+  const env = mockEnv();
+  env.COMMENT_BLOCKLIST = '广告\n赌博';
+  const post = (body) => core.handleComments(new Request('http://t/api/posts/k1/comments', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }), env, 'k1');
+  let r = await post({ author: '路人', content: '这条带 赌博 字样' });
+  assert.strictEqual(r.status, 400, '命中敏感词 400');
+  assert.ok((await r.json()).error.indexOf('敏感词') >= 0, '错误提示含敏感词');
+  r = await post({ author: '路人', content: '正常讨论内容' });
+  assert.strictEqual(r.status, 201, '正常评论放行');
+}]);
+
+tests.push(['friend links page', async () => {
+  const b = await boot({ 'window.BLOG_CONFIG': { mode: 'static' } });
+  b.ctx._siteSettings = { friend_links: JSON.stringify([{ text: 'Alpha', url: 'https://a.example' }]) };
+  setRoute(b.ctx, '/links');
+  await b.ctx.route();
+  const html = b.ctx.document.querySelector('#app').innerHTML;
+  assert.ok(html.includes('Alpha'), 'friend link rendered');
+  assert.ok(html.includes('friend-grid'), 'grid rendered');
+  const foot = b.ctx.renderFooter();
+  assert.ok(foot.includes('/links'), 'footer entry present');
+}]);
+
+tests.push(['comment server paging and sort', async () => {
+  const core = await import('./functions/_lib/api-core.js');
+  const env = mockEnv();
+  const post = (body) => core.handleComments(new Request('http://t/api/posts/sp/comments', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }), env, 'sp');
+  const ids = [];
+  for (let i = 0; i < 12; i++) { const r = await post({ author: 'u' + i, content: 'c' + i }); ids.push((await r.json()).comment.id); }
+  await post({ author: 'r', content: 'reply', parent_id: ids[0] });
+  let r = await core.handleComments(new Request('http://t/api/posts/sp/comments?page=1&per=5'), env, 'sp');
+  let d = await r.json();
+  assert.strictEqual(d.total, 13, 'total includes reply');
+  assert.strictEqual(d.rootTotal, 12, 'root total');
+  assert.strictEqual(d.pages, 3, 'three pages');
+  assert.ok(d.comments.length >= 5, 'first page has 5 roots');
+  r = await core.handleComments(new Request('http://t/api/posts/sp/comments?sort=new&page=1&per=5'), env, 'sp');
+  d = await r.json();
+  assert.strictEqual(d.sort, 'new', 'sort flag');
+  assert.strictEqual(d.comments[0].author, 'u11', 'newest first');
+}]);
+
+tests.push(['stats sources api', async () => {
+  const core = await import('./functions/_lib/api-core.js');
+  const env = mockEnv();
+  env.BLOG_WRITE_TOKEN = 'tok-ss';
+  let r = await core.handleStatsSources(new Request('http://t/api/admin/stats/sources', {}), env);
+  assert.strictEqual(r.status, 401, 'auth required');
+  r = await core.handleStatsSources(new Request('http://t/api/admin/stats/sources?days=7', { headers: { Authorization: 'Bearer tok-ss' } }), env);
+  assert.strictEqual(r.status, 200, 'ok');
+  const d = await r.json();
+  assert.strictEqual(d.days, 7, 'days echoed');
+  assert.ok(Array.isArray(d.referrers) && Array.isArray(d.devices), 'arrays');
+}]);
+
+tests.push(['health check api', async () => {
+  const core = await import('./functions/_lib/api-core.js');
+  const env = mockEnv();
+  env.BLOG_WRITE_TOKEN = 'tok-hc';
+  let r = await core.handleHealth(new Request('http://t/api/admin/health', {}), env);
+  assert.strictEqual(r.status, 401, 'auth required');
+  r = await core.handleHealth(new Request('http://t/api/admin/health', { headers: { Authorization: 'Bearer tok-hc' } }), env);
+  assert.strictEqual(r.status, 200, 'ok');
+  const d = await r.json();
+  const keys = (d.items || []).map(function (x) { return x.key; });
+  ['db','kv','r2media','r2backup','ai','mail'].forEach(function (k) { assert.ok(keys.indexOf(k) >= 0, 'has ' + k); });
+}]);
+
+tests.push(['bulk comment ops', async () => {
+  const core = await import('./functions/_lib/api-core.js');
+  const env = mockEnv();
+  env.BLOG_WRITE_TOKEN = 'tok-cb';
+  const auth = { 'Content-Type': 'application/json', Authorization: 'Bearer tok-cb' };
+  env._d1.comments.set('cb1', { id: 'cb1', post_id: 'p', status: 'pending', __rowid: 1 });
+  env._d1.comments.set('cb2', { id: 'cb2', post_id: 'p', status: 'pending', __rowid: 2 });
+  let r = await core.handleCommentsBulk(new Request('http://t/api/admin/comments/bulk', { method: 'POST', headers: auth, body: JSON.stringify({ op: 'approve', ids: ['cb1', 'cb2'] }) }), env);
+  assert.strictEqual(r.status, 200, 'approve ok');
+  assert.strictEqual(env._d1.comments.get('cb1').status, 'approved', 'status updated');
+  r = await core.handleCommentsBulk(new Request('http://t/api/admin/comments/bulk', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ op: 'approve', ids: ['cb1'] }) }), env);
+  assert.strictEqual(r.status, 401, 'auth required');
+  await core.handleCommentsBulk(new Request('http://t/api/admin/comments/bulk', { method: 'POST', headers: auth, body: JSON.stringify({ op: 'delete', ids: ['cb2'] }) }), env);
+  assert.strictEqual(env._d1.comments.has('cb2'), false, 'deleted');
+}]);
+
 tests.push(['加密：服务端 PBKDF2 哈希往返验证', async () => {
+tests.push(['标签：批量重命名 / 删除接口', async () => {
+  const core = await import('./functions/_lib/api-core.js');
+  const env = mockEnv();
+  env.BLOG_WRITE_TOKEN = 'tok-tag';
+  const auth = { 'Content-Type': 'application/json', Authorization: 'Bearer tok-tag' };
+  env._d1.posts.set('tp1', { id: 'tp1', tags: JSON.stringify(['旧标签', '保留']) });
+  env._d1.posts.set('tp2', { id: 'tp2', tags: JSON.stringify(['旧标签']) });
+  env._d1.posts.set('tp3', { id: 'tp3', tags: JSON.stringify(['其他']) });
+  let r = await core.handleTags(new Request('http://t/api/admin/tags', { method: 'POST', headers: auth, body: JSON.stringify({ op: 'rename', from: '旧标签', to: '新标签' }) }), env);
+  assert.strictEqual(r.status, 200, '批量重命名 200');
+  assert.strictEqual((await r.json()).updated, 2, '命中 2 篇');
+  assert.ok(JSON.parse(env._d1.posts.get('tp1').tags).indexOf('新标签') >= 0, '标签已重命名');
+  r = await core.handleTags(new Request('http://t/api/admin/tags', { method: 'POST', headers: auth, body: JSON.stringify({ op: 'delete', from: '新标签' }) }), env);
+  assert.strictEqual((await r.json()).updated, 2, '批量删除命中 2 篇');
+  r = await core.handleTags(new Request('http://t/api/admin/tags', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }), env);
+  assert.strictEqual(r.status, 401, '未登录 401');
+}]);
+
   const core = await import('./functions/_lib/api-core.js');
   const env = mockEnv();
   env.BLOG_ADMIN_SETUP_KEY = 'setup-key-123';
@@ -1767,6 +2541,45 @@ tests.push(['统计：API 阅读数/点赞 累计与校验', async () => {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'wat' })
   }), env, 'p1');
   assert.strictEqual(r.status, 400, '非法 action 400');
+}]);
+
+/* 访问来源 / 设备：浏览时记录（外链 / 站内 / 直达 / 旧客户端回退），点赞不记录 */
+tests.push(['访问来源 / 设备：浏览时按天记录（点赞不记录）', async () => {
+  const core = await import('./functions/_lib/api-core.js');
+  const env = mockEnv();
+  env.BLOG_WRITE_TOKEN = 'tok-src';
+  const hit = (id, ua, opts) => core.handleStats(new Request('http://blog.example/api/posts/' + id + '/stats', {
+    method: 'POST',
+    headers: Object.assign({ 'Content-Type': 'application/json', 'User-Agent': ua }, (opts && opts.referer) ? { 'Referer': opts.referer } : {}),
+    body: JSON.stringify((opts && opts.body) ? opts.body : { action: 'views' })
+  }), env, id);
+  // 外链来源：前端上报 document.referrer
+  await hit('p1', 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15', { body: { action: 'views', ref: 'https://www.google.com/search?q=x' } });
+  // 站内来源
+  await hit('p2', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)', { body: { action: 'views', ref: 'https://blog.example/posts/other/' } });
+  // 直接访问：ref 空串，不应误判为站内
+  await hit('p3', 'Mozilla/5.0 (Windows NT 10.0)', { body: { action: 'views', ref: '' } });
+  // 旧客户端：无 ref 字段 → 回退 Referer 头
+  await hit('p4', 'Mozilla/5.0 (Linux; Android 13)', { referer: 'https://t.co/abc' });
+  // 国家/地区来自 Cloudflare 边缘 IP 地理（CF-IPCountry）
+  await core.handleStats(new Request('http://blog.example/api/posts/p6/stats', { method: 'POST', headers: { 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X)', 'CF-IPCountry': 'CN' }, body: JSON.stringify({ action: 'views', ref: '' }) }), env, 'p6');
+  // 点赞不应产生来源 / 设备记录
+  await hit('p5', 'Mozilla/5.0', { body: { action: 'like' } });
+  const d = await (await core.handleStatsSources(new Request('http://t/api/admin/stats/sources?days=30', { headers: { Authorization: 'Bearer tok-src' } }), env)).json();
+  const refs = d.referrers.map((x) => x.name);
+  const devs = d.devices.map((x) => x.name);
+  assert.ok(refs.indexOf('google.com') >= 0, '外链来源已记录: ' + refs.join(','));
+  assert.ok(refs.indexOf('internal') >= 0, '站内来源记为 internal');
+  assert.ok(refs.indexOf('direct') >= 0, '直接访问记为 direct');
+  assert.ok(refs.indexOf('t.co') >= 0, '旧客户端回退 Referer 头: ' + refs.join(','));
+  assert.ok(devs.indexOf('mobile') >= 0 && devs.indexOf('desktop') >= 0, '设备类型已记录: ' + devs.join(','));
+  assert.strictEqual(d.refTotal, 5, '五次浏览计入五次来源（点赞不计）');
+  assert.strictEqual(d.devTotal, 5, '五次浏览计入五次设备（点赞不计）');
+  // 国家/地区 · 系统 · 品牌
+  assert.ok((d.countries || []).some(function (x) { return x.name === 'CN'; }), '记录国家/地区（CN）');
+  assert.ok((d.platforms || []).some(function (x) { return x.name === 'iOS'; }), '记录手机系统（iOS）');
+  assert.ok((d.platforms || []).some(function (x) { return x.name === 'Windows'; }), '记录桌面系统（Windows）');
+  assert.ok((d.vendors || []).some(function (x) { return x.name === 'Apple'; }), '记录设备品牌（Apple）');
 }]);
 
 tests.push(['统计（静态模式）：本机阅读数/点赞 + 详情页元素', async () => {
@@ -1931,13 +2744,16 @@ tests.push(['保存文件：系统对话框原地覆盖，不支持时回退下�
   assert.strictEqual(ok2, false, '无对话框时回退下载');
 }]);
 
-tests.push(['导航渲染：默认主导航 + resolveNav 支持 i18n/直接文本/子菜单/外链', async () => {
+tests.push(['导航渲染：一级导航 + 「发现」点击下拉 + resolveNav 支持 i18n/直接文本/子菜单/外链', async () => {
   const b = await boot({ 'window.BLOG_CONFIG': { mode: 'static' } });
-  // 默认主导航渲染：7 项（首页/标签/系列/热门/归档/留言/关于）
+  // 一级导航只留 首页/归档/留言板/关于，其余五项收进「发现」下拉
   const mainNav = (b.html.match(/<nav class="main-nav">.*?<\/nav>/s) || [''])[0];
   assert.ok(mainNav.includes('>首页<') || mainNav.includes('>Home<'), '默认导航含首页（i18n）');
-  assert.ok(mainNav.includes('>归档<') || mainNav.includes('>Archive<'), '默认导航含归档');
-  assert.ok((mainNav.match(/nav-link/g) || []).length >= 7, '默认导航至少 7 个链接');
+  assert.ok(mainNav.includes('data-nav-dropdown-trigger') && mainNav.includes('id="navExploreMenu"'), '「发现」是点击展开的下拉入口');
+  ['标签', '分类', '历史', '系列', '热门'].forEach((t) => assert.ok(mainNav.includes('>' + t + '<'), '下拉菜单含「' + t + '」'));
+  assert.ok(mainNav.includes('href="/tags"') && mainNav.includes('href="/categories"') && mainNav.includes('href="/history"') && mainNav.includes('href="/series"') && mainNav.includes('href="/popular"'), '下拉菜单五个链接齐全（历史走 /history）');
+  assert.ok(mainNav.includes('>归档<') || mainNav.includes('>Archive<'), '一级导航保留「归档」');
+  assert.ok((mainNav.match(/nav-link/g) || []).length >= 7, '默认导航至少 7 个可点链接');
   assert.ok(!mainNav.includes('target="_blank"'), '默认导航全为站内链接（无外链）');
   // resolveNav 支持直接 text（无 i18n key）与子菜单（自定义导航移除后解析器仍保留该能力）
   const items = [
@@ -1955,9 +2771,495 @@ tests.push(['导航渲染：默认主导航 + resolveNav 支持 i18n/直接文�
   assert.strictEqual(resolved[1].children[0].text, '写作', '子项 text 生效');
   assert.strictEqual(resolved[1].children[1].url, 'https://friend.example', '子项外链保留');
   assert.ok(resolved[2].text, 'i18n key 解析出文本（' + resolved[2].text + '）');
-  // 默认 NAV 常量解析后 7 项且不崩溃
+  // 默认 NAV 常量解析后 8 项且不崩溃
   const def = b.ctx.resolveNav(b.ctx.NAV);
-  assert.strictEqual(def.length, 7, '默认 NAV 7 项');
+  assert.strictEqual(def.length, 9, '默认 NAV 9 项');
+  // 旧 nav_menu 没有 nav_defaults_version 时，新默认项应自动补齐，但不覆盖自定义项。
+  b.ctx._siteSettings = {
+    nav_menu: JSON.stringify([
+      { text: '首页', url: '/' }, { text: '标签', url: '/tags' },
+      { text: '归档', url: '/archive' }, { text: '留言板', url: '/guestbook' },
+      { text: '关于', url: '/about' }, { text: '监控', url: 'https://status.example' }
+    ]),
+    nav_defaults_version: '0'
+  };
+  const mergedNav = b.ctx.navItems();
+  assert.ok(mergedNav.some(function (x) { return x.url === '/categories'; }), '旧导航自动补充分类');
+  assert.ok(mergedNav.some(function (x) { return x.url === '/history'; }), '旧导航自动补充历史');
+  assert.ok(mergedNav.some(function (x) { return x.url === '/series'; }), '旧导航自动补充系列');
+  assert.ok(mergedNav.some(function (x) { return x.url === '/popular'; }), '旧导航自动补充热门');
+  assert.ok(mergedNav.some(function (x) { return x.url === 'https://status.example'; }), '自动补默认项时保留自定义项');
+  b.ctx._siteSettings.nav_defaults_version = String(b.ctx.NAV_DEFAULT_VERSION);
+  b.ctx._siteSettings.nav_menu = JSON.stringify([{ text: '首页', url: '/' }, { text: '归档', url: '/archive' }]);
+  const respectedNav = b.ctx.navItems();
+  assert.ok(!respectedNav.some(function (x) { return x.url === '/categories'; }), '版本已同步后不再把用户删除的默认项加回');
+  b.ctx._siteSettings.features = JSON.stringify({ navExtras: false });
+  b.ctx._siteSettings.nav_menu = JSON.stringify([
+    { text: '首页', url: '/' }, { text: '标签', url: '/tags' },
+    { text: '分类', url: '/categories' }, { text: '历史', url: '/history' },
+    { text: '系列', url: '/series' }, { text: '热门', url: '/popular' },
+    { text: '关于', url: '/about' }, { text: '监控', url: 'https://status.example' }
+  ]);
+  const hiddenNav = b.ctx.navItems();
+  assert.ok(hiddenNav.some(function (x) { return x.url === '/categories'; }), '分类已独立为一级导航，不受旧开关影响');
+  assert.ok(!hiddenNav.some(function (x) { return x.url === '/history'; }), '关闭开关后隐藏历史导航');
+  assert.ok(hiddenNav.some(function (x) { return x.url === '/tags'; }), '关闭新增导航开关不影响基础导航');
+  assert.ok(hiddenNav.some(function (x) { return x.url === 'https://status.example'; }), '关闭新增导航开关不影响自定义链接');
+}]);
+
+tests.push(['「发现」下拉：严格按后台配置输出（尊重删除、顺序与自定义项）', async () => {
+  const b = await boot({ 'window.BLOG_CONFIG': { mode: 'static' } });
+  b.ctx._siteSettings = {
+    nav_defaults_version: String(b.ctx.NAV_DEFAULT_VERSION),
+    // 后台只留下「历史 / 热门」，并把一个自定义链接放进「发现」
+    nav_menu: JSON.stringify([
+      { i18n: 'nav.home', url: '/', path: '/' },
+      { i18n: 'nav.history', url: '/history', path: '/history' },
+      { text: '随手记', url: '/notes', path: '/notes', discover: true },
+      { i18n: 'nav.popular', url: '/popular', path: '/popular' },
+      { i18n: 'nav.about', url: '/about', path: '/about' }
+    ])
+  };
+  await b.ctx.route();
+  const html = b.ctx.document.querySelector('#app').innerHTML;
+  const mainNav = (html.match(/<nav class="main-nav">.*?<\/nav>/s) || [''])[0];
+  const items = b.ctx.secondaryNavItems();
+  assert.strictEqual(items.length, 3, '下拉只输出后台保留的 2 个内置项 + 1 个自定义项');
+  assert.strictEqual(JSON.stringify(b.ctx.resolveNav(items).map((x) => x.text)), JSON.stringify(['历史', '随手记', '热门']), '下拉顺序 = 后台配置顺序');
+  assert.ok(!mainNav.includes('>标签<') && !mainNav.includes('>分类<') && !mainNav.includes('>系列<'), '后台删掉的内置入口不再自动补回');
+  assert.ok(mainNav.includes('href="/notes"'), '自定义项进入「发现」下拉');
+  assert.ok(mainNav.includes('data-nav-dropdown-trigger') && mainNav.includes('id="navExploreMenu"'), '下拉结构仍在');
+  assert.ok(!mainNav.includes('>留言<'), '一级导航只渲染配置里的项');
+}]);
+
+tests.push(['「发现」下拉：全部移除后不再渲染「发现」按钮', async () => {
+  const b = await boot({ 'window.BLOG_CONFIG': { mode: 'static' } });
+  b.ctx._siteSettings = {
+    nav_defaults_version: String(b.ctx.NAV_DEFAULT_VERSION),
+    nav_menu: JSON.stringify([
+      { i18n: 'nav.home', url: '/', path: '/' },
+      { i18n: 'nav.about', url: '/about', path: '/about' }
+    ])
+  };
+  await b.ctx.route();
+  const html = b.ctx.document.querySelector('#app').innerHTML;
+  const mainNav = (html.match(/<nav class="main-nav">.*?<\/nav>/s) || [''])[0];
+  assert.ok(!mainNav.includes('navExploreMenu'), '下拉为空时不渲染「发现」按钮');
+  assert.ok(mainNav.includes('href="/about"'), '一级导航照常渲染');
+}]);
+
+tests.push(['自定义二级下拉：顶栏与手机侧栏都能展开一级项的子菜单', async () => {
+  const b = await boot({ 'window.BLOG_CONFIG': { mode: 'static' } });
+  b.ctx._siteSettings = {
+    nav_defaults_version: String(b.ctx.NAV_DEFAULT_VERSION),
+    nav_menu: JSON.stringify([
+      { i18n: 'nav.home', url: '/', path: '/' },
+      {
+        text: '专栏', url: '/columns', path: '/columns',
+        children: [
+          { text: '前端', url: '/columns/fe' },
+          { text: '后端', url: '/columns/be' }
+        ]
+      },
+      { i18n: 'nav.about', url: '/about', path: '/about' }
+    ])
+  };
+  await b.ctx.route();
+  const html = b.ctx.document.querySelector('#app').innerHTML;
+  const mainNav = (html.match(/<nav class="main-nav">.*?<\/nav>/s) || [''])[0];
+  assert.ok(mainNav.includes('href="/columns"'), '主链接保留，可直接跳转');
+  assert.ok(mainNav.includes('class="nav-sub-caret"'), '顶栏出现独立的展开箭头');
+  assert.ok(mainNav.includes('href="/columns/fe"') && mainNav.includes('href="/columns/be"'), '子菜单项已渲染');
+  assert.ok(/class="nav-item has-sub click-dropdown"/.test(mainNav), '带二级的一级项走点击展开');
+  assert.ok(html.includes('class="sidebar-link-row"') && html.includes('class="sidebar-sub-caret"'), '手机侧栏同样支持自定义二级');
+  assert.ok(html.includes('href="/columns/be"'), '侧栏也渲染了子菜单项');
+}]);
+
+tests.push(['博客设置 tab 恢复：真正走 pageSettings 渲染出上次那个标签', async () => {
+  const b = await boot({ 'window.BLOG_CONFIG': { mode: 'static' } });
+  b.win._cloudOn = () => true;
+  vm.runInContext(fs.readFileSync(path.join(PUB, 'admin.js'), 'utf8'), b.ctx, { filename: 'admin.js' });
+  const st = b.win.QingyuAdmin._settingsTab;
+  // 构造一个能反映 class 变化的 content 元素：pageSettings 会往 innerHTML 里塞 6 个 .ab-tab
+  function makeContent() {
+    const classes = {};
+    const TABS = ['site', 'features', 'profile', 'nav', 'footerNav', 'friends'];
+    const tabEls = TABS.map((key) => ({
+      _cls: new Set(),
+      get className() { return Array.from(this._cls).join(' '); },
+      classList: { add(c) { this.owner._cls.add(c); }, remove(c) { this.owner._cls.delete(c); } },
+      getAttribute: (a) => (a === 'data-tab' ? key : null),
+      addEventListener(evt, fn) { (this._h = this._h || {})[evt] = fn; },
+    }));
+    tabEls.forEach((e, i) => { e.owner = e; e.classList = { add: (c) => e._cls.add(c), remove: (c) => e._cls.delete(c) }; });
+    const body = { innerHTML: '' };
+    const saveBtn = { addEventListener() {}, disabled: false };
+    return {
+      innerHTML: '',
+      querySelectorAll: (sel) => (sel === '.ab-tab' ? tabEls : []),
+      querySelector: (sel) => {
+        if (sel === '#abSettingsBody') return body;
+        if (sel === '#abSaveSettings') return saveBtn;
+        return deepEl();
+      },
+      _tabEls: tabEls, _body: body, _classes: classes,
+    };
+  }
+  // renderNavVisual 等会对 innerHTML 里的元素再 querySelector，这里给一个可无限下探的桩
+  function deepEl() {
+    const el = stubEl();
+    el.querySelector = () => deepEl();
+    el.querySelectorAll = () => [];
+    return el;
+  }
+  // 无记录时：应回落到第一个标签（站点基础信息）
+  const c1 = makeContent();
+  st.page(c1);
+  assert.strictEqual(c1._tabEls[0]._cls.has('active'), true, '无记录时默认选中「站点基础信息」');
+  assert.strictEqual(c1._tabEls[1]._cls.has('active'), false, '其他标签默认不选中');
+  // 记录为 nav 时：pageSettings 应把 active 打在 nav 上，且渲染的是 nav 的内容
+  st.remember('nav');
+  const c2 = makeContent();
+  st.page(c2);
+  const active = c2._tabEls.filter((e) => e._cls.has('active'));
+  assert.strictEqual(active.length, 1, '有且仅有一个标签处于选中态');
+  assert.strictEqual(active[0].getAttribute('data-tab'), 'nav', '恢复为上次停留的「顶部导航」');
+  assert.ok(c2._body.innerHTML.includes('ab-nav'), '渲染的是「顶部导航」tab 的内容，而非站点基础信息');
+  // 记录了已不存在的标签（模拟后台以后增删 tab）：应安全回落到第一个，不报错
+  st.remember('some-removed-tab');
+  const c3 = makeContent();
+  st.page(c3);
+  assert.strictEqual(c3._tabEls[0]._cls.has('active'), true, '失效记录回落到第一个标签');
+}]);
+
+tests.push(['导航编辑器：过期草稿不再抹掉服务端二级菜单', async () => {
+  const b = await boot({ 'window.BLOG_CONFIG': { mode: 'static' } });
+  b.win._cloudOn = () => true;
+  vm.runInContext(fs.readFileSync(path.join(PUB, 'admin.js'), 'utf8'), b.ctx, { filename: 'admin.js' });
+  const nd = b.win.QingyuAdmin._navDraft;
+  assert.ok(nd && typeof nd.merge === 'function', '暴露导航草稿合并接口');
+  const server = [
+    { i18n: 'nav.home', text: '首页', url: '/' },
+    { i18n: 'nav.categories', text: '分类', url: '/categories', children: [{ text: '软件', url: '/categories/soft' }, { text: '服务器', url: '/categories/server' }] },
+    { i18n: 'nav.about', text: '关于', url: '/about', children: [{ text: '关于我', url: '/about/me' }] }
+  ];
+  // 曾经写进 localStorage 的过期草稿：默认 9 项平铺，既没有二级菜单，也没有「服务」
+  const staleDraft = [
+    { text: '首页', url: '/' }, { text: '标签', url: '/tags' }, { text: '分类', url: '/categories' },
+    { text: '归档', url: '/archive' }, { text: '留言板', url: '/guestbook' }, { text: '关于', url: '/about' }
+  ];
+  const merged = nd.merge(server, staleDraft);
+  const cat = merged.find((i) => i.url === '/categories');
+  assert.ok(cat && cat.children && cat.children.length === 2, '分类的二级菜单仍来自服务端');
+  assert.strictEqual(cat.children[0].text, '软件', '子菜单文案正确');
+  assert.ok(merged.find((i) => i.url === '/about').children.length === 1, '关于的二级菜单同样保留');
+  ['首页', '分类', '关于'].forEach((txt) => assert.ok(merged.some((i) => i.text === txt), '服务端菜单项「' + txt + '」未被过期草稿删除'));
+  assert.strictEqual(merged.length, 6, '服务端 3 项 + 草稿独有的 3 项（标签/归档/留言板）都保留');
+  // 草稿里用户自己加的项要保留
+  const withExtra = nd.merge(server, staleDraft.concat([{ text: '服务', url: '/services', children: [{ text: '主机', url: '/services/host' }] }]));
+  assert.ok(withExtra.some((i) => i.url === '/services'), '草稿新增的「服务」项不会被丢掉');
+  assert.strictEqual(withExtra.find((i) => i.url === '/services').children.length, 1, '「服务」的二级菜单也在');
+  // 草稿里的文案/地址编辑要生效
+  const edited = nd.merge(server, [{ text: '首页', url: '/' }, { text: '分类', url: '/categories' }, { text: '关于', url: '/about' }]);
+  assert.strictEqual(edited.find((i) => i.url === '/').text, '首页', '草稿文案覆盖服务端文案');
+  // 服务端没有 children、草稿里有（用户新加的子项）→ 用草稿的
+  const noKids = nd.merge([{ text: '关于', url: '/about' }], [{ text: '关于', url: '/about', children: [{ text: '留言', url: '/about/gb' }] }]);
+  assert.strictEqual(noKids[0].children.length, 1, '服务端没有时用草稿新增的子菜单');
+  // 没有草稿：原样返回服务端
+  assert.strictEqual(nd.merge(server, null).length, 3, '无草稿时直接用服务端数据');
+  assert.deepStrictEqual(nd.merge(server, []), server, '空草稿不改变服务端数据');
+  assert.strictEqual(nd.merge(null, null).length, 0, '空输入不报错');
+}]);
+
+tests.push(['导航编辑器：服务端数据回来前不写草稿，返回后重画一次编辑器', async () => {
+  const b = await boot({ 'window.BLOG_CONFIG': { mode: 'static' } });
+  b.win._cloudOn = () => true;
+  vm.runInContext(fs.readFileSync(path.join(PUB, 'admin.js'), 'utf8'), b.ctx, { filename: 'admin.js' });
+  const src = fs.readFileSync(path.join(PUB, 'admin.js'), 'utf8');
+  assert.ok(src.includes('function persist() { if (!settingsServerLoaded) return;'), '服务端未就绪时不把默认值写进草稿');
+  assert.ok(src.includes("if (content.querySelector('#abNavVisual') && !navUserEdited) renderNavVisual(content);"), '数据回来后重画导航编辑器');
+  assert.ok(src.includes('} else if (old.children && old.children.length) {'), 'DOM 无子行时保留原有 children，防止静默抹除');
+  const nd = b.win.QingyuAdmin._navDraft;
+  assert.strictEqual(typeof nd.state, 'function', '暴露加载状态供观测');
+  assert.strictEqual(nd.state().serverLoaded, false, '初始状态：服务端数据尚未到达');
+  assert.strictEqual(nd.state().edited, false, '初始状态：用户尚未编辑');
+}]);
+
+tests.push(['导航编辑器：真实取数逻辑 —— 服务端未就绪忽略草稿，就绪后以服务端为底', async () => {
+  const b = await boot({ 'window.BLOG_CONFIG': { mode: 'static' } });
+  b.win._cloudOn = () => true;
+  vm.runInContext(fs.readFileSync(path.join(PUB, 'admin.js'), 'utf8'), b.ctx, { filename: 'admin.js' });
+  const nd = b.win.QingyuAdmin._navDraft;
+  // 浏览器里遗留的过期草稿：默认 9 项平铺，没有二级菜单，也没有「服务」
+  b.ctx.localStorage.setItem(nd.key(), JSON.stringify([
+    { text: '首页', url: '/' }, { text: '标签', url: '/tags' }, { text: '分类', url: '/categories' },
+    { text: '归档', url: '/archive' }, { text: '留言板', url: '/guestbook' }, { text: '关于', url: '/about' }
+  ]));
+  // 场景一：服务端数据还没回来（settingsDraft 还是默认值）→ 不该被草稿带偏，也不该显示旧草稿
+  nd.setDraft([{ text: '首页', url: '/' }]);
+  assert.deepStrictEqual(nd.resolve(), [{ text: '首页', url: '/' }], '服务端未就绪时直接用当前草稿，不读本地旧草稿');
+  // 场景二：服务端数据回来后 → 以服务端为底合并，二级菜单与自定义项都回来了
+  const server = [
+    { text: '首页', url: '/' },
+    { text: '分类', url: '/categories', children: [{ text: '软件', url: '/categories/soft' }, { text: '服务器', url: '/categories/server' }] },
+    { text: '服务', url: '/services', children: [{ text: '主机', url: '/services/host' }] }
+  ];
+  nd.setServerLoaded(true);
+  nd.setDraft(server);
+  const out = nd.resolve();
+  assert.ok(out.some((i) => i.url === '/'), '首页在');
+  assert.ok(out.some((i) => i.url === '/categories'), '分类在');
+  assert.ok(out.some((i) => i.url === '/services'), '服务在（服务端自定义项，不再丢失）');
+  assert.strictEqual(out.length, 7, '服务端 3 项 + 草稿独有的 标签/归档/留言板/关于 共 7 项：' + out.map((i) => i.url).join(','));
+  assert.strictEqual(out.find((i) => i.url === '/categories').children.length, 2, '分类二级菜单回来了');
+  assert.strictEqual(out.find((i) => i.url === '/services').children.length, 1, '服务的二级菜单也回来了');
+  // 场景三：没有本地草稿时原样返回服务端
+  b.ctx.localStorage.removeItem(nd.key());
+  assert.deepStrictEqual(nd.resolve(), server, '无本地草稿时原样使用服务端数据');
+}]);
+
+tests.push(['首屏弱网兜底：预加载关键资源 + 加载超时提示重试', async () => {
+  const html = fs.readFileSync(path.join(PUB, 'index.html'), 'utf8');
+  const appSrc = fs.readFileSync(path.join(PUB, 'app.js'), 'utf8');
+  // 1) 首屏关键资源都提前声明预加载
+  ['config.min.js', 'posts.min.js', 'i18n.min.js', 'app.min.js'].forEach((f) => {
+    assert.ok(html.includes('<link rel="preload" href="' + f + '?v='), f + ' 已预加载');
+  });
+  assert.ok(html.includes('<link rel="preload" href="style.min.css?v='), '主样式已预加载');
+  // 2) 8 秒未渲染则给出「网络较慢」提示与重试按钮，30 秒升级为明确的失败文案
+  assert.ok(html.includes("setTimeout(showSlowTip, 8000)"), '8 秒后弹出慢网提示');
+  assert.ok(html.includes('网络较慢，页面还在加载'), '慢网提示有文案');
+  assert.ok(html.includes('网络连接不稳定，页面没能加载出来'), '30 秒后提示升级为加载失败');
+  assert.ok(html.includes('location.reload()'), '提示里有重新加载按钮');
+  assert.ok(html.includes("document.getElementById('bootSlowTip')"), '同一时刻只显示一个提示');
+  // 3) app.js 渲染完成后不再提示
+  assert.ok(appSrc.includes('window.__qingyuBooted = true;'), 'app.js 渲染完成会标记已启动');
+  const bootIdx = appSrc.indexOf('// 首屏渲染兜底：route()');
+  const idx = appSrc.indexOf('window.__qingyuBooted = true;');
+  assert.ok(bootIdx > 0 && idx > bootIdx, '标记发生在首次渲染之后');
+  // 4) 真实跑一遍计时逻辑：模拟 app.js 迟迟不来（8 秒）时是否出现提示
+  const b = await boot({ 'window.BLOG_CONFIG': { mode: 'static' } });
+  const m = html.match(/<script>\s*\/\/ 首屏兜底[\s\S]*?<\/script>/);
+  assert.ok(m, '能取出兜底脚本');
+  const els = {};
+  const mkEl = (id) => ({
+    id, style: {}, children: [], textContent: '', _html: '',
+    set innerHTML(v) { this._html = v; }, get innerHTML() { return this._html; },
+    appendChild(c) { this.children.push(c); if (c && c.id) els[c.id] = c; return c; },
+    addEventListener() {},
+  });
+  els.bootLoad = mkEl('bootLoad');
+  const realDoc = b.ctx.document;
+  // 未注册的 id 必须返回 null（默认桩会返回假元素，会让兜底脚本误判提示已存在）
+  realDoc.getElementById = (id) => els[id] || null;
+  realDoc.createElement = (tag) => mkEl(tag);
+  const timers = [];
+  b.ctx.setTimeout = (fn, ms) => { timers.push({ fn, ms }); return timers.length; };
+  b.win.setTimeout = b.ctx.setTimeout;
+  b.win.__qingyuBooted = false;
+  vm.runInContext(m[0].replace(/^<script>/, '').replace(/<\/script>$/, ''), b.ctx);
+  const slow = timers.find((x) => x.ms === 8000);
+  const late = timers.find((x) => x.ms === 30000);
+  assert.ok(slow && late, '注册了 8 秒与 30 秒两个计时器');
+  slow.fn();
+  assert.strictEqual(els.bootLoad.children.length, 1, '8 秒后提示已插入加载动画');
+  const tip = els.bootSlowTip;
+  assert.ok(tip, '提示节点已创建');
+  assert.strictEqual(tip.children.length, 2, '提示里是「网络较慢」文案 + 重新加载按钮');
+  assert.strictEqual(tip.children[1].textContent, '重新加载', '提供了重新加载按钮');
+  slow.fn();
+  assert.strictEqual(els.bootLoad.children.length, 1, '重复触发不会插入第二个提示');
+  late.fn();
+  assert.ok(String(tip.innerHTML).includes('网络连接不稳定'), '30 秒后提示升级为明确的加载失败');
+  // app.js 已启动就不再打扰
+  const before = els.bootLoad.children.length;
+  b.win.__qingyuBooted = true;
+  slow.fn();
+  assert.strictEqual(els.bootLoad.children.length, before, 'app.js 已启动就不再提示');
+}]);
+
+tests.push(['评论区：切换最热/最新有反馈、过渡连贯不闪空白', async () => {
+  const appSrc = fs.readFileSync(path.join(PUB, 'app.js'), 'utf8');
+  const css = fs.readFileSync(path.join(PUB, 'style.css'), 'utf8');
+  // 1) 点击立刻有选中与按下反馈，不再等数据回来才变
+  assert.ok(/\.cs-btn\.pressed/.test(css), '排序按钮有按下态样式');
+  assert.ok(appSrc.includes("b.classList.add('pressed')"), '点击时立即给出按下反馈');
+  assert.ok(appSrc.indexOf("b.classList.add('pressed')") < appSrc.indexOf('cloudCommentPage(1, v)'), '按下反馈早于请求发出');
+  // 2) 切换期间用骨架占位，绝不出现「暂无评论」的空白帧
+  const ldIdx = appSrc.indexOf('if (_cmtState.loading) {');
+  assert.ok(ldIdx > 0 && appSrc.slice(ldIdx, ldIdx + 400).includes('cmtLoadingSkeleton'), '加载中渲染骨架占位');
+  const emptyIdx = appSrc.indexOf("ul.innerHTML = '<li class=\"comment-empty\">'");
+  assert.ok(emptyIdx > ldIdx, '骨架分支排在「暂无评论」之前，切换不会先闪空');
+  const sk = appSrc.match(/function cmtLoadingSkeleton\(n\) \{[\s\S]*?\n  \}/);
+  assert.ok(sk, '骨架渲染函数存在');
+  const skel = vm.runInNewContext('(' + sk[0].replace('function cmtLoadingSkeleton', 'function') + ')');
+  const html3 = skel(3);
+  assert.strictEqual((html3.match(/comment-skeleton/g) || []).length, 3, '骨架行数跟随已加载条数');
+  assert.strictEqual((skel(99).match(/comment-skeleton/g) || []).length, 6, '骨架行数有上限，不会刷屏');
+  assert.ok(!/comment-empty/.test(html3), '骨架不出现「暂无评论」字样');
+  // 3) 加载中去抖，旧列表留在原地；失败有明确提示且恢复可点
+  assert.ok(/if \(v === _cmtState\.sort \|\| _cmtState\.loading\) return;/.test(appSrc), '加载中忽略重复点击');
+  assert.ok(appSrc.includes("toast(t('comment.loadFail'), 'err')"), '加载失败有错误提示');
+  assert.ok(appSrc.includes('_cmtState.loading = false;'), '结束后恢复可交互');
+  ['zh-CN', 'en', 'ja', 'ko', 'hi'].forEach((loc) => {
+    const j = JSON.parse(fs.readFileSync(path.join(PUB, 'locales', loc + '.json'), 'utf8'));
+    assert.ok(j['comment.loadFail'], loc + ' 有加载失败文案');
+  });
+}]);
+
+tests.push(['AI 摘要：游客不显示「重新生成」；页脚导航无间隔圆点', async () => {
+  const appSrc = fs.readFileSync(path.join(PUB, 'app.js'), 'utf8');
+  const css = fs.readFileSync(path.join(PUB, 'style.css'), 'utf8');
+  // 1) 重新生成只认登录态：命中缓存不等于有权限
+  assert.ok(!appSrc.includes('!!d.cached || adminOk()'), '不再把「命中缓存」当成管理员权限');
+  assert.ok(/adminVerified\(\)\.then\(function \(ok\)/.test(appSrc), '卡片按服务端确认的管理员身份决定是否给重新生成');
+  const cardFn = appSrc.match(/function aiSummaryCardHTML[\s\S]*?\n\}/)[0];
+  assert.ok(/isAdmin \? '<div class="ai-card-foot">/.test(cardFn), '底部按钮区仅在管理员时渲染');
+  assert.ok(cardFn.includes("t('ai.regenerate')"), '管理员看到的是重新生成');
+  // 游客（未登录）渲染：不带任何生成/重生成入口
+  const render = vm.runInNewContext('(function(t,esc,svgIcon){' + cardFn + '; return aiSummaryCardHTML;})')(
+    (k) => k, (v) => String(v), () => '');
+  const guest = render('一段摘要', 'p1', false, true);
+  assert.ok(guest.includes('一段摘要'), '游客仍能看到摘要正文');
+  assert.ok(!guest.includes('ai-card-foot') && !guest.includes('重新生成') && !guest.includes('ai.regenerate'), '游客看不到重新生成');
+  const admin = render('一段摘要', 'p1', true, true);
+  assert.ok(admin.includes('ai-card-foot') && admin.includes('ai.regenerate'), '管理员才看到重新生成');
+  assert.ok(!guest.includes('ai.regenerate'), '游客 DOM 里完全没有重新生成入口');
+  // 服务端：强制重生成必须登录
+  const sum = fs.readFileSync(path.join(dir, 'functions', 'api', 'ai', 'summary.js'), 'utf8');
+  assert.ok(/if \(force && !\(await isWriteAuthed\(request, env\)\)\) return unauthorized/.test(sum), '接口层也拦住了未登录的强制重生成');
+  // 2) 页脚导航不再有间隔圆点
+  assert.ok(!appSrc.includes('footer-dot'), '页脚不再插入小圆点');
+  assert.ok(appSrc.includes("var navHtml = nav.map(l).join('');"), '导航项直接拼接，不再用圆点分隔');
+  // 文章标题下的信息行同样不再出现小圆点
+  assert.ok(!appSrc.includes('meta-dot'), '文章标题下的信息行不再插圆点');
+  assert.ok(!css.includes('meta-dot'), '圆点样式一并移除');
+  assert.ok(!/post\.tags[^\n]*join\(' · '\)/.test(appSrc), '标签之间不再用圆点分隔');
+  assert.ok(!css.includes('.footer-dot'), '小圆点样式一并移除');
+  assert.ok(/\.footer-nav \{[^}]*column-gap: 16px/.test(css), '改用间距分隔');
+}]);
+
+tests.push(['评论区与页脚导航保持间距', async () => {
+  const css = fs.readFileSync(path.join(PUB, 'style.css'), 'utf8');
+  const cm = css.match(/\.comments \{[^}]*\}/g).join('\n');
+  assert.ok(/\.comments \{[^}]*padding-bottom: \d+px/.test(cm), '评论区下方有内边距');
+  assert.ok(/\.comments \{[^}]*margin-bottom: (2[0-9]|[3-9][0-9])px/.test(cm), '评论区与页脚之间有外边距');
+  assert.ok(/\.footer-inner \{[^}]*padding: 2[0-9]px/.test(css), '页脚导航行上方也留了一段间距');
+}]);
+tests.push(['AI 摘要：重新生成按钮仅登录管理员可见', async () => {
+  const appSrc = fs.readFileSync(path.join(PUB, 'app.js'), 'utf8');
+  const coreSrc = fs.readFileSync(path.join(dir, 'functions', '_lib', 'api-core.js'), 'utf8');
+  const workerSrc = fs.readFileSync(path.join(dir, 'worker.js'), 'utf8');
+  // 1) 不能再只凭本地 token 就认定管理员（过期/已撤销的 token 会误导致游客看到按钮）
+  assert.ok(/function adminOk()/.test(appSrc), '保留 adminOk 供其他场景使用');
+  assert.ok(/function adminVerified()/.test(appSrc), '新增服务端确认的管理员身份判定');
+  assert.ok(appSrc.includes("apiFetch('api/admin/session'"), '前端向服务端确认会话而非只看本地');
+  assert.ok(/resetAdminVerified()/.test(appSrc), '登录/登出/会话失效时清掉确认结果');
+  // 2) 摘要卡片的「重新生成」按钮必须走确认后的结果
+  const card = appSrc.match(/function aiSummaryCardHTML\([\s\S]*?\n\}/)[0];
+  assert.ok(/isAdmin \?/.test(card), '按钮由 isAdmin 决定是否渲染');
+  const fill = appSrc.match(/function aiFillSlots\(\) \{[\s\S]*?\n\}/)[0];
+  assert.ok(fill.includes('adminVerified().then(function (ok)'), '摘要卡片等服务端确认后再渲染');
+  assert.ok(!/aiSummaryCardHTML\(d\.summary, slug, adminOk\(\)/.test(fill), '不再直接用本地 token 判断');
+  const doS = appSrc.match(/function aiDoSummary\([\s\S]*?\n\}/)[0];
+  assert.ok(!/aiSummaryCardHTML\(d\.summary \|\| '', slug, adminOk\(\)\)/.test(doS), '生成完成后重绘卡片也用确认后的身份');
+  // 3) 服务端提供轻量会话自检接口，且未登录也返 200（不触发 401 清理会话）
+  assert.ok(/export async function handleAdminSession\(request, env\)/.test(coreSrc), '服务端有会话自检处理函数');
+  assert.ok(/authed: !!\(state\.authed && !state\.mustChange\)/.test(coreSrc), '强制改密中的会话不算管理员');
+  assert.ok(/'Cache-Control': 'no-store'/.test(coreSrc.match(/handleAdminSession[\s\S]*?\n\}/)[0]), '自检结果不被缓存');
+  assert.ok(workerSrc.includes("'/api/admin/session'") && workerSrc.includes('handleAdminSession(request, env)'), 'Worker 已路由该接口');
+  // 4) 未登录时 force 仍由服务端拒绝（前端只是不显示，不是唯一保护）
+  const sum = fs.readFileSync(path.join(dir, 'functions', 'api', 'ai', 'summary.js'), 'utf8');
+  assert.ok(sum.includes('if (force && !(await isWriteAuthed(request, env))) return unauthorized(request, env);'), '服务端对强制重生仍做鉴权');
+}]);
+tests.push(['功能开关：划线高亮与收藏可分别关闭', async () => {
+  const appSrc = fs.readFileSync(path.join(PUB, 'app.js'), 'utf8');
+  const adminSrc = fs.readFileSync(path.join(PUB, 'admin.js'), 'utf8');
+  assert.ok(/function highlightToolsEnabled\(\) \{[\s\S]*?\.highlight !== false/.test(appSrc), '读取「划线高亮」开关，未设置时默认开启');
+  assert.ok(/function bookmarkEnabled\(\) \{[\s\S]*?\.bookmark !== false/.test(appSrc), '读取「收藏」开关，未设置时默认开启');
+  // 默认开启：四个高亮按钮与收藏按钮都创建；一个关掉一个就不应输出
+  const mk = appSrc.match(/\(function initHighlight\(\) \{[\s\S]*?\n  \}\)\(\);/);
+  assert.ok(mk, '找到 initHighlight 实现');
+  var ids = ['btnHlSummary', 'btnClearHl', 'btnHlExport', 'btnHlImport', 'btnLater'];
+  ['hlOn', 'bmOn'].forEach((flag) => {
+    assert.ok(new RegExp('if \\(' + flag + '\\)').test(mk[0]) || mk[0].includes('if (!hlOn) return;'), flag + ' 真正影响渲染');
+  });
+  assert.ok(mk[0].includes('if (tools && tools.appendChild && hlOn) {'), '高亮按钮由 hlOn 决定是否创建');
+  assert.ok(mk[0].includes('if (bmOn) {'), '收藏按钮由 bmOn 决定是否创建');
+  assert.ok(mk[0].includes('if (!hlOn) return;'), '关闭高亮后不再创建高亮面板与划线气泡');
+  ids.forEach((id) => { assert.ok(mk[0].includes("id = '" + id + "'") || mk[0].includes("'" + id + "'"), '查找定位锚点 ' + id); });
+  // 后台：两个勾选框 + 读取 / 回填 / 保存三处
+  assert.ok(adminSrc.includes('id="abFeatHighlight"') && adminSrc.includes('id="abFeatBookmark"'), '功能开关里有两个勾选框');
+  assert.ok(adminSrc.includes("querySelector('#abFeatHighlight').checked") && adminSrc.includes("querySelector('#abFeatBookmark').checked"), '勾选框状态被读入草稿并回填');
+  assert.ok(/highlight: !\(feat && feat\.highlight === false\)/.test(adminSrc), '从服务端配置初始化草稿');
+  assert.ok(/highlight: !\(settingsDraft\.features && settingsDraft\.features\.highlight === false\)/.test(adminSrc), '保存时写回开关值');
+  ['zh-CN', 'en', 'ja', 'ko', 'hi'].forEach((loc) => {
+    const j = JSON.parse(fs.readFileSync(path.join(PUB, 'locales', loc + '.json'), 'utf8'));
+    assert.ok(j['admin.settings.featHighlight'] && j['admin.settings.featHighlightHint'] && j['admin.settings.featBookmark'] && j['admin.settings.featBookmarkHint'], loc + ' 有对应文案');
+  });
+}]);
+tests.push(['阅读字号：后台开关可隐藏/显示正文字号调节', async () => {
+  const appSrc = fs.readFileSync(path.join(PUB, 'app.js'), 'utf8');
+  const adminSrc = fs.readFileSync(path.join(PUB, 'admin.js'), 'utf8');
+  // 1) 前台按开关渲染：关闭时整条字号控件都不输出
+  assert.ok(/function readingFontEnabled\(\) \{[\s\S]*?\.readingFont !== false/.test(appSrc), '读取后台开关，未设置时默认开启');
+  assert.ok(appSrc.includes("html += '<div class=\"reading-tools\">' + (readingFontEnabled()"), '字号控件由开关决定是否渲染');
+  const fn = appSrc.match(/function readingFontEnabled\(\) \{[\s\S]*?\n\}/)[0];
+  // 在沙箱里换三次配置，直接跑这个开关函数：未配置 / 开 / 关
+  var res = vm.runInNewContext('(function(){' + fn + '\nvar r = [], g;\nfunction getConfig() { return g; }'
+    + "\ng = { features: {} }; r.push(readingFontEnabled());"
+    + "\ng = { features: { readingFont: true } }; r.push(readingFontEnabled());"
+    + "\ng = { features: { readingFont: false } }; r.push(readingFontEnabled());"
+    + '\nreturn r; })()');
+  assert.strictEqual(JSON.stringify(res), '[true,true,false]', '未配置默认显示、开=显示、关=隐藏');   // 跨沙箱数组，用字符串比
+  // 2) 后台：功能开关里有这个勾选框，且读取/回填/保存三处都串起来了
+  assert.ok(adminSrc.includes('id="abFeatReadingFont"'), '功能开关里有「阅读字号」勾选框');
+  assert.ok(adminSrc.includes("t('admin.settings.featReading')"), '有独立的分区标题');
+  assert.ok(/readingFont: !\(settingsDraft\.features && settingsDraft\.features\.readingFont === false\)/.test(adminSrc), '保存时写回开关值');
+  assert.ok(adminSrc.includes("querySelector('#abFeatReadingFont').checked"), '勾选框状态被读入草稿并回填');
+  assert.ok(/readingFont: !\(feat && feat\.readingFont === false\)/.test(adminSrc), '从服务端配置初始化草稿');
+  ['zh-CN', 'en', 'ja', 'ko', 'hi'].forEach((loc) => {
+    const j = JSON.parse(fs.readFileSync(path.join(PUB, 'locales', loc + '.json'), 'utf8'));
+    assert.ok(j['admin.settings.featReading'] && j['admin.settings.featReadingFont'] && j['admin.settings.featReadingFontHint'], loc + ' 有对应文案');
+  });
+}]);
+
+tests.push(['博客设置：刷新后停留在上次标签页（不再跳回站点基础信息）', async () => {
+  const b = await boot({ 'window.BLOG_CONFIG': { mode: 'static' } });
+  vm.runInContext(fs.readFileSync(path.join(PUB, 'admin.js'), 'utf8'), b.ctx, { filename: 'admin.js' });
+  const st = b.win.QingyuAdmin._settingsTab;
+  assert.ok(st && typeof st.remember === 'function' && typeof st.read === 'function', '暴露标签页记忆接口');
+  // 首次进入（无记录）应为空，由 pageSettings 回落到第一个 tab
+  assert.strictEqual(st.read(), '', '默认不记忆任何标签页');
+  // 切到「顶部导航」后应被记住
+  st.remember('nav');
+  assert.strictEqual(st.read(), 'nav', '切走的标签页被记住');
+  assert.strictEqual(b.ctx.localStorage.getItem(st.key()), 'nav', '写入 localStorage');
+  // 模拟刷新：新建一份 context 但共用同一 localStorage 记忆
+  assert.strictEqual(st.read(), 'nav', '刷新后仍能读回上次标签页');
+  // 空值不应污染记录
+  st.remember('');
+  assert.strictEqual(st.read(), 'nav', '忽略空标签页');
+  const adminSrc = fs.readFileSync(path.join(PUB, 'admin.js'), 'utf8');
+  assert.ok(!/class="ab-tab active" data-tab="site"/.test(adminSrc), 'site tab 不再硬编码为默认选中');
+  assert.ok(/rememberSettingsTab\(key\)/.test(adminSrc) && /readSettingsTab\(\)/.test(adminSrc), '进入设置时读取、点击时写入记忆');
+}]);
+
+tests.push(['后台导航编辑器：拖拽排序 + 「发现」标记 + 自定义二级', async () => {
+  const adminSrc = fs.readFileSync(path.join(PUB, 'admin.js'), 'utf8');
+  assert.ok(adminSrc.includes('data-toggle-discover'), '提供「放入/移出发现下拉」开关');
+  assert.ok(adminSrc.includes('admin.settings.navDiscoverBadge'), '内置二级项显示「发现 · 二级」标记');
+  assert.ok(adminSrc.includes('ab-nav-drag') && adminSrc.includes("'dragstart'") && adminSrc.includes("'drop'"), '提供拖拽排序');
+  assert.ok(/function applyDrop/.test(adminSrc) && adminSrc.includes('drop-after') && adminSrc.includes('drop-into'), '拖拽支持前插/后插/拖进子级');
+  assert.ok(adminSrc.includes('data-addchild') && adminSrc.includes('data-rmchild'), '可增删自定义二级项');
+  const css = fs.readFileSync(path.join(PUB, 'admin.css'), 'utf8');
+  assert.ok(css.includes('.ab-nav-drag') && css.includes('.ab-nav-badge') && css.includes('.drop-into'), '拖拽手柄 / 标记 / 落点样式齐备');
+  // 内置二级路径需与前台保持一致：标签 / 历史 / 系列 / 热门 四项
+  ['/tags', '/history', '/series', '/popular'].forEach((u) => {
+    assert.ok(new RegExp("'" + u + "': 1").test(adminSrc), '后台内置发现路径含 ' + u);
+  });
+  // 「分类」已独立为一级导航，不应再被标为内置「发现」入口
+  assert.ok(!new RegExp("'\\/categories': 1").test(adminSrc), '后台内置发现路径不含 /categories');
 }]);
 
 tests.push(['导航翻译：旧后台自定义导航在切换语言后内置项自动翻译、自定义文本保留', async () => {
@@ -2064,6 +3366,7 @@ tests.push(['后台：文章数据分析页已完整接入', async () => {
   assert.ok(src.includes('function pageAnalytics') && src.includes('abAnalyticsSummary') && src.includes('abAnalyticsBody'), '分析页主体已接入');
   assert.ok(src.includes("key: 'analytics'") && src.includes("href: '/admin/analytics'"), '侧边栏分析入口已接入');
   assert.ok(src.includes('api/admin/post-analytics'), '分析接口已接线');
+  assert.ok(src.includes('analyticsSparkline') && src.includes('exportAnalyticsCsv'), '趋势图和 CSV 导出已接入');
 }]);
 tests.push(['PWA：安装清单 / 图标 / Service Worker 配置齐全', async () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(PUB, 'manifest.webmanifest'), 'utf8'));
@@ -2569,6 +3872,1003 @@ tests.push(['背景动画开关位于顶栏 actions（与搜索同排），侧�
   assert.ok(!html.includes('sidebar-picks-2'), '侧边栏第二排容器已移除');
 }]);
 
+/* 前端文章加密内核：AES-GCM + PBKDF2 往返 + 错误密码拒绝 */
+tests.push(['文章加密：pfEncrypt / pfDecrypt 往返与错误密码拒绝', async () => {
+  const d = await boot({ 'window.BLOG_CONFIG': { mode: 'static' } });
+  assert.strictEqual(typeof d.win.pfEncrypt, 'function', '暴露 pfEncrypt');
+  assert.strictEqual(typeof d.win.pfDecrypt, 'function', '暴露 pfDecrypt');
+  const enc = await d.win.pfEncrypt('机密正文内容', 'p@ssw0rd');
+  assert.strictEqual(enc.alg, 'AES-GCM', '算法 AES-GCM');
+  assert.strictEqual(enc.kdf, 'PBKDF2-SHA256', 'KDF PBKDF2-SHA256');
+  assert.strictEqual(enc.iter, 100000, '迭代 100000');
+  assert.ok(enc.salt && enc.iv && enc.data, '含 salt / iv / data');
+  assert.ok(!JSON.stringify(enc).includes('机密正文内容'), '密文不含明文');
+  assert.strictEqual(await d.win.pfDecrypt(enc, 'p@ssw0rd'), '机密正文内容', '正确密码解出原文');
+  let bad = false; try { await d.win.pfDecrypt(enc, 'nope-wrong'); } catch (e) { bad = true; }
+  assert.ok(bad, '错误密码解密抛错');
+}]);
+
+/* 详情页锁屏：含 enc 渲染锁屏且不泄漏明文；protected 无 enc（历史数据）不锁屏 */
+tests.push(['加密文章：详情页渲染锁屏；protected 无 enc 不锁屏（兼容回归）', async () => {
+  const d0 = await boot({ 'window.BLOG_CONFIG': { mode: 'static' } });
+  const enc = await d0.win.pfEncrypt('这是加密正文', 'pw-123456');
+  const posts = [
+    { id: 'locked-1', title: '锁屏文章', date: '2025-02-01', tags: [], protected: true, enc: enc, content: '' },
+    { id: 'legacy-1', title: '历史保护', date: '2025-02-02', tags: [], protected: true, content: '这是历史受保护正文' }
+  ];
+  const locked = await boot({ 'window.BLOG_CONFIG': { mode: 'static' }, 'window.BLOG_POSTS': posts }, '/posts/locked-1/');
+  assert.ok(locked.html.includes('id="postLock"'), '渲染锁屏容器');
+  assert.ok(locked.html.includes('id="postArticle"'), '隐藏正文容器存在');
+  assert.ok(locked.html.includes('id="postLockPwd"') && locked.html.includes('id="postUnlockBtn"'), '密码输入框 + 解锁按钮');
+  assert.ok(!locked.html.includes('这是加密正文'), '锁屏时不泄漏明文');
+  const legacy = await boot({ 'window.BLOG_CONFIG': { mode: 'static' }, 'window.BLOG_POSTS': posts }, '/posts/legacy-1/');
+  assert.ok(!legacy.html.includes('id="postLock"'), 'protected 无 enc 不锁屏');
+  assert.ok(legacy.html.includes('这是历史受保护正文'), '历史受保护正文正常渲染');
+}]);
+
+/* 云端：列表摘要删掉 enc → 详情补回 enc → 渲染锁屏；回归“不得无限重渲染” */
+tests.push(['云端加密文章：详情补回 enc 后渲染锁屏（回归）', async () => {
+  const d0 = await boot({ 'window.BLOG_CONFIG': { mode: 'static' } });
+  const enc = await d0.win.pfEncrypt('云端密文正文', 'cloud-pass');
+  let detailHits = 0;
+  const fn = async (url) => {
+    const u = String(url);
+    if (u.indexOf('/locales/') >= 0) return { ok: false, status: 404, json: async () => ({}) };
+    if (/\/api\/posts\/lock-cloud\/?$/.test(u.split('?')[0])) {
+      detailHits++;
+      return { ok: true, status: 200, json: async () => ({ ok: true, post: { id: 'lock-cloud', title: '云端锁屏', date: '2025-03-01', tags: [], protected: true, content: '', enc: enc } }) };
+    }
+    if (u.indexOf('/api/posts') >= 0) return { ok: true, status: 200, json: async () => ({ ok: true, posts: [{ id: 'lock-cloud', title: '云端锁屏', date: '2025-03-01', tags: [], protected: true }] }) };
+    return { ok: true, status: 200, json: async () => ({ ok: true }) };
+  };
+  const b = await boot({ 'window.BLOG_CONFIG': { mode: 'api' }, fetch: fn }, '/posts/lock-cloud/');
+  const html = b.ctx.document.querySelector('#app').innerHTML;
+  assert.ok(html.includes('id="postLock"'), '云端锁屏渲染（详情补回 enc）');
+  assert.ok(html.includes('id="postLockPwd"'), '密码输入框存在');
+  assert.ok(!html.includes('云端密文正文'), '锁屏不泄漏明文');
+  assert.ok(detailHits > 0 && detailHits <= 4, '详情拉取次数有限，未陷入无限重渲染（' + detailHits + ' 次）');
+  const src = fs.readFileSync(path.join(PUB, 'app.js'), 'utf8');
+  assert.ok(src.includes('post.enc = full.enc'), '详情返回后补回 enc');
+}]);
+
+/* 后台编辑器：加密开关接入（保存时加密正文、写 protected/enc） */
+tests.push(['编辑器：文章加密开关已接入（enc / content / protected）', async () => {
+  const src = fs.readFileSync(path.join(PUB, 'admin.js'), 'utf8');
+  assert.ok(src.includes('id="abProtected"'), '加密开关复选框');
+  assert.ok(src.includes('id="abProtectPwd"'), '密码输入框');
+  assert.ok(src.includes('id="abProtectUnlock"'), '解锁正文按钮');
+  assert.ok(src.includes('await window.pfEncrypt(body, protectPwd)'), '保存时加密正文');
+  assert.ok(src.includes('content: contentToSave'), '密文文章明文 content 置空');
+  assert.ok(src.includes('protected: protectOn, enc: encData'), '写入 protected / enc 字段');
+  assert.ok(src.includes('admin.editor.protect'), '使用 i18n 文案');
+  assert.ok(src.includes('id="abProtectShow"'), '密码显示/隐藏按钮');
+  assert.ok(src.includes('rememberPostPwd(') && src.includes('readPostPwd('), '本机记住密码（便于后台查看）');
+  assert.ok(src.includes('forgetPostPwd('), '取消加密时清除本机密码');
+  assert.ok(src.includes('id="abSeoTitle"') && src.includes('id="abSeoDesc"') && src.includes('id="abSeoNoindex"'), '编辑器 SEO 字段已接入');
+  assert.ok(src.includes('canonical: val(content, \'#abSeoCanonical\')'), '保存 SEO 字段');
+}]);
+
+/* i18n：五个语言包键数一致，且都含加密相关文案 */
+tests.push(['i18n：五个语言包键数一致且含加密文案', async () => {
+  const langs = ['zh-CN', 'en', 'ja', 'ko', 'hi'];
+  const maps = langs.map((l) => JSON.parse(fs.readFileSync(path.join(PUB, 'locales', l + '.json'), 'utf8')));
+  const counts = maps.map((m) => Object.keys(m).length);
+  assert.ok(counts.every((c) => c === counts[0]), '各语言键数一致: ' + counts.join('/'));
+  const need = ['post.lockedTitle','post.lockedDesc','post.lockedPlaceholder','post.unlock','post.unlocked','post.unlockFail','admin.editor.protect','admin.editor.protectHint','admin.editor.protectPwdPh','admin.editor.protectEncrypted','admin.editor.protectUnlock','admin.editor.protectNeedPwd','admin.editor.protectUnlocked','admin.editor.protectFail','admin.editor.protectNeedUnlock','admin.editor.protectShow','admin.editor.protectHide','admin.editor.protectRemembered','admin.subscribers.colGroups','admin.subscribers.broadcastQueued','admin.subscribers.broadcastMailDisabled'];
+  maps.forEach((m, i) => { need.forEach((k) => assert.ok(typeof m[k] === 'string' && m[k], langs[i] + ' 缺 ' + k)); });
+}]);
+
+/* 后台文章列表分页回归：serverTotal 未定义 / 云端重复切片 */
+tests.push(['后台文章列表分页：云端不重复切片、静态本地切片（serverTotal 回归）', async () => {
+  const b = await boot({ 'window.BLOG_CONFIG': { mode: 'static' } });
+  vm.runInContext(fs.readFileSync(path.join(PUB, 'admin.js'), 'utf8'), b.ctx, { filename: 'admin.js' });
+  const pg = b.win.QingyuAdmin && b.win.QingyuAdmin._list && b.win.QingyuAdmin._list.paginatePosts;
+  assert.strictEqual(typeof pg, 'function', '暴露 paginatePosts 纯函数');
+  // 云端：接口已返回第 2 页的 10 条，total=25 → 不得再本地切片（否则会变空）
+  const cloudPage2 = Array.from({ length: 10 }, (_, i) => ({ id: 'c' + i }));
+  const c2 = pg(cloudPage2, 2, 10, 25);
+  assert.strictEqual(c2.slice.length, 10, '云端第 2 页仍是 10 条（不重复切片）');
+  assert.strictEqual(c2.totalPages, 3, '云端总页数 3');
+  assert.strictEqual(c2.page, 2, '云端当前页 2');
+  // 静态：完整 25 条本地切片，第 2 页取第 11-20 条
+  const all = Array.from({ length: 25 }, (_, i) => ({ id: 's' + i }));
+  const s2 = pg(all, 2, 10, 0);
+  assert.strictEqual(s2.slice.length, 10, '静态第 2 页 10 条');
+  assert.strictEqual(s2.slice[0].id, 's10', '静态第 2 页从第 11 条开始');
+  assert.strictEqual(s2.totalPages, 3, '静态总页数 3');
+  assert.strictEqual(pg(all, 99, 10, 0).page, 3, '越界页收敛到最后一页');
+  // 源码回归：loadPosts 内必须声明 serverTotal，避免再次 ReferenceError
+  const src = fs.readFileSync(path.join(PUB, 'admin.js'), 'utf8');
+  const body = src.slice(src.indexOf('async function loadPosts'), src.indexOf('function enc(s)'));
+  assert.ok(/var serverTotal\s*=\s*0/.test(body), 'loadPosts 内声明 serverTotal');
+  assert.ok(body.indexOf('paginatePosts(') >= 0, 'loadPosts 使用纯分页函数');
+}]);
+
+/* 订阅分组：PUT 保存分组（去重/中英逗号）+ 列表返回分组与计数 */
+tests.push(['订阅分组：PUT 保存分组 + 列表返回分组与计数', async () => {
+  const { env, token } = await authEnv();
+  const subscribe = await import('./functions/_lib/subscribe.js');
+  env._d1.subscribers.set('s1', { id: 's1', email: 'a@example.com', status: 'active', token: 'tok-a', locale: 'zh-CN', groups: '[]', created_at: 1 });
+  env._d1.subscribers.set('s2', { id: 's2', email: 'b@example.com', status: 'active', token: 'tok-b', locale: 'zh-CN', groups: '[]', created_at: 2 });
+  const auth = { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token };
+  let r = await subscribe.handleSubscriberId(new Request('http://t/api/admin/subscribers/s1', { method: 'PUT', headers: auth, body: JSON.stringify({ groups: ['newsletter', 'VIP', 'newsletter', '  '] }) }), env, 's1');
+  assert.strictEqual(r.status, 200, 'PUT 分组返回 200');
+  assert.deepStrictEqual((await r.json()).groups, ['newsletter', 'VIP'], '分组去重去空');
+  const list = await (await subscribe.handleSubscribersAdmin(new Request('http://t/api/admin/subscribers', { headers: auth }), env)).json();
+  const s1 = list.subscribers.filter((x) => x.id === 's1')[0];
+  assert.deepStrictEqual(s1.groups, ['newsletter', 'VIP'], '列表返回分组数组');
+  assert.ok(list.groups.some((g) => g.name === 'newsletter' && g.count === 1), '分组聚合计数');
+  r = await subscribe.handleSubscriberId(new Request('http://t/api/admin/subscribers/s2', { method: 'PUT', headers: auth, body: JSON.stringify({ groups: 'newsletter，VIP' }) }), env, 's2');
+  assert.deepStrictEqual((await r.json()).groups, ['newsletter', 'VIP'], '支持中英文逗号分隔');
+}]);
+
+/* 订阅群发：按分组入队 + 必填校验 + Cron 异步发送 */
+tests.push(['订阅群发：按分组入队，Cron 异步发送且校验必填', async () => {
+  const { env, token } = await authEnv();
+  const subscribe = await import('./functions/_lib/subscribe.js');
+  env._d1.subscribers.set('s1', { id: 's1', email: 'a@example.com', status: 'active', token: 'tok-a', locale: 'zh-CN', groups: '["newsletter"]', created_at: 1 });
+  env._d1.subscribers.set('s2', { id: 's2', email: 'b@example.com', status: 'active', token: 'tok-b', locale: 'zh-CN', groups: '["vip"]', created_at: 2 });
+  env._d1.subscribers.set('s3', { id: 's3', email: 'c@example.com', status: 'active', token: 'tok-c', locale: 'zh-CN', groups: '[]', created_at: 3 });
+  env._d1.subscribers.set('s4', { id: 's4', email: 'd@example.com', status: 'pending', token: 'tok-d', locale: 'zh-CN', groups: '["newsletter"]', created_at: 4 });
+  const auth = { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token };
+  const post = (body) => subscribe.handleSubscriberBroadcast(new Request('http://t/api/admin/subscribers/broadcast', { method: 'POST', headers: auth, body: JSON.stringify(body) }), env);
+  assert.strictEqual((await post({ subject: 's', body: 'b' })).status, 503, '邮件未配置时拒绝群发');
+  env.RESEND_API_KEY = 're_test';
+  env.BLOG_MAIL_FROM = 'blog@example.com';
+  env.SITE_URL = 'https://blog.example';
+  assert.strictEqual((await post({ body: 'x' })).status, 400, '缺主题拒绝');
+  assert.strictEqual((await post({ subject: 's' })).status, 400, '缺正文拒绝');
+  let r = await post({ subject: '分组通知', body: '你好 <img src=x onerror=alert(1)>', groups: ['newsletter'] });
+  assert.strictEqual((await r.json()).queued, 1, '仅命中已确认的 newsletter 订阅者（pending 不计）');
+  r = await post({ subject: '全员通知', body: '大家好', groups: [] });
+  assert.strictEqual((await r.json()).queued, 3, '留空发送全部已确认订阅者');
+  const emails = [];
+  const originalFetch = global.fetch;
+  global.fetch = async function (url, opts) {
+    if (String(url).indexOf('api.resend.com') >= 0) { emails.push(JSON.parse(opts.body)); return new Response(JSON.stringify({ id: 'm' + emails.length }), { status: 200, headers: { 'Content-Type': 'application/json' } }); }
+    return originalFetch(url, opts);
+  };
+  try {
+    const result = await subscribe.processMailOutbox(env, 50);
+    assert.strictEqual(result.sent, 4, '4 封全部发出');
+    const xssMail = emails.filter((m) => m.subject === '分组通知')[0];
+    assert.ok(xssMail, '含分组通知邮件');
+    assert.ok(xssMail.html.indexOf('&lt;img') >= 0, '群发正文 HTML 已转义');
+    assert.ok(xssMail.html.indexOf('<img src=x') < 0, '群发正文不含未转义标签');
+    assert.ok(emails.some((m) => m.subject === '全员通知'), '含全员通知邮件');
+    assert.ok(emails.some((m) => String(m.html || '').indexOf('取消订阅') >= 0), '群发含退订入口');
+  } finally {
+    global.fetch = originalFetch;
+  }
+}]);
+
+/* i18n 完整性：内嵌中文兜底必须与 zh-CN.json 完全一致，且各语言包无重复键 */
+tests.push(['i18n 完整性：兜底与 zh-CN.json 一致、语言包无重复键', async () => {
+  const zhRaw = fs.readFileSync(path.join(PUB, 'locales', 'zh-CN.json'), 'utf8');
+  const zh = JSON.parse(zhRaw);
+  const i18nSrc = fs.readFileSync(path.join(PUB, 'i18n.js'), 'utf8');
+  const fallback = {};
+  for (const m of i18nSrc.matchAll(/^\s*"([A-Za-z0-9_.\-]+)"\s*:/gm)) fallback[m[1]] = 1;
+  const missing = Object.keys(zh).filter((k) => !fallback[k]);
+  const extra = Object.keys(fallback).filter((k) => !(k in zh));
+  assert.deepStrictEqual(missing, [], '内嵌兜底缺少 zh-CN 的键: ' + missing.join(','));
+  assert.deepStrictEqual(extra, [], '内嵌兜底存在多余键: ' + extra.join(','));
+  for (const lang of ['zh-CN', 'en', 'ja', 'ko', 'hi']) {
+    const raw = fs.readFileSync(path.join(PUB, 'locales', lang + '.json'), 'utf8');
+    const seen = {}; const dups = [];
+    for (const m of raw.matchAll(/^\s*"([^"]+)"\s*:/gm)) { if (seen[m[1]]) dups.push(m[1]); seen[m[1]] = 1; }
+    assert.deepStrictEqual(dups, [], lang + ' 存在重复键: ' + dups.join(','));
+  }
+  assert.ok(!/```|\$\$/.test(zh['admin.settings.featRichContentHint'] || ''), '功能开关提示不直接显示代码语法');
+}]);
+
+/** 让 boot() 的 #app 支持局部 querySelector，并桥接 app.js 暴露到 window 的函数，
+/** 用于在伪 DOM 中挂载新版 admin UI（覆盖静态检查抓不到的运行时错误）。 */
+function mountAdminUi(b) {
+  const appEl = b.ctx.document.querySelector('#app');
+  const fakeEl = () => { const el = stubEl(); const kids = {}; el.querySelector = (sel) => kids[sel] || (kids[sel] = fakeEl()); el.querySelectorAll = () => []; return el; };
+  const kids = {};
+  appEl.querySelector = (sel) => kids[sel] || (kids[sel] = fakeEl());
+  appEl.querySelectorAll = () => [];
+  Object.keys(b.ctx).forEach((k) => { if (typeof b.ctx[k] === 'function' && !b.win[k]) b.win[k] = b.ctx[k]; });
+  b.ctx._setSessionToken('SES-T1');
+  b.ctx._setAdminSession(true);
+  vm.runInContext(fs.readFileSync(path.join(PUB, 'admin.js'), 'utf8'), b.ctx, { filename: 'admin.js' });
+  return appEl;
+}
+
+/* 新版后台 UI 运行时冒烟：伪 DOM 挂载订阅者页（覆盖静态检查抓不到的运行时错误） */
+tests.push(['后台（新版 UI）：订阅者页挂载渲染分组列与群发入口', async () => {
+  const fn = async (url) => {
+    const u = String(url);
+    if (u.indexOf('/locales/') >= 0) return { ok: false, status: 404, json: async () => ({}) };
+    if (u.indexOf('/api/admin/subscribers') >= 0) return { ok: true, status: 200, json: async () => ({ ok: true, enabled: true, counts: { total: 2, active: 2, pending: 0, unsubscribed: 0 }, groups: [{ name: 'newsletter', count: 1 }], subscribers: [{ id: 's1', email: 'a@example.com', status: 'active', created_at: 1, groups: ['newsletter'] }, { id: 's2', email: 'b@example.com', status: 'active', created_at: 2, groups: [] }] }) };
+    if (u.indexOf('/api/posts') >= 0) return { ok: true, status: 200, json: async () => ({ ok: true, posts: [] }) };
+    return { ok: true, status: 200, json: async () => ({ ok: true }) };
+  };
+  const b = await boot({ 'window.BLOG_CONFIG': { mode: 'api' }, fetch: fn }, '/admin/subscribers');
+  const appEl = mountAdminUi(b);
+  await new Promise((r) => setTimeout(r, 60));
+  const shell = appEl.innerHTML || '';
+  assert.ok(shell.indexOf('ab-root') >= 0, '新版后台外壳已渲染（非门禁页）');
+  const content = appEl.querySelector('#abContent');
+  assert.ok((content.innerHTML || '').indexOf('abSubBroadcast') >= 0, '订阅者页含「群发邮件」入口');
+  const body = content.querySelector('#abSubBody').innerHTML || '';
+  assert.ok(body.indexOf('a@example.com') >= 0, '订阅者行已渲染');
+  assert.ok(body.indexOf('newsletter') >= 0 && body.indexOf('data-sub-groups') >= 0, '分组列 + 编辑分组按钮');
+  const sel = content.querySelector('#abSubGroup').innerHTML || '';
+  assert.ok(sel.indexOf('newsletter') >= 0, '分组筛选下拉已填充');
+}]);
+
+/* 新版后台 UI 运行时冒烟：全部文章页云端分页（serverTotal 未定义 / 重复切片 回归） */
+tests.push(['后台（新版 UI）：全部文章页云端分页渲染（serverTotal 回归）', async () => {
+  const fn = async (url) => {
+    const u = String(url);
+    if (u.indexOf('/locales/') >= 0) return { ok: false, status: 404, json: async () => ({}) };
+    if (u.indexOf('/api/posts?') >= 0) return { ok: true, status: 200, json: async () => ({ ok: true, posts: [{ id: 'p1', title: '第一篇文章', date: '2026-01-01', tags: [], status: 'published', pinned: false }], total: 25, page: 1, per: 10, pages: 3 }) };
+    if (u.indexOf('/api/posts') >= 0) return { ok: true, status: 200, json: async () => ({ ok: true, posts: [] }) };
+    return { ok: true, status: 200, json: async () => ({ ok: true }) };
+  };
+  const b = await boot({ 'window.BLOG_CONFIG': { mode: 'api' }, fetch: fn }, '/admin/posts');
+  const appEl = b.ctx.document.querySelector('#app');
+  // 预置筛选控件（伪 DOM 没有真实 select 的默认值），挂载后再读取
+  const fakeEl0 = () => { const el = stubEl(); const kids = {}; el.querySelector = (sel) => kids[sel] || (kids[sel] = fakeEl0()); el.querySelectorAll = () => []; return el; };
+  const kids0 = {};
+  appEl.querySelector = (sel) => kids0[sel] || (kids0[sel] = fakeEl0());
+  appEl.querySelectorAll = () => [];
+  const preContent = appEl.querySelector('#abContent');
+  preContent.querySelector('#abPostStatus').value = 'all';
+  preContent.querySelector('#abPostKw').value = '';
+  Object.keys(b.ctx).forEach((k) => { if (typeof b.ctx[k] === 'function' && !b.win[k]) b.win[k] = b.ctx[k]; });
+  b.ctx._setSessionToken('SES-T1'); b.ctx._setAdminSession(true);
+  vm.runInContext(fs.readFileSync(path.join(PUB, 'admin.js'), 'utf8'), b.ctx, { filename: 'admin.js' });
+  await new Promise((r) => setTimeout(r, 60));
+  const content = appEl.querySelector('#abContent');
+  const body = content.querySelector('#abPostBody').innerHTML || '';
+  assert.ok(body.indexOf('第一篇文章') >= 0, '文章行已渲染（不再 serverTotal 报错）');
+  assert.ok(body.indexOf('加载失败') < 0 && body.indexOf('serverTotal') < 0, '列表未显示加载失败');
+  const pg = content.querySelector('#abPostPage').innerHTML || '';
+  assert.ok(pg.indexOf('3') >= 0, '分页显示服务端总页数 3');
+}]);
+
+/* 新版后台 UI：全部评论页加载渲染（回归：不再一直转圈） */
+tests.push(['后台（新版 UI）：全部评论页加载并渲染', async () => {
+  const fn = async (url) => {
+    const u = String(url);
+    if (u.indexOf('/locales/') >= 0) return { ok: false, status: 404, json: async () => ({}) };
+    if (u.indexOf('/api/comments?status=') >= 0) return { ok: true, status: 200, json: async () => ({ ok: true, comments: [
+      { id: 'c1', post_id: 'p1', post_title: '文章一', author: '甲', content: '第一条评论', date: '2026-01-02 10:00', status: 'approved', likes: 2, pinned: 1, featured: 0 },
+      { id: 'c2', post_id: 'p1', post_title: '文章一', author: '乙', content: '待审核评论', date: '2026-01-03 11:00', status: 'pending', likes: 0 },
+      { id: 'c3', post_id: 'p1', author: '丙', content: '一条回复', date: '2026-01-03 12:00', status: 'approved', parent_id: 'c1' }
+    ] }) };
+    if (u.indexOf('/api/posts') >= 0) return { ok: true, status: 200, json: async () => ({ ok: true, posts: [] }) };
+    return { ok: true, status: 200, json: async () => ({ ok: true }) };
+  };
+  const b = await boot({ 'window.BLOG_CONFIG': { mode: 'api' }, fetch: fn }, '/admin/comments');
+  const appEl = mountAdminUi(b);
+  await new Promise((r) => setTimeout(r, 80));
+  const content = appEl.querySelector('#abContent');
+  const body = content.querySelector('#abCmtBody').innerHTML || '';
+  assert.ok(body.indexOf('第一条评论') >= 0, '评论行已渲染');
+  assert.ok(body.indexOf('甲') >= 0 && body.indexOf('乙') >= 0, '作者列已渲染');
+  assert.ok(body.indexOf('待审核') >= 0, '状态列已渲染');
+  assert.ok(body.indexOf('加载中') < 0, '不再停留在加载态');
+  // 接口失败也必须落到错误行，而不是一直转圈
+  const fnFail = async (url) => {
+    const u = String(url);
+    if (u.indexOf('/locales/') >= 0) return { ok: false, status: 404, json: async () => ({}) };
+    if (u.indexOf('/api/comments?status=') >= 0) return { ok: false, status: 500, json: async () => ({ error: 'boom' }) };
+    if (u.indexOf('/api/posts') >= 0) return { ok: true, status: 200, json: async () => ({ ok: true, posts: [] }) };
+    return { ok: true, status: 200, json: async () => ({ ok: true }) };
+  };
+  const b2 = await boot({ 'window.BLOG_CONFIG': { mode: 'api' }, fetch: fnFail }, '/admin/comments');
+  const appEl2 = mountAdminUi(b2);
+  await new Promise((r) => setTimeout(r, 80));
+  const body2 = appEl2.querySelector('#abContent').querySelector('#abCmtBody').innerHTML || '';
+  assert.ok(body2.indexOf('加载失败') >= 0 && body2.indexOf('加载中') < 0, '接口失败显示错误行而非一直转圈');
+}]);
+
+/* 新版后台 UI：所有页面逐个挂载，任何未捕获异常都视为失败（覆盖跨函数作用域变量名笔误） */
+tests.push(['后台（新版 UI）：所有页面挂载无运行时异常', async () => {
+  const errors = [];
+  const onRej = (e) => errors.push(e);
+  process.on('unhandledRejection', onRej);
+  const fn = async (url) => {
+    const u = String(url);
+    const ok = (obj) => ({ ok: true, status: 200, json: async () => obj });
+    if (u.indexOf('/locales/') >= 0) return { ok: false, status: 404, json: async () => ({}) };
+    if (u.indexOf('/api/comments?status=') >= 0) return ok({ ok: true, comments: [{ id: 'c1', post_id: 'p1', post_title: '文章一', author: '甲', content: '一条评论', date: '2026-01-02 10:00', status: 'approved', likes: 1, pinned: 1, featured: 0 }] });
+    if (/\/api\/posts\/[^?]+\?_=/.test(u) || /\/api\/posts\/edit-1(\?|$)/.test(u)) return ok({ ok: true, post: { id: 'edit-1', title: '编辑文', date: '2026-01-01', content: 'x', tags: [], protected: false } });
+    if (u.indexOf('/api/posts?') >= 0) return ok({ ok: true, posts: [{ id: 'p1', title: '文章一', date: '2026-01-01', tags: [], status: 'published', pinned: false }], total: 1, page: 1, per: 10, pages: 1 });
+    if (/\/api\/posts\/edit-1(\?|$)/.test(u)) return ok({ post: { id: 'edit-1', title: '编辑文', date: '2026-01-01', content: 'x', tags: [], protected: false } });
+    if (u.indexOf('/api/posts') >= 0) return ok({ ok: true, posts: [] });
+    if (u.indexOf('/api/settings') >= 0) return ok({ ok: true, settings: {} });
+    if (u.indexOf('/api/media') >= 0) return ok({ ok: true, media: [] });
+    if (u.indexOf('/api/music') >= 0) return ok({ ok: true, music: [] });
+    if (u.indexOf('/api/admin/subscribers') >= 0) return ok({ ok: true, enabled: false, counts: { total: 0, active: 0, pending: 0, unsubscribed: 0 }, groups: [], subscribers: [] });
+    if (u.indexOf('/api/admin/backups') >= 0) return ok({ ok: true, configured: false, backups: [] });
+    if (u.indexOf('/api/admin/audit') >= 0) return ok({ ok: true, logs: [], total: 0, page: 1, pages: 1 });
+    if (u.indexOf('/api/admin/health') >= 0) return ok({ ok: true, items: [] });
+    if (u.indexOf('/api/admin/errors') >= 0) return ok({ ok: true, total: 0, sumHits: 0, errors: [] });
+    if (u.indexOf('/api/admin/stats/sources') >= 0) return ok({ ok: true, referrers: [], devices: [], refTotal: 0, devTotal: 0 });
+    if (u.indexOf('/api/admin/stats/trend') >= 0) return ok({ ok: true, days: 30, views: [], comments: [] });
+    if (u.indexOf('/api/admin/post-analytics') >= 0) return ok({ ok: true, items: [], range: 'all' });
+    if (u.indexOf('/api/tags') >= 0) return ok({ ok: true, tags: [] });
+    if (u.indexOf('/api/ai/') >= 0) return ok({ ok: false });
+    return ok({ ok: true });
+  };
+  const routes = ['/admin', '/admin/posts', '/admin/posts/new', '/admin/posts/edit-1/edit', '/admin/comments', '/admin/comments/pending', '/admin/tags', '/admin/series', '/admin/media', '/admin/music', '/admin/subscribers', '/admin/audit', '/admin/health', '/admin/errors', '/admin/backup', '/admin/settings', '/admin/transfer'];
+  try {
+    for (const r of routes) {
+      const b = await boot({ 'window.BLOG_CONFIG': { mode: 'api' }, fetch: fn }, r);
+      const appEl = mountAdminUi(b);
+      await new Promise((res) => setTimeout(res, 60));
+      const html = appEl.querySelector('#abContent').innerHTML || '';
+      assert.ok(html.length > 0, r + ' 渲染了内容');
+    }
+  } finally {
+    process.removeListener('unhandledRejection', onRej);
+  }
+  assert.deepStrictEqual(errors.map((e) => String((e && e.message) || e)), [], '挂载过程中无未捕获异常');
+}]);
+
+/* 前端错误日志：公开上报聚合去重 + 后台列表 / 清空 */
+tests.push(['错误日志：上报聚合去重 + 后台列表 / 清空', async () => {
+  const core = await import('./functions/_lib/api-core.js');
+  const env = mockEnv();
+  env.BLOG_WRITE_TOKEN = 'tok-err';
+  const post = (body) => core.handleErrorReport(new Request('http://t/api/errors', { method: 'POST', headers: { 'Content-Type': 'application/json', 'User-Agent': 'TestUA' }, body: JSON.stringify(body) }), env);
+  assert.strictEqual((await post({ kind: 'error', message: 'cmtSel is not defined', source: 'admin.js:3035', url: 'https://x/admin/comments' })).status, 200, '上报成功');
+  await post({ kind: 'error', message: 'cmtSel is not defined', source: 'admin.js:3035', url: 'https://x/admin/comments' });
+  await post({ kind: 'promise', message: 'boom', source: 'app.js:1' });
+  assert.strictEqual((await post({ message: '' })).status, 400, '缺 message 拒绝');
+  const h = { headers: { Authorization: 'Bearer tok-err' } };
+  let d = await (await core.handleErrorsAdmin(new Request('http://t/api/admin/errors', h), env)).json();
+  assert.strictEqual(d.total, 2, '两类错误聚合为 2 条');
+  assert.strictEqual(d.sumHits, 3, '累计出现 3 次');
+  const first = d.errors.filter((x) => x.message === 'cmtSel is not defined')[0];
+  assert.strictEqual(Number(first.hits), 2, '相同错误 hits 累加');
+  assert.strictEqual((await core.handleErrorsAdmin(new Request('http://t/api/admin/errors'), mockEnv())).status, 401, '未登录 401');
+  assert.strictEqual((await core.handleErrorsAdmin(new Request('http://t/api/admin/errors', { method: 'DELETE', headers: h.headers }), env)).status, 200, '清空成功');
+  d = await (await core.handleErrorsAdmin(new Request('http://t/api/admin/errors', h), env)).json();
+  assert.strictEqual(d.total, 0, '已清空');
+}]);
+
+/* 前端错误上报：去重 + 功能开关可关闭 */
+tests.push(['前端错误上报：同一错误只报一次，开关可关闭', async () => {
+  const sent = [];
+  const fn = async (url, opts) => {
+    const u = String(url);
+    if (u.indexOf('/api/errors') >= 0) { sent.push(JSON.parse(opts.body)); return { ok: true, status: 200, json: async () => ({ ok: true }) }; }
+    if (u.indexOf('/locales/') >= 0) return { ok: false, status: 404, json: async () => ({}) };
+    if (u.indexOf('/api/posts') >= 0) return { ok: true, status: 200, json: async () => ({ ok: true, posts: [] }) };
+    return { ok: true, status: 200, json: async () => ({ ok: true }) };
+  };
+  const b = await boot({ 'window.BLOG_CONFIG': { mode: 'api' }, fetch: fn });
+  b.ctx.reportClientError('error', 'cmtSel is not defined', 'admin.js:1', 'stack');
+  b.ctx.reportClientError('error', 'cmtSel is not defined', 'admin.js:1', 'stack');
+  await new Promise((r) => setTimeout(r, 20));
+  assert.strictEqual(sent.length, 1, '同一会话同一错误只上报一次');
+  assert.strictEqual(sent[0].message, 'cmtSel is not defined', '错误内容上报');
+  b.ctx._siteSettings = { features: JSON.stringify({ errorReport: false }) };
+  b.ctx.reportClientError('error', 'another error', 'x.js:1');
+  await new Promise((r) => setTimeout(r, 20));
+  assert.strictEqual(sent.length, 1, '功能开关关闭后不再上报');
+}]);
+
+/* 评论反机器人：蜜罐静默丢弃 + 提交过快拒绝 + 功能开关可关闭 */
+tests.push(['评论反机器人：蜜罐静默丢弃 + 过快拒绝 + 开关可关闭', async () => {
+  const core = await import('./functions/_lib/api-core.js');
+  const env = mockEnv();
+  const post = (body) => core.handleComments(new Request('http://t/api/posts/p1/comments', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }), env, 'p1');
+  let r = await post({ author: '甲', content: '正常评论', ts: Date.now() - 60000 });
+  assert.strictEqual(r.status, 201, '正常评论可发表');
+  r = await post({ author: 'bot', content: 'spam', hp: 'http://spam.example', ts: Date.now() - 60000 });
+  assert.strictEqual(r.status, 200, '蜜罐命中返回 200（不暴露给机器人）');
+  assert.strictEqual((await r.json()).filtered, true, '标记为已过滤');
+  r = await post({ author: '甲二', content: '太快了', ts: Date.now() });
+  assert.strictEqual(r.status, 429, '提交过快被拒');
+  let list = await (await core.handleComments(new Request('http://t/api/posts/p1/comments'), env, 'p1')).json();
+  assert.strictEqual(list.comments.length, 1, '仅正常评论入库');
+  // 旧客户端不带 ts → 不受时间戳限制（兼容）
+  r = await post({ author: '丙', content: '老客户端' });
+  assert.strictEqual(r.status, 201, '缺少 ts 时按兼容放行');
+  // 后台关闭反机器人 → 蜜罐 / 时间戳都不再拦截
+  env._d1.site_settings.set('features', { k: 'features', v: JSON.stringify({ commentGuard: false }) });
+  r = await post({ author: '丁', content: '关闭后蜜罐也能发', hp: 'x', ts: Date.now() });
+  assert.strictEqual(r.status, 201, '关闭开关后不再拦截');
+}]);
+
+/* 评论表单：提交体带上蜜罐与时间戳字段 */
+tests.push(['评论表单：提交带蜜罐与时间戳字段', async () => {
+  const bodies = [];
+  const fn = async (url, opts) => {
+    const u = String(url);
+    if (u.indexOf('/comments') >= 0 && opts && String(opts.method || '').toUpperCase() === 'POST') {
+      bodies.push(JSON.parse(opts.body));
+      return { ok: true, status: 201, json: async () => ({ ok: true, comment: { id: 'c1', author: '甲', content: '你好' } }) };
+    }
+    if (u.indexOf('/locales/') >= 0) return { ok: false, status: 404, json: async () => ({}) };
+    if (u.indexOf('/api/posts') >= 0) return { ok: true, status: 200, json: async () => ({ ok: true, posts: [] }) };
+    return { ok: true, status: 200, json: async () => ({ ok: true }) };
+  };
+  const b = await boot({ 'window.BLOG_CONFIG': { mode: 'api' }, fetch: fn });
+  await b.ctx.saveComment('p1', '甲', '你好', null, { hp: '', ts: Date.now() - 5000 });
+  assert.strictEqual(bodies.length, 1, '发表评论调用一次接口');
+  assert.ok('hp' in bodies[0] && 'ts' in bodies[0], '提交体包含蜜罐与时间戳');
+  assert.strictEqual(bodies[0].hp, '', '蜜罐为空');
+}]);
+
+/* 编辑器本地草稿：读写清除 + 自动保存接线（崩溃恢复回归） */
+tests.push(['编辑器草稿：本地自动保存读写清除 + 保存后清理', async () => {
+  const b = await boot({ 'window.BLOG_CONFIG': { mode: 'static' } });
+  vm.runInContext(fs.readFileSync(path.join(PUB, 'admin.js'), 'utf8'), b.ctx, { filename: 'admin.js' });
+  const draft = b.win.QingyuAdmin && b.win.QingyuAdmin._editor && b.win.QingyuAdmin._editor.draft;
+  assert.ok(draft && typeof draft.write === 'function' && typeof draft.read === 'function' && typeof draft.clear === 'function', '暴露草稿读写接口');
+  assert.strictEqual(draft.read('p1'), null, '初始无草稿');
+  draft.write('p1', { title: '未发布的标题', body: '正文', date: '2026-01-01T10:00' });
+  const got = draft.read('p1');
+  assert.ok(got && got.data && got.data.title === '未发布的标题', '写入后可读回');
+  assert.ok(got.savedAt > 0, '带保存时间');
+  draft.clear('p1');
+  assert.strictEqual(draft.read('p1'), null, '清除后为空');
+  const src = fs.readFileSync(path.join(PUB, 'admin.js'), 'utf8');
+  assert.ok(src.includes('function autosaveEditorDraft'), '存在自动保存函数');
+  assert.ok(src.includes('setInterval(function () { autosaveEditorDraft'), '定时自动保存已接入');
+  assert.ok(src.includes('clearEditorDraft(id)'), '保存成功后清除草稿');
+  assert.ok(src.includes('renderDraftBar'), '恢复提示条已接入');
+  assert.ok(src.includes('editorDraftEnabled'), '加密文章跳过本地草稿');
+}]);
+
+/* 文章级 SEO 覆盖：服务端字段往返 + 前端 meta 生效 */
+tests.push(['文章 SEO 覆盖：字段往返（含清洗）+ 前端标题/描述/canonical/noindex', async () => {
+  const core = await import('./functions/_lib/api-core.js');
+  const { env, token } = await authEnv();
+  const auth = { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token };
+  assert.deepStrictEqual(core.normalizeSeo({ title: '  T  ', desc: '', canonical: '', noindex: false }), { title: 'T', desc: '', canonical: '', noindex: false }, 'normalizeSeo 去空格');
+  assert.deepStrictEqual(core.normalizeSeo('{}'), {}, '空 SEO 归一为空对象');
+  assert.strictEqual(core.normalizeSeo({ noindex: true }).noindex, true, 'noindex 保留');
+  let r = await core.handlePosts(new Request('http://t/api/posts', { method: 'POST', headers: auth, body: JSON.stringify({ id: 'seo1', title: 'T', date: '2026-01-01', content: 'x', seo: { title: 'SEO 标题', desc: 'SEO 描述', canonical: 'https://x/y', noindex: true } }) }), env);
+  assert.strictEqual(r.status, 201, '创建成功');
+  const p = (await (await core.handlePostId(new Request('http://t/api/posts/seo1'), env, 'seo1')).json()).post;
+  assert.strictEqual(p.seo.title, 'SEO 标题', '详情返回 SEO 标题');
+  assert.strictEqual(p.seo.noindex, true, '详情返回 noindex');
+  assert.strictEqual(typeof env._d1.posts.get('seo1').seo, 'string', 'D1 存 JSON 字符串');
+  // PUT 更新 SEO
+  await core.handlePostId(new Request('http://t/api/posts/seo1', { method: 'PUT', headers: auth, body: JSON.stringify({ id: 'seo1', title: 'T', date: '2026-01-01', content: 'x', seo: { desc: '新描述' } }) }), env, 'seo1');
+  const p2 = (await (await core.handlePostId(new Request('http://t/api/posts/seo1'), env, 'seo1')).json()).post;
+  assert.strictEqual(p2.seo.desc, '新描述', 'PUT 更新 SEO');
+  assert.ok(!p2.seo.noindex, 'PUT 未传的 noindex 被清空（整体覆盖）');
+  // 前端 meta
+  const posts = [{ id: 'seo1', title: '原标题', date: '2026-01-01', content: '正文', tags: [], seo: { title: '前端 SEO 标题', desc: '前端描述', canonical: 'https://custom.example/x', noindex: true } }];
+  const b = await boot({ 'window.BLOG_CONFIG': { mode: 'static', siteUrl: 'https://blog.example' }, 'window.BLOG_POSTS': posts }, '/posts/seo1/');
+  assert.strictEqual(b.title, '前端 SEO 标题', 'SEO 标题覆盖 document.title');
+  const seen = {};
+  b.ctx.document.querySelector = function (sel) {
+    if (!seen[sel]) seen[sel] = { setAttribute(k, v) { this[k] = v; }, getAttribute(k) { return this[k]; }, remove() {}, appendChild() {} };
+    return seen[sel];
+  };
+  b.ctx.updateSEO('/posts/seo1/');
+  assert.strictEqual(seen['meta[name="description"]'].content, '前端描述', '描述覆盖');
+  assert.strictEqual(seen['link[rel="canonical"]'].href, 'https://custom.example/x', 'canonical 覆盖');
+  assert.ok(String(seen['meta[name="robots"]'].content).indexOf('noindex') >= 0, 'noindex 生效');
+  assert.strictEqual(seen['meta[property="og:title"]'].content, '前端 SEO 标题', 'og:title 覆盖');
+}]);
+
+/* 富内容：Mermaid / KaTeX 本地化 + 按需加载 + 功能开关 */
+tests.push(['富内容：Mermaid / KaTeX 本地化并按需加载', async () => {
+  for (const rel of ['libs/katex/katex.min.js', 'libs/katex/katex.min.css', 'libs/katex/contrib/auto-render.min.js', 'libs/mermaid/mermaid.min.js']) {
+    assert.ok(fs.existsSync(path.join(PUB, rel)), rel + ' 已本地化');
+  }
+  assert.ok(fs.readdirSync(path.join(PUB, 'libs/katex/fonts')).some((x) => /\.woff2$/.test(x)), 'KaTeX 字体已本地化');
+  const src = fs.readFileSync(path.join(PUB, 'app.js'), 'utf8');
+  assert.ok(src.includes('function enhanceRichContent'), '存在富内容渲染函数');
+  assert.ok(src.includes('code.lang-mermaid, code.language-mermaid'), '识别 mermaid 代码块');
+  assert.ok(src.includes('libs/katex/katex.min.js') && src.includes('libs/mermaid/mermaid.min.js'), '按需加载本地库');
+  assert.ok(src.includes('renderMathInElement'), 'KaTeX auto-render 已接入');
+  assert.ok(src.includes("enhanceRichContent(document.querySelector('.article'))"), '详情页已接入');
+  const admin = fs.readFileSync(path.join(PUB, 'admin.js'), 'utf8');
+  assert.ok(admin.includes('window.enhanceRichContent(pane)'), '编辑器预览已接入');
+  assert.ok(admin.includes('id="abFeatRichContent"'), '功能开关已接入');
+  const b = await boot({ 'window.BLOG_CONFIG': { mode: 'static' } });
+  assert.strictEqual(typeof b.ctx.enhanceRichContent, 'function', '暴露到全局供编辑器预览调用');
+  b.ctx._siteSettings = { features: JSON.stringify({ richContent: false }) };
+  b.ctx.enhanceRichContent(null);
+  assert.strictEqual(b.win.katex, undefined, '关闭开关时不加载 KaTeX');
+}]);
+
+/* 草稿预览分享链接：签名生成 / 未登录可读 / 篡改与过期拒绝 / 前端预览页 */
+tests.push(['草稿预览链接：签名生成 + 未登录可读 + 篡改拒绝', async () => {
+  const core = await import('./functions/_lib/api-core.js');
+  const { env, token } = await authEnv();
+  const auth = { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token };
+  await core.handlePosts(new Request('http://t/api/posts', { method: 'POST', headers: auth, body: JSON.stringify({ id: 'draft1', title: '草稿标题', date: '2026-01-01', content: '草稿正文', status: 'draft' }) }), env);
+  assert.strictEqual((await core.handlePreviewLink(new Request('http://t/api/admin/preview-link', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ postId: 'draft1' }) }), env)).status, 401, '生成链接需登录');
+  assert.strictEqual((await core.handlePreviewLink(new Request('http://t/api/admin/preview-link', { method: 'POST', headers: auth, body: JSON.stringify({ postId: 'nope' }) }), env)).status, 404, '文章不存在 404');
+  const link = await (await core.handlePreviewLink(new Request('http://t/api/admin/preview-link', { method: 'POST', headers: auth, body: JSON.stringify({ postId: 'draft1', ttlDays: 7 }) }), env)).json();
+  assert.ok(link.url && link.url.indexOf('/preview/') >= 0, '返回预览 URL');
+  assert.ok(link.expiresAt > Date.now(), '带过期时间');
+  const pv = await (await core.handlePreviewGet(new Request('http://t/api/preview?token=' + encodeURIComponent(link.token)), env)).json();
+  assert.strictEqual(pv.post.id, 'draft1', '未登录也能读到草稿');
+  assert.strictEqual(pv.post.content, '草稿正文', '返回草稿正文');
+  const bad = link.token.slice(0, -2) + (link.token.slice(-2) === 'aa' ? 'bb' : 'aa');
+  assert.strictEqual((await core.handlePreviewGet(new Request('http://t/api/preview?token=' + encodeURIComponent(bad)), env)).status, 403, '篡改 token 被拒');
+  assert.strictEqual((await core.handlePreviewGet(new Request('http://t/api/preview'), env)).status, 403, '缺 token 被拒');
+}]);
+
+tests.push(['草稿预览页：/preview/<token> 渲染正文与预览提示条', async () => {
+  const fn = async (url) => {
+    const u = String(url);
+    if (u.indexOf('/locales/') >= 0) return { ok: false, status: 404, json: async () => ({}) };
+    if (u.indexOf('/api/preview') >= 0) return { ok: true, status: 200, json: async () => ({ ok: true, preview: true, expiresAt: Date.now() + 86400000, post: { id: 'd1', title: '草稿标题', date: '2026-01-01', content: '草稿正文 **粗体**', tags: ['随笔'], status: 'draft' } }) };
+    if (u.indexOf('/api/posts') >= 0) return { ok: true, status: 200, json: async () => ({ ok: true, posts: [] }) };
+    return { ok: true, status: 200, json: async () => ({ ok: true }) };
+  };
+  const b = await boot({ 'window.BLOG_CONFIG': { mode: 'api' }, fetch: fn }, '/preview/tok123');
+  await new Promise((r) => setTimeout(r, 40));
+  const html = b.ctx.document.querySelector('#app').innerHTML;
+  assert.ok(html.indexOf('草稿正文') >= 0, '预览正文已渲染');
+  assert.ok(html.indexOf('preview-banner') >= 0, '预览提示条已渲染');
+  assert.ok(html.indexOf('尚未发布') >= 0, '提示尚未发布');
+  const admin = fs.readFileSync(path.join(PUB, 'admin.js'), 'utf8');
+  assert.ok(admin.indexOf('abPreviewLink') >= 0 && admin.indexOf('api/admin/preview-link') >= 0, '后台生成入口已接入');
+}]);
+
+/* 导出静态站：资源清单 + 模板生成 + ZIP 支持二进制 */
+tests.push(['导出静态站：模板生成 / 资源清单 / ZIP 二进制', async () => {
+  const manifest = JSON.parse(fs.readFileSync(path.join(PUB, 'static-export.json'), 'utf8'));
+  assert.ok(Array.isArray(manifest) && manifest.length > 20, '资源清单存在');
+  for (const need of ['style.min.css', 'app.min.js', 'i18n.min.js', 'locales/zh-CN.json']) assert.ok(manifest.indexOf(need) >= 0, '清单含 ' + need);
+  assert.ok(manifest.some((x) => x.indexOf('libs/katex/') === 0), '清单含 KaTeX');
+  assert.ok(manifest.some((x) => x.indexOf('libs/mermaid/') === 0), '清单含 Mermaid');
+  assert.ok(manifest.indexOf('admin.min.js') < 0 && manifest.indexOf('sw.js') < 0, '不打包后台与 Service Worker');
+  const b = await boot({ 'window.BLOG_CONFIG': { mode: 'static' } });
+  vm.runInContext(fs.readFileSync(path.join(PUB, 'admin.js'), 'utf8'), b.ctx, { filename: 'admin.js' });
+  const se = b.win.QingyuAdmin && b.win.QingyuAdmin._staticExport;
+  assert.ok(se && typeof se.page === 'function', '暴露静态导出模板函数');
+  const tpl = '<html><head><title>old</title><meta name="description" content="x"><link rel="canonical" href="/"><link rel="stylesheet" href="style.min.css"></head><body><div id="app"><p>loading</p></div><script defer src="app.min.js"></script><a href="/">home</a></body></html>';
+  const out = se.page(tpl, { title: 'T1', desc: 'D1', canonical: 'https://x/y', app: '<h1>HI</h1>', base: '../../' });
+  assert.ok(out.indexOf('<title>T1</title>') >= 0, '标题替换');
+  assert.ok(out.indexOf('content="D1"') >= 0, '描述替换');
+  assert.ok(out.indexOf('href="https://x/y"') >= 0, 'canonical 替换');
+  assert.ok(out.indexOf('<h1>HI</h1>') >= 0 && out.indexOf('loading') < 0, '#app 内容替换');
+  assert.ok(out.indexOf('href="../../style.min.css"') >= 0 && out.indexOf('src="../../app.min.js"') >= 0, '嵌套页资源前缀');
+  assert.ok(out.indexOf('href="../../"') >= 0, '根链接相对化');
+  const zip = b.win.QingyuAdmin._transfer.zip([{ name: 'a.txt', text: 'hi' }, { name: 'b.bin', data: new Uint8Array([1, 2, 3]) }]);
+  assert.ok(zip, 'ZIP 含二进制文件也能生成');
+  const admin = fs.readFileSync(path.join(PUB, 'admin.js'), 'utf8');
+  assert.ok(admin.indexOf('id="abIeExportStatic"') >= 0 && admin.indexOf('function exportStaticSite') >= 0, '后台导出入口已接入');
+}]);
+
+/* 文章打印 / 导出 PDF：按钮 + 打印样式 + 仅打印页脚 */
+tests.push(['文章打印 / PDF：按钮 + 打印样式 + 仅打印页脚', async () => {
+  const src = fs.readFileSync(path.join(PUB, 'app.js'), 'utf8');
+  assert.ok(src.indexOf('id="btnPrint"') >= 0, '打印按钮已渲染');
+  assert.ok(src.indexOf('window.print()') >= 0, '按钮触发打印');
+  assert.ok(src.indexOf('print-only print-foot') >= 0, '仅打印页脚');
+  const css = fs.readFileSync(path.join(PUB, 'style.css'), 'utf8');
+  assert.ok(css.indexOf('@media print') >= 0, '打印样式存在');
+  for (const sel of ['header.topbar', '#backTop', '.comments', '.like-bar', '.mp-fab-wrap', '#bgSketch']) {
+    assert.ok(css.indexOf(sel) >= 0, '打印隐藏 ' + sel);
+  }
+  assert.ok(css.indexOf('break-inside: avoid') >= 0 || css.indexOf('page-break-inside: avoid') >= 0, '避免跨页断行');
+  assert.ok(css.indexOf('.print-only') >= 0, '仅打印元素样式');
+  const b = await boot({ 'window.BLOG_CONFIG': { mode: 'static' } }, '/posts/hello-qingyu/');
+  assert.ok(b.html.indexOf('id="btnPrint"') >= 0, '详情页含打印按钮');
+  assert.ok(b.html.indexOf('print-foot') >= 0, '详情页含仅打印页脚');
+}]);
+
+/* Webmention：接收校验 / 列表 / 删除 + 前端与后台接线 */
+tests.push(['Webmention：校验来源链接后收录 + 列表 / 删除', async () => {
+  const core = await import('./functions/_lib/api-core.js');
+  const { env, token } = await authEnv();
+  const auth = { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token };
+  await core.handlePosts(new Request('http://t/api/posts', { method: 'POST', headers: auth, body: JSON.stringify({ id: 'wm1', title: '被引用文章', date: '2026-01-01', content: 'x' }) }), env);
+  const origFetch = global.fetch;
+  const linked = '<html><head><title>别人的文章</title><meta name="description" content="这是摘要"></head><body><p>正文 <a href="http://t/posts/wm1/">引用</a></p></body></html>';
+  const notLinked = '<html><head><title>没有链接</title></head><body><p>什么也没有</p></body></html>';
+  global.fetch = async function (url) {
+    const u = String(url);
+    if (u.indexOf('https://other.example/') === 0) return new Response(linked, { status: 200, headers: { 'Content-Type': 'text/html' } });
+    if (u.indexOf('https://nolink.example/') === 0) return new Response(notLinked, { status: 200, headers: { 'Content-Type': 'text/html' } });
+    return origFetch(url);
+  };
+  try {
+    const form = (source, target) => new Request('http://t/api/webmention', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'source=' + encodeURIComponent(source) + '&target=' + encodeURIComponent(target) });
+    assert.strictEqual((await core.handleWebmention(form('https://other.example/post', 'http://t/posts/wm1/'), env)).status, 202, '合法引用被接收');
+    assert.strictEqual((await core.handleWebmention(form('https://nolink.example/post', 'http://t/posts/wm1/'), env)).status, 400, '未链接则拒绝');
+    assert.strictEqual((await core.handleWebmention(form('https://other.example/post', 'http://t/about/'), env)).status, 400, '非文章地址拒绝');
+    assert.strictEqual((await core.handleWebmention(form('https://other.example/post', 'http://evil.example/posts/wm1/'), env)).status, 400, '站外 target 拒绝');
+    assert.strictEqual((await core.handleWebmention(form('https://other.example/post', 'http://t/posts/nope/'), env)).status, 404, '文章不存在 404');
+  } finally { global.fetch = origFetch; }
+  const list = await (await core.handleWebmentionList(new Request('http://t/api/webmention?target=' + encodeURIComponent('http://t/posts/wm1/')), env)).json();
+  assert.strictEqual(list.mentions.length, 1, '公开列表返回 1 条');
+  assert.strictEqual(list.mentions[0].title, '别人的文章', '解析出来源页标题');
+  assert.ok(list.mentions[0].excerpt.indexOf('摘要') >= 0, '解析出来源摘要');
+  assert.strictEqual((await core.handleWebmentionsAdmin(new Request('http://t/api/admin/webmentions'), env, null)).status, 401, '后台列表需登录');
+  const adminList = await (await core.handleWebmentionsAdmin(new Request('http://t/api/admin/webmentions', { headers: auth }), env, null)).json();
+  assert.strictEqual(adminList.mentions.length, 1, '后台可见');
+  await core.handleWebmentionsAdmin(new Request('http://t/api/admin/webmentions/1', { method: 'DELETE', headers: auth }), env, String(adminList.mentions[0].id));
+  const after = await (await core.handleWebmentionsAdmin(new Request('http://t/api/admin/webmentions', { headers: auth }), env, null)).json();
+  assert.strictEqual(after.mentions.length, 0, '删除后为空');
+  const idxHtml = fs.readFileSync(path.join(PUB, 'index.html'), 'utf8');
+  assert.ok(idxHtml.indexOf('rel="webmention"') >= 0, '页面声明 Webmention 端点');
+  const appSrc = fs.readFileSync(path.join(PUB, 'app.js'), 'utf8');
+  assert.ok(appSrc.indexOf('function loadWebmentions') >= 0 && appSrc.indexOf('postWebmentions') >= 0, '前台展示已接入');
+  const adminSrc = fs.readFileSync(path.join(PUB, 'admin.js'), 'utf8');
+  assert.ok(adminSrc.indexOf('pageWebmentions') >= 0 && adminSrc.indexOf('/admin/webmentions') >= 0, '后台管理页已接入');
+}]);
+
+/* 多作者：字段往返 + /authors 列表 + 作者主页 + 文章页作者署名 */
+tests.push(['多作者：字段往返 + 作者列表 / 作者主页', async () => {
+  const core = await import('./functions/_lib/api-core.js');
+  const { env, token } = await authEnv();
+  const auth = { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token };
+  await core.handlePosts(new Request('http://t/api/posts', { method: 'POST', headers: auth, body: JSON.stringify({ id: 'a1', title: '甲的文章', date: '2026-01-01', content: 'x', author: '甲' }) }), env);
+  await core.handlePostId(new Request('http://t/api/posts/a1', { method: 'PUT', headers: auth, body: JSON.stringify({ id: 'a1', title: '甲的文章', date: '2026-01-01', content: 'x', author: '乙' }) }), env, 'a1');
+  const p = (await (await core.handlePostId(new Request('http://t/api/posts/a1'), env, 'a1')).json()).post;
+  assert.strictEqual(p.author, '乙', '作者字段可保存与更新');
+  const posts = [
+    { id: 'p1', title: '甲文', date: '2026-01-02', content: 'x', tags: [], author: '甲' },
+    { id: 'p2', title: '乙文', date: '2026-01-03', content: 'y', tags: [], author: '乙' },
+    { id: 'p3', title: '乙文二', date: '2026-01-04', content: 'z', tags: [], author: '乙' }
+  ];
+  const b = await boot({ 'window.BLOG_CONFIG': { mode: 'static' }, 'window.BLOG_POSTS': posts }, '/authors');
+  assert.ok(b.html.indexOf('author-card') >= 0, '作者卡片列表渲染');
+  assert.ok(b.html.indexOf('甲') >= 0 && b.html.indexOf('乙') >= 0, '列出两位作者');
+  assert.ok(b.html.indexOf('2 篇') >= 0, '显示该作者文章数');
+  const b2 = await boot({ 'window.BLOG_CONFIG': { mode: 'static' }, 'window.BLOG_POSTS': posts }, '/authors/' + encodeURIComponent('乙'));
+  assert.ok(b2.html.indexOf('乙文') >= 0 && b2.html.indexOf('乙文二') >= 0, '作者主页列出其文章');
+  assert.ok(b2.html.indexOf('甲文') < 0, '不混入其他作者的文章');
+  const b3 = await boot({ 'window.BLOG_CONFIG': { mode: 'static' }, 'window.BLOG_POSTS': posts }, '/posts/p1/');
+  assert.ok(b3.html.indexOf('meta-author') >= 0, '文章页显示作者');
+  const admin = fs.readFileSync(path.join(PUB, 'admin.js'), 'utf8');
+  assert.ok(admin.indexOf('id="abAuthor"') >= 0 && admin.indexOf('author: val(content') >= 0, '编辑器作者字段已接入');
+  const worker = fs.readFileSync(path.join(dir, 'worker.js'), 'utf8');
+  assert.ok(worker.indexOf('/authors') >= 0, 'SPA 路由白名单含作者页');
+}]);
+
+/* 仪表盘：统一骨架屏（不再个别转圈）+ 趋势图质感 */
+tests.push(['仪表盘：统一骨架屏 + 趋势图质感增强', async () => {
+  const src = fs.readFileSync(path.join(PUB, 'admin.js'), 'utf8');
+  assert.ok(src.includes('function skStatCards') && src.includes('function skRows') && src.includes('function skChartBox'), '骨架屏组件已定义');
+  assert.ok(src.indexOf('id="abStats">\' + skStatCards(5)') >= 0, '统计卡使用骨架屏');
+  assert.ok(src.indexOf('id="abSourcesBody">\' + skRows(3)') >= 0, '来源卡使用骨架屏（不再单独转圈）');
+  assert.ok(src.indexOf('id="abStorageBody">\' + skRows(4)') >= 0, '存储卡使用骨架屏（不再单独转圈）');
+  assert.ok(src.indexOf('id="abTrendViews">\' + skChartBox()') >= 0, '趋势卡使用骨架屏');
+  assert.ok(src.indexOf('function smoothLinePath') >= 0, '曲线平滑处理');
+  assert.ok(src.indexOf('linearGradient') >= 0 && src.indexOf('class="area"') >= 0, '渐变面积填充');
+  assert.ok(src.indexOf('class="grid"') >= 0, '水平网格线');
+  const css = fs.readFileSync(path.join(PUB, 'admin.css'), 'utf8');
+  assert.ok(css.includes('.ab-sk') && css.includes('@keyframes abSk'), '骨架屏样式与动画');
+  assert.ok(css.includes('.ab-chart .grid') && css.includes('.ab-chart .area'), '趋势图样式增强');
+  const fn = async (url) => {
+    const u = String(url);
+    if (u.indexOf('/locales/') >= 0) return { ok: false, status: 404, json: async () => ({}) };
+    if (u.indexOf('/api/stats/trend') >= 0) return { ok: true, status: 200, json: async () => ({ ok: true, days: 30, trend: [{ date: '2026-01-01', views: 5 }, { date: '2026-01-02', views: 9 }] }) };
+    if (u.indexOf('/api/admin/stats/sources') >= 0) return { ok: true, status: 200, json: async () => ({ ok: true, referrers: [{ name: 'google.com', views: 2 }], devices: [{ name: 'mobile', views: 2 }], countries: [{ name: 'CN', views: 2 }], platforms: [{ name: 'iOS', views: 2 }], vendors: [{ name: 'Apple', views: 2 }], refTotal: 2, devTotal: 2, countryTotal: 2, platformTotal: 2, vendorTotal: 2 }) };
+    if (u.indexOf('/api/posts') >= 0) return { ok: true, status: 200, json: async () => ({ ok: true, posts: [] }) };
+    if (u.indexOf('/api/comments') >= 0) return { ok: true, status: 200, json: async () => ({ ok: true, comments: [] }) };
+    return { ok: true, status: 200, json: async () => ({ ok: true }) };
+  };
+  const b = await boot({ 'window.BLOG_CONFIG': { mode: 'api' }, fetch: fn }, '/admin');
+  const appEl = mountAdminUi(b);
+  await new Promise((r) => setTimeout(r, 90));
+  const root = appEl.querySelector('#abContent');
+  const trend = root.querySelector('#abTrendViews').innerHTML || '';
+  assert.ok(trend.indexOf('ab-chart-box') >= 0, '仪表盘渲染出趋势图');
+  assert.ok(trend.indexOf('class="area"') >= 0, '趋势图含渐变面积');
+  assert.ok(trend.indexOf('class="grid"') >= 0, '趋势图含网格线');
+  const stats = root.querySelector('#abStats').innerHTML || '';
+  assert.ok(stats.indexOf('ab-sk') < 0 && stats.indexOf('ab-stat-value') >= 0, '统计卡已用数据替换骨架屏');
+  const sources = root.querySelector('#abSourcesBody').innerHTML || '';
+  assert.ok(sources.indexOf('国家/地区') >= 0 && sources.indexOf('🇨🇳') >= 0, '国家/地区区块（含国旗）');
+  assert.ok(sources.indexOf('系统') >= 0 && sources.indexOf('iOS') >= 0, '系统区块');
+  assert.ok(sources.indexOf('设备品牌') >= 0 && sources.indexOf('Apple') >= 0, '品牌区块');
+  assert.ok(sources.indexOf('手机') >= 0, '设备类型已本地化');
+}]);
+
+/* 回归：i18n.js 未加载（网络/缓存异常）时，页面不能因 “t is not defined” 整页崩溃 */
+tests.push(['i18n 缺失兜底：app.js 仍能启动（不再 t is not defined）', async () => {
+  const { ctx, appEl, win } = makeCtx({ 'window.BLOG_CONFIG': { mode: 'static' } });
+  setRoute(ctx, '/');
+  // 故意不加载 i18n.js，模拟 i18n.min.js 加载失败 / 被拦截 / 缓存缺失
+  vm.runInContext(fs.readFileSync(path.join(PUB, 'posts.js'), 'utf8'), ctx, { filename: 'posts.js' });
+  win.BLOG_POSTS = TEST_POSTS;
+  vm.runInContext(fs.readFileSync(path.join(PUB, 'app.js'), 'utf8'), ctx, { filename: 'app.js' });
+  assert.strictEqual(typeof win.t, 'function', 'app.js 在 window 上装了 t 兜底');
+  if (typeof ctx.t !== 'function') ctx.t = win.t;   // 模拟浏览器里 window === 全局
+  await win.__bootPromise;
+  assert.ok((appEl.innerHTML || '').length > 0, '页面仍然渲染出内容');
+  assert.strictEqual(typeof win.t, 'function', 't 仍可用');
+}]);
+
+tests.push(['老文章（WordPress 导入）：HTML 残留不再显示为字面文字', async () => {
+  const appSrc = fs.readFileSync(path.join(PUB, 'app.js'), 'utf8');
+  assert.ok(appSrc.includes('function preprocessLegacyHtml(md)'), 'app.js 有老 HTML 预处理');
+  assert.ok(appSrc.includes('function decodeHtmlEntities(t)'), 'app.js 有实体解码');
+  assert.ok(appSrc.includes('var src = preprocessLegacyMarkdown(md);'), 'renderMarkdown 在转义之前先做预处理');
+  assert.ok(appSrc.indexOf('function preprocessLegacyHtml') < appSrc.indexOf('function renderMarkdown(md) {'), '预处理函数定义在渲染器之前（函数提升可用）');
+
+  // 真实执行一遍被测函数
+  function grabFn(name) {
+    const i = appSrc.indexOf('function ' + name);
+    let d = 0;
+    for (let j = i; j < appSrc.length; j++) {
+      if (appSrc[j] === '{') d++;
+      else if (appSrc[j] === '}') { d--; if (d === 0) return appSrc.slice(i, j + 1); }
+    }
+    throw new Error('找不到函数 ' + name);
+  }
+  const start = appSrc.indexOf('var LEGACY_ENTITIES');
+  const end = appSrc.indexOf('\nfunction ', appSrc.indexOf('function inlineMd') + 10);
+  const code = grabFn('esc') + '\n' + grabFn('tokenizeCode') + '\n' + appSrc.slice(start, end) +
+    '\nmodule.exports = { preprocessLegacyHtml, preprocessLegacyMarkdown, decodeHtmlEntities, renderMarkdown };';
+  const f = path.join(dir, '.tmp-legacy-md.cjs');
+  fs.writeFileSync(f, code);
+  try {
+    const m = require(f);
+    const wp = '&nbsp;&nbsp; ZVP教科书,进入观看:<!--more-->' +
+      '<embed src=\'http://player.youku.com/player.php/sid/x=/v.swf\' quality="high" width="480" type="application/x-shockwave-flash"></embed>';
+    const out = m.renderMarkdown(wp);
+    assert.ok(!out.includes('&nbsp;'), '&nbsp; 不再显示为字面文字');
+    assert.ok(!out.includes('&amp;nbsp;'), '实体未被二次转义');
+    assert.ok(!out.includes('&lt;'), '尖括号未被转义成可见文字');
+    assert.ok(!out.includes('more--'), '<!--more--> 注释被清掉');
+    assert.ok(out.toLowerCase().indexOf('embed') < 0, 'Flash <embed> 播放器被移除');
+    assert.ok(out.indexOf('shockwave') < 0, 'Flash 相关属性不残留');
+    assert.ok(out.includes('ZVP教科书'), '正文文字保留');
+
+    // 实体解码：具名 / 十进制 / 十六进制 / 不带分号
+    assert.strictEqual(m.decodeHtmlEntities('a&amp;b'), 'a&b', '具名实体 &amp; 解码');
+    assert.strictEqual(m.decodeHtmlEntities('&#8212;'), '\u2014', '十进制实体解码');
+    assert.strictEqual(m.decodeHtmlEntities('&#x2014;'), '\u2014', '十六进制实体解码');
+    assert.strictEqual(m.decodeHtmlEntities('&nbsp;x'), '\u00a0x', '&nbsp; 解码为不换行空格');
+    assert.strictEqual(m.decodeHtmlEntities('&notarealentity;'), '&notarealentity;', '未知实体原样保留');
+    assert.strictEqual(m.decodeHtmlEntities('&lt;script&gt;'), '<script>', '&lt;/&gt; 解码（之后再统一转义，不会执行）');
+
+    // 块级标签 -> 段落
+    const h = m.renderMarkdown('<p>第一段</p><p>第二段</p>');
+    assert.strictEqual((h.match(/<p>/g) || []).length, 2, 'HTML 段落标签转成 Markdown 段落');
+
+    // 危险标签仍走转义，不放行
+    const danger = m.renderMarkdown('<script>alert(1)</'+'script>');
+    assert.ok(danger.includes('&lt;script&gt;'), '<script> 仍被转义，不会执行');
+
+    // 回归：正常 Markdown 不能被破坏
+    const md = m.renderMarkdown('# 标题\n\n**粗体** 与 `代码`\n\n- 列表项\n\n> 引用');
+    assert.ok(md.includes('<h1') && md.includes('标题'), '标题正常');
+    assert.ok(md.includes('<strong>粗体</strong>'), '加粗正常');
+    assert.ok(md.includes('<code class="inline-code">代码</code>'), '行内代码正常');
+    assert.ok(md.includes('<li>列表项</li>'), '列表正常');
+    assert.ok(md.includes('<blockquote>'), '引用正常');
+    assert.ok(m.renderMarkdown('![图](https://e.com/a.png)').includes('<img'), '图片正常');
+    assert.ok(m.renderMarkdown('[链接](https://e.com)').includes('<a href='), '链接正常');
+    const cb = m.renderMarkdown('```html\n<div>x</div>\n```');
+    assert.ok(cb.includes('&lt;div&gt;x&lt;/div&gt;'), '代码块内的示例 HTML 不被老文章清理改写（按代码块规则转义）');
+  } finally { try { fs.unlinkSync(f); } catch (e) {} }
+}]);
+
+/* ---------- 音乐播放器后台开关 ---------- */
+tests.push(['音乐播放器：后台开关（保存 / 回填 / 前台生效 / 5 语言文案）', async () => {
+  const app = fs.readFileSync(path.join(PUB, 'app.js'), 'utf8');
+  const admin = fs.readFileSync(path.join(PUB, 'admin.js'), 'utf8');
+  const mp = fs.readFileSync(path.join(PUB, 'music-player.js'), 'utf8');
+
+  /* --- app.js：开关判定 + 就绪广播 --- */
+  assert.ok(app.includes('function musicPlayerEnabled()'), 'app.js 缺少 musicPlayerEnabled()');
+  assert.ok(app.includes('return f.musicPlayer !== false;'), 'app.js 未按 features.musicPlayer 判定');
+  assert.ok(app.includes('function notifyFeaturesReady()'), 'app.js 缺少 notifyFeaturesReady()');
+  assert.ok(app.includes("new CustomEvent('qy:features')"), 'app.js 未广播 qy:features 事件');
+  assert.ok(app.includes('window.__qyFeaturesReady = true;'), 'app.js 未置位 __qyFeaturesReady');
+  assert.ok(app.includes('snapHit = true; notifyFeaturesReady();'), 'app.js 快照路径未广播 qy:features');
+  const apiAt = app.indexOf('_siteSettings = sResp.settings;');
+  assert.ok(apiAt !== -1, 'app.js 云端设置落地处不见了');
+  const apiNotify = app.indexOf('notifyFeaturesReady();', apiAt);
+  const apiSnap = app.indexOf('writeSnapshot(SETTINGS_SNAP_KEY, sResp);', apiAt);
+  assert.ok(apiNotify > apiAt && apiNotify < apiSnap, 'app.js 云端设置落地后未广播 qy:features');
+
+  /* --- music-player.js：真正被开关拦住 --- */
+  assert.ok(mp.includes('async function playerEnabled()'), 'music-player.js 缺少 playerEnabled()');
+  assert.ok(mp.includes('if (!(await playerEnabled())) return;'), 'music-player.js init 未在 buildDOM 前拦截');
+  assert.ok(mp.includes("window.addEventListener('qy:features', done)"), 'music-player.js 未监听 qy:features');
+  const gateAt = mp.indexOf('if (!(await playerEnabled())) return;');
+  const buildAt = mp.indexOf('buildDOM();', mp.indexOf('async function init()'));
+  const fetchAt = mp.indexOf("fetch('/api/music");
+  assert.ok(gateAt !== -1 && buildAt !== -1 && gateAt < buildAt, '开关判定必须早于 buildDOM（否则会闪现）');
+  assert.ok(gateAt < fetchAt, '开关判定必须早于 /api/music 请求（关闭时零请求）');
+  assert.ok(mp.includes('setTimeout(done, 3000)'), 'music-player.js 缺少超时兜底（设置接口异常会卡住）');
+
+  /* --- admin.js：开关 UI + 保存 + 回填 --- */
+  assert.ok(admin.includes('id="abFeatMusicPlayer"'), 'admin.js 缺少 abFeatMusicPlayer 开关');
+  assert.ok(admin.includes("t('admin.settings.featMusicPlayer')"), 'admin.js 未使用文案 featMusicPlayer');
+  assert.ok(admin.includes("t('admin.settings.featMusicPlayerHint')"), 'admin.js 未使用文案 featMusicPlayerHint');
+  assert.ok(admin.includes('musicPlayer: content.querySelector'), 'admin.js 保存时未收集 musicPlayer');
+  assert.ok(admin.includes('.checked = (feat.musicPlayer !== false);'), 'admin.js 回填时未按 feat.musicPlayer 还原勾选');
+
+  /* --- 5 种语言都要有文案，缺键会白屏 --- */
+  ['zh-CN', 'en', 'ja', 'ko', 'hi'].forEach((lang) => {
+    const j = JSON.parse(fs.readFileSync(path.join(PUB, 'locales', lang + '.json'), 'utf8'));
+    assert.ok(j['admin.settings.featMusicPlayer'], lang + ' 缺少 admin.settings.featMusicPlayer');
+    assert.ok(j['admin.settings.featMusicPlayerHint'], lang + ' 缺少 admin.settings.featMusicPlayerHint');
+  });
+
+  /* --- 行为验证：真跑一遍 app.js 的判定逻辑 --- */
+  const fnSrc = app.slice(app.indexOf('function musicPlayerEnabled()'));
+  // app.js 是 CRLF：按 \r?\n 收尾，避免截出半个函数体
+  const endAt = /\r?\n\}\r?\n/.exec(fnSrc);
+  assert.ok(endAt, 'musicPlayerEnabled() 函数体不完整');
+  const body = fnSrc.slice(0, endAt.index + endAt[0].length);
+  const run = (features) => {
+    const ctx = { getConfig: () => ({ features: features }) };
+    vm.createContext(ctx);
+    vm.runInContext(body + '\nthis.r = musicPlayerEnabled();', ctx);
+    return ctx.r;
+  };
+  assert.strictEqual(run({}), true, '未设置时默认开启（向后兼容）');
+  assert.strictEqual(run({ musicPlayer: true }), true, '显式开启');
+  assert.strictEqual(run({ musicPlayer: false }), false, '显式关闭');
+  assert.strictEqual(run({ bookmark: false }), true, '其他开关不影响播放器');
+
+  /* --- 行为验证：真跑一遍播放器的等待 / 拦截逻辑 --- */
+  const gateSrc = mp.slice(mp.indexOf('function featuresSettled()'));
+  const gateBody = gateSrc.slice(0, gateSrc.indexOf('\n\n  /* ---------- 初始化 ---------- */'));
+  const runGate = async (opts) => {
+    const listeners = {};
+    const ctx = {
+      setTimeout: setTimeout, clearTimeout: clearTimeout, Promise: Promise,
+      window: {
+        __qyFeaturesReady: !!opts.ready,
+        musicPlayerEnabled: opts.enabled === undefined ? (() => true) : (() => opts.enabled),
+        addEventListener: (t, f) => { (listeners[t] = listeners[t] || []).push(f); },
+        removeEventListener: (t, f) => { listeners[t] = (listeners[t] || []).filter((x) => x !== f); }
+      }
+    };
+    vm.createContext(ctx);
+    vm.runInContext(gateBody + '\nthis.p = playerEnabled();', ctx);
+    if (opts.later) {
+      (listeners['qy:features'] || []).slice().forEach((f) => f());
+      ctx.window.__qyFeaturesReady = true;
+    }
+    return await ctx.p;
+  };
+  assert.strictEqual(await runGate({ ready: true, enabled: false }), false, '开关关闭 → 播放器不加载');
+  assert.strictEqual(await runGate({ ready: true, enabled: true }), true, '开关开启 → 播放器加载');
+  assert.strictEqual(await runGate({ ready: false, later: true, enabled: false }), false, '设置晚到时也能拦住（首次访问无快照）');
+  assert.strictEqual(await runGate({ ready: false, later: true, enabled: true }), true, '设置晚到且开启 → 正常加载');
+}]);
+
+/* ---------- 背景动画默认关闭 ---------- */
+tests.push(['背景动画：默认关闭（可顶栏一键开启，选过一次后记住）', async () => {
+  const bg = fs.readFileSync(path.join(PUB, 'bg-anim.js'), 'utf8');
+  const app = fs.readFileSync(path.join(PUB, 'app.js'), 'utf8');
+
+  /* --- 默认值：没有用户选择时一律关闭（不再区分桌面 / 触屏） --- */
+  assert.ok(bg.includes('return false;          // 默认关闭'), 'bg-anim.js 默认值不是关闭');
+  assert.ok(!bg.includes('return !isTouchDevice();'), 'bg-anim.js 仍按设备类型决定默认值');
+  assert.ok(!bg.includes('function isTouchDevice()'), 'isTouchDevice 已失效却还留着');
+  // 头部说明不能还写着「桌面默认开启」
+  assert.ok(!bg.includes('桌面默认开启'), '头部说明仍写着「桌面默认开启」');
+  // iOS 减半粒子仍要保留（用到 maxTouchPoints），别被误删
+  assert.ok(bg.includes('navigator.maxTouchPoints'), 'iOS 粒子减半逻辑被误删');
+
+  /* --- 顶栏开关按钮仍在，访客仍能自己打开 --- */
+  assert.ok(app.includes("id=\"bgAnimToggle\""), '顶栏背景动画开关按钮不见了');
+  assert.ok(app.includes('window.bgAnim.toggle()'), '顶栏按钮没有调用 bgAnim.toggle()');
+
+  /* --- 行为验证：真跑一遍 readSetting --- */
+  const src = bg.slice(bg.indexOf('function readSetting()'));
+  const end = /\r?\n {2}\}\r?\n/.exec(src);
+  assert.ok(end, 'readSetting 函数体不完整');
+  const fn = src.slice(0, end.index + end[0].length);
+
+  const run = (store, search) => {
+    const ctx = {
+      KEY: 'qingyu.bgAnim',
+      URLSearchParams: URLSearchParams,
+      location: { search: search || '' },
+      localStorage: { getItem: (k) => (k in store ? store[k] : null), setItem() {} },
+      navigator: undefined,   // 默认值不再依赖设备判断
+      window: undefined
+    };
+    vm.createContext(ctx);
+    vm.runInContext(fn + '\nthis.r = readSetting();', ctx);
+    return ctx.r;
+  };
+
+  assert.strictEqual(run({}), false, '没有用户选择时默认关闭');
+  assert.strictEqual(run({}, '?bg=1'), true, '?bg=1 预览参数仍能强制打开');
+  assert.strictEqual(run({ 'qingyu.bgAnim': '1' }), true, '用户自己开过 → 保持开启');
+  assert.strictEqual(run({ 'qingyu.bgAnim': '0' }), false, '用户自己关过 → 保持关闭');
+  assert.strictEqual(run({ 'qingyu.bgAnim': '0' }, '?bg=1'), true, '?bg=1 仍能覆盖本地选择（调试用）');
+}]);
+
+/* ---------- v2.10.104 公开接口全局频控 ---------- */
+tests.push(['安全：公开只读接口全局频控（429 / Retry-After / fail-open / 不信任 XFF / 分档阈值 / page 上限）', async () => {
+  const p2f = require('node:url').pathToFileURL;
+  const w = fs.readFileSync(path.join(dir, 'worker.js'), 'utf8');
+  assert.ok(w.includes('if (url.pathname === \'/api\' || url.pathname.indexOf(\'/api/\') === 0) {'),
+    'worker.js 未在 /api/* 入口挂频控');
+  const guardAt = w.indexOf('await apiGuard(request, env, url.pathname)');
+  const popularAt = w.indexOf("if (url.pathname === '/api/popular')");
+  assert.ok(guardAt > -1 && guardAt < popularAt, '频控必须在业务路由之前生效');
+  assert.ok(/search:\s*\{\s*limit:\s*60/.test(w), '搜索应有独立且更严的阈值');
+  assert.ok(/read:\s*\{\s*limit:\s*240/.test(w), '普通读接口阈值缺失');
+  assert.ok(/all:\s*\{\s*limit:\s*600/.test(w), '全量总闸缺失');
+  assert.ok(w.includes("'Retry-After': String(retryAfter || 60)"), '429 缺少 Retry-After');
+  assert.ok(w.includes("'Cache-Control': 'no-store'"), '429 响应不应被缓存');
+  assert.ok(w.includes('请求过于频繁'), '429 缺少可读提示');
+  assert.ok(w.includes('if (!env || !env.BLOG) return null;'), 'KV 未绑定时必须放行');
+  assert.ok(/catch \(e\) \{ return null; \}/.test(w), 'KV 读取异常时必须放行');
+  const ipFn = w.slice(w.indexOf('function guardIp('), w.indexOf('function guardIp(') + 400);
+  assert.ok(ipFn.includes('CF-Connecting-IP'), '频控必须用 CF-Connecting-IP 取 IP');
+  assert.ok(!ipFn.includes('X-Forwarded-For'), '频控绝不能信任 X-Forwarded-For（可伪造绕过）');
+  assert.ok(w.includes("const isRead = m === 'GET' || m === 'HEAD';"), '应只对读接口限流');
+  assert.ok(w.includes('if (!isRead) return null;'), '写接口必须豁免「读」这一档限流');
+  const mod = await import(p2f(path.join(dir, 'worker.js')).href);
+  const store = new Map();
+  const env = { BLOG: {
+    get: async (k) => (store.has(k) ? store.get(k) : null),
+    put: async (k, v) => { store.set(k, v); }
+  } };
+  const mk = (ip) => new Request('https://x.test/api/__guard_probe__', { headers: { 'CF-Connecting-IP': ip } });
+  const first = await mod.default.fetch(mk('1.2.3.4'), env);
+  assert.strictEqual(first.status, 404, '未超限时不应被频控拦下（应走业务路由返回 404（不触库））');
+  let saw429 = false;
+  for (let i = 0; i < 700; i++) {
+    const r = await mod.default.fetch(mk('1.2.3.4'), env);
+    if (r.status === 429) {
+      saw429 = true;
+      assert.strictEqual(r.headers.get('Retry-After'), '60', 'Retry-After 应为窗口秒数');
+      assert.ok(/请求过于频繁/.test(await r.text()), '429 响应体应给出可读提示');
+      break;
+    }
+  }
+  assert.ok(saw429, '连续刷请求必须被总闸拦下（返回 429）');
+  // 写接口豁免「读」这一档：连打 300 次 POST 不应被只读限流误伤（写各有业务级限流）
+  let writeBlocked = 0;
+  for (let i = 0; i < 300; i++) {
+    const r = await mod.default.fetch(new Request('https://x.test/api/__guard_probe__', {
+      method: 'POST', headers: { 'CF-Connecting-IP': '7.7.7.7', 'Content-Type': 'application/json' }, body: '{}'
+    }), env);
+    if (r.status === 429) writeBlocked++;
+  }
+  assert.strictEqual(writeBlocked, 0, '写接口不应被只读档位限流误伤');
+
+  const other = await mod.default.fetch(mk('5.6.7.8'), env);
+  assert.strictEqual(other.status, 404, '限流应按 IP 隔离，不能波及其它访客');
+  const noKv = await mod.default.fetch(mk('9.9.9.9'), {});
+  assert.strictEqual(noKv.status, 404, 'KV 缺失时必须放行，不能挡正常访客');
+  const core = fs.readFileSync(path.join(dir, 'functions/_lib/api-core.js'), 'utf8');
+  assert.ok(core.includes('const MAX_POSTS_PAGE = 200;'), '缺少 page 上限常量');
+  assert.ok(core.includes("Math.min(MAX_POSTS_PAGE, Math.max(1, Math.floor(Number(url.searchParams.get('page'))"),
+    'handlePosts 未对 page 封顶');
+}]);
+/* ---------- v2.10.105 无图文章：自动生成渐变封面 ---------- */
+tests.push(['封面：无图文章自动生成渐变封面（稳定色板 / 标题转义 / 副标题回退 / 窄屏样式）', async () => {
+  const app = fs.readFileSync(path.join(dir, 'public/app.js'), 'utf8');
+  const css = fs.readFileSync(path.join(dir, 'public/style.css'), 'utf8');
+  assert.ok(app.includes('const GENERATED_COVERS = ['), '缺少渐变封面色板');
+  assert.ok(app.includes('function hashString('), '缺少稳定哈希函数');
+  assert.ok(app.includes('function renderGeneratedCover('), '缺少渐变封面渲染函数');
+  const fbAt = app.indexOf('return renderGeneratedCover(p, title);');
+  const phAt = app.indexOf('post-thumb-ph');
+  assert.ok(fbAt > -1, '缩略图 fallback 未走渐变封面');
+  // 色板：至少 8 组，每组两个 hex
+  const covers = app.slice(app.indexOf('const GENERATED_COVERS = ['), app.indexOf('function hashString('));
+  const hexes = covers.match(/#[0-9a-fA-F]{6}/g) || [];
+  assert.ok(hexes.length >= 16, '色板配色组过少');
+  // 输出结构包含标题 / 副标题 / 短横线，且全部转义
+  assert.ok(app.includes("'<span class=\"ptg-title\">' + esc(t) + '</span>'"), '封面标题未转义');
+  assert.ok(app.includes('<span class="ptg-line"></span>'), '封面缺短横线装饰');
+  // 副标题回退：category -> tags[0] -> date
+  assert.ok(/p && p.category/.test(app) && /normalizeTags\(p\)/.test(app) && /tg\[0\]/.test(app) && /p\.date/.test(app),
+    '副标题回退链不完整');
+  // CSS：渐变背景 + 两个半透明白圆 + 窄屏收窄
+  assert.ok(css.includes('.post-thumb.gen'), '缺渐变封面样式');
+  assert.ok(/\.post-thumb\.gen::before/.test(css) && /\.post-thumb\.gen::after/.test(css), '缺装饰圆');
+  assert.ok(/@media \(max-width: 768px\)/.test(css), '缺窄屏适配');
+}]);
 /* ---------- 运行 ---------- */
 (async () => {
   let passed = 0, failed = 0;
@@ -2577,6 +4877,17 @@ tests.push(['背景动画开关位于顶栏 actions（与搜索同排），侧�
     try { await fn(); passed++; console.log('  ✅ ' + name); }
     catch (e) { failed++; console.log('  ❌ ' + name + '\n     ' + (e && e.stack ? e.message : e)); }
   }
+  // 文档里写的测试例数不得与实际不一致（README / 开发文档都有）
+  const total = passed + failed;
+  const strTotal = String(total);
+  DOC_FILES.forEach((f) => {
+    const doc = fs.readFileSync(path.join(dir, 'docs', f), 'utf8');
+    const stale = doc.match(/(?:\u5192\u70df|\u6d4b\u8bd5|Smoke tests)[^\n]{0,24}?(\d{2,4}) (\u4f8b|cases)/g) || [];
+    stale.forEach((m) => {
+      const num = /(\d{2,4}) (\u4f8b|cases)/.exec(m)[1];
+      if (num !== strTotal) { failed++; console.log('  ❌ 文档测试例数过期：' + f + ' 写的 ' + num + ' 实际 ' + total); }
+    });
+  });
   console.log(`\n结果：${passed} 通过 / ${failed} 失败`);
   process.exit(failed ? 1 : 0);
 })();

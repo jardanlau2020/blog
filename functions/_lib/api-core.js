@@ -135,10 +135,22 @@ export function corsPreflight(request, env) {
   return new Response(null, { status: 204, headers: getCorsHeaders(request, env) });
 }
 
-/** 401 统一响应（缺少/无效凭证） */
-export function unauthorized(request, env) {
+/** 统一鉴权失败响应。
+ *  有效会话仍处于 must_change 状态时返回 403 + 明确错误码，前端据此强制进入改密页，
+ *  而不会误判为 token 过期并把唯一可用于改密的会话清掉。 */
+export async function unauthorized(request, env) {
+  const state = await adminAuthState(request, env).catch(() => null);
+  if (state && state.authed && state.mustChange) {
+    return json({
+      error: '必须先修改初始密码，才能继续使用后台',
+      code: 'PASSWORD_CHANGE_REQUIRED',
+      mustChange: true
+    }, 403, request, env);
+  }
   return json({ error: '未授权：请先登录获取会话 token，并在请求头携带 Authorization: Bearer <token>' }, 401, request, env);
 }
+
+const MAX_POSTS_PAGE = 200;
 
 function normalizePostStatus(v) {
   return v === 'draft' || v === 'scheduled' ? v : 'published';
@@ -146,6 +158,21 @@ function normalizePostStatus(v) {
 function normalizePublishAt(v) {
   const n = Number(v);
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : null;
+}
+const SEO_CAPS = { title: 120, desc: 300, canonical: 500 };
+/** 文章级 SEO 覆盖：{ title, desc, canonical, noindex }，全部为空时返回 {} */
+export function normalizeSeo(v) {
+  let o = v;
+  if (typeof o === 'string') { try { o = JSON.parse(o); } catch (e) { o = null; } }
+  o = (o && typeof o === 'object') ? o : {};
+  const out = {
+    title: String(o.title || '').trim().slice(0, SEO_CAPS.title),
+    desc: String(o.desc || '').trim().slice(0, SEO_CAPS.desc),
+    canonical: String(o.canonical || '').trim().slice(0, SEO_CAPS.canonical),
+    noindex: !!o.noindex
+  };
+  if (!out.title && !out.desc && !out.canonical && !out.noindex) return {};
+  return out;
 }
 export function normalizePost(p) {
   const out = p || {};
@@ -166,9 +193,11 @@ export function normalizePost(p) {
     enc: protectedPost ? out.enc : null,
     category: String(out.category || '').trim(),
     series: String(out.series || '').trim().slice(0, 80),
+    author: String(out.author || '').trim().slice(0, 80),
     seriesOrder: Math.max(0, Math.floor(Number(out.seriesOrder || out.series_order) || 0)),
     status: status,
     publishAt: publishAt,
+    seo: normalizeSeo(out.seo),
     tags: Array.isArray(out.tags)
       ? out.tags.map((t) => String(t).trim()).filter(Boolean)
       : String(out.tags || '').split(/[,，]/).map((t) => t.trim()).filter(Boolean)
@@ -199,9 +228,11 @@ function postFromRow(r) {
     enc: enc,
     category: String(r.category || ''),
     series: String(r.series || ''),
+    author: String(r.author || ''),
     seriesOrder: Number(r.series_order) || 0,
     status: normalizePostStatus(r.status),
     publishAt: normalizePublishAt(r.publish_at),
+    seo: normalizeSeo(r.seo),
     tags: tags
   };
 }
@@ -217,9 +248,11 @@ function postToParams(p) {
     JSON.stringify(p.tags || []),
     p.category || '',
     p.series || '',
+    p.author || '',
     p.seriesOrder || 0,
     normalizePostStatus(p.status),
-    p.status === 'scheduled' ? normalizePublishAt(p.publishAt) : null
+    p.status === 'scheduled' ? normalizePublishAt(p.publishAt) : null,
+    JSON.stringify(normalizeSeo(p.seo))
   ];
 }
 
@@ -337,6 +370,16 @@ async function readStaticPosts(env) {
     return Array.isArray(arr) ? arr.map(normalizePost) : [];
   } catch (e) { return []; }
 }
+/** 反机器人开关（后台「功能开关」→ features.commentGuard，默认开） */
+async function commentGuardEnabled(env) {
+  try {
+    const row = await dbFirst(env.DB, 'SELECT v FROM site_settings WHERE k = ?', 'features');
+    if (!row || !row.v) return true;
+    const f = JSON.parse(String(row.v));
+    return !(f && f.commentGuard === false);
+  } catch (e) { return true; }
+}
+const COMMENT_MIN_FILL_MS = 2000;   // 表单渲染到提交的最短间隔（低于此值视为机器人）
 
 /** GET /api/posts（列表） · POST /api/posts（新建） */
 export async function handlePosts(request, env) {
@@ -348,6 +391,13 @@ export async function handlePosts(request, env) {
     const full = url.searchParams.get('full') === '1';
     const includeDrafts = full || url.searchParams.get('all') === '1';
 
+    const q = String(url.searchParams.get('q') || '').trim().toLowerCase();
+    const stFilter = String(url.searchParams.get('status') || '');
+    // 上限 200 页：翻到这里已经要 2 万篇文章，深翻页会持续付出 OFFSET 代价，
+    // 没有实际意义，只会变成攻击者打 D1 配额的入口（v2.10.104）。
+    const pageNum = Math.min(MAX_POSTS_PAGE, Math.max(1, Math.floor(Number(url.searchParams.get('page')) || 0)));
+    const perNum = Math.min(100, Math.floor(Number(url.searchParams.get('per')) || 0));
+    const paged = pageNum > 0 && perNum > 0;
     // all=1 / full=1 是后台接口：必须登录，可返回草稿（full=1 还返回正文）。
     // 公开的 GET /api/posts 仍只返回已发布摘要，且响应不区分管理员身份。
     if (includeDrafts && !(await isWriteAuthed(request, env))) return unauthorized(request, env);
@@ -357,6 +407,18 @@ export async function handlePosts(request, env) {
 
     // 完整备份：正文/密文原样返回，禁止写进共享缓存。
     if (full) return json({ ok: true, posts: all }, 200, request, env, { 'Cache-Control': NO_CACHE });
+    // 后台列表：服务端过滤 + 分页（不下发全量文章）
+    if (paged) {
+      if (!(await isWriteAuthed(request, env))) return unauthorized(request, env);
+      let list = all;
+      if (stFilter && stFilter !== 'all') list = list.filter((p) => (p.status || 'published') === stFilter);
+      if (q) list = list.filter((p) => ((p.title || '') + ' ' + (Array.isArray(p.tags) ? p.tags.join(' ') : String(p.tags || ''))).toLowerCase().indexOf(q) >= 0);
+      const total = list.length;
+      const pages = Math.max(1, Math.ceil(total / perNum));
+      const start = (pageNum - 1) * perNum;
+      const rows = list.slice(start, start + perNum).map((p) => { const c = Object.assign({}, p); if (!c.protected && c.content) c.search = String(c.content).slice(0, 800); delete c.content; delete c.enc; return c; });
+      return json({ ok: true, posts: rows, total: total, page: pageNum, per: perNum, pages: pages }, 200, request, env, { 'Cache-Control': NO_CACHE });
+    }
 
     const summary = all.map((p) => {
       if (!p.protected) {
@@ -380,7 +442,7 @@ export async function handlePosts(request, env) {
     const exist = await dbFirst(env.DB, 'SELECT 1 FROM posts WHERE id = ?', p.id);
     if (exist) return json({ error: '已存在相同 id（' + p.id + '），请用 PUT 更新' }, 409, request, env);
     await dbRun(env.DB,
-      'INSERT INTO posts (id,title,date,excerpt,content,cover,og_image,pinned,protected,enc,tags,category,series,series_order,status,publish_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+      'INSERT INTO posts (id,title,date,excerpt,content,cover,og_image,pinned,protected,enc,tags,category,series,author,series_order,status,publish_at,seo) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
       ...postToParams(p));
     await recordPostRevision(env, p, 'create').catch(() => {});
     if ((p.status || 'published') === 'published') await queuePostNotifications(env, p).catch(() => {});
@@ -414,11 +476,13 @@ export async function handlePostId(request, env, id) {
     const body = await request.json().catch(() => null);
     const p = normalizePost(body);
     p.id = id;
+    // 编辑旧文时若未显式带日期，沿用数据库中的原日期，避免被“今天”覆盖导致排序跳到最新
+    if (!p.date && exist && exist.date) p.date = String(exist.date);
     if (!p.title) return json({ error: '缺少 title' }, 400, request, env);
     if (p.status === 'scheduled' && !p.publishAt) return json({ error: '定时发布缺少发布时间' }, 400, request, env);
     await dbRun(env.DB,
-      'INSERT INTO posts (id,title,date,excerpt,content,cover,og_image,pinned,protected,enc,tags,category,series,series_order,status,publish_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ' +
-      'ON CONFLICT(id) DO UPDATE SET title=excluded.title,date=excluded.date,excerpt=excluded.excerpt,content=excluded.content,cover=excluded.cover,og_image=excluded.og_image,pinned=excluded.pinned,protected=excluded.protected,enc=excluded.enc,tags=excluded.tags,category=excluded.category,series=excluded.series,series_order=excluded.series_order,status=excluded.status,publish_at=excluded.publish_at',
+      'INSERT INTO posts (id,title,date,excerpt,content,cover,og_image,pinned,protected,enc,tags,category,series,author,series_order,status,publish_at,seo) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ' +
+      'ON CONFLICT(id) DO UPDATE SET title=excluded.title,date=excluded.date,excerpt=excluded.excerpt,content=excluded.content,cover=excluded.cover,og_image=excluded.og_image,pinned=excluded.pinned,protected=excluded.protected,enc=excluded.enc,tags=excluded.tags,category=excluded.category,series=excluded.series,series_order=excluded.series_order,author=excluded.author,status=excluded.status,publish_at=excluded.publish_at,seo=excluded.seo',
       ...postToParams(p));
     await recordPostRevision(env, p, 'update').catch(() => {});
     const oldStatus = exist ? normalizePostStatus(exist.status) : '';
@@ -440,6 +504,7 @@ export async function handlePostId(request, env, id) {
     await dbBatch(env.DB, stmts);
     await dbRun(env.DB, 'DELETE FROM stats_daily WHERE post_id = ?', id).catch(() => {});
     await purgeTags(env, [TAG_POSTS, TAG_FEED, TAG_SITEMAP, 'post:' + id]);
+    await recordAudit(env, request, 'post.delete', id);
     return json({ ok: true }, 200, request, env);
   }
 
@@ -450,7 +515,27 @@ export async function handlePostId(request, env, id) {
  * 评论（D1 表 comments；GET 列表 / POST 发表 / DELETE 单条）
  * ============================================================ */
 
-const COMMENT_CAPS = { author: 30, content: 1000, perPost: 300, perMin: 5 };
+/** 评论敏感词：词库存 site_settings.comment_blocklist（JSON 数组或换行/逗号分隔） */
+export function commentBlocklistHit(text, list) {
+  const hay = String(text || '').toLowerCase();
+  for (const w of (list || [])) { const k = String(w || '').trim().toLowerCase(); if (k && hay.indexOf(k) >= 0) return k; }
+  return '';
+}
+async function commentBlocklist(env) {
+  try {
+    if (env && env.COMMENT_BLOCKLIST) {
+      return String(env.COMMENT_BLOCKLIST).split(/[\n,，]/).map(function (x) { return String(x || '').trim(); }).filter(Boolean);
+    }
+    const row = await dbFirst(env.DB, "SELECT v FROM site_settings WHERE k = 'comment_blocklist'");
+    if (!row || !row.v) return [];
+    const raw = String(row.v);
+    let list = [];
+    try { const j = JSON.parse(raw); if (Array.isArray(j)) list = j; } catch (e) { list = raw.split(/[\n,，]/); }
+    return list.map(function (x) { return String(x || '').trim(); }).filter(Boolean);
+  } catch (e) { return []; }
+}
+
+const COMMENT_CAPS = { author: 30, content: 1000, perPost: 300, perMin: 5, likePerMin: 30 };
 
 /** 清除字符串中的 ASCII 控制字符（保留 \n \t）：防注入 / 干扰渲染的隐形字符 */
 function sanitizeText(s) {
@@ -477,12 +562,27 @@ export async function handleComments(request, env, postId) {
   const method = request.method.toUpperCase();
 
   if (method === 'GET') {
-    // 按写入顺序返回（rowid 单调递增），与旧版 KV 行为一致；
-    // 仅返回已通过审核的评论（status 缺失视为已通过，兼容旧数据）。
-    const list = await dbAll(env.DB, "SELECT * FROM comments WHERE post_id = ? AND (status = 'approved' OR status IS NULL) ORDER BY rowid ASC", postId);
-    // 评论是用户实时互动内容、变化频繁，不进边缘缓存（no-store），
-    // 保证发表/删除后立即可见；否则命中 60s 缓存会导致删除"不刷新"。
-    return json({ ok: true, postId, comments: list }, 200, request, env, { 'Cache-Control': NO_CACHE });
+    const url = new URL(request.url);
+    const sortNew = url.searchParams.get('sort') === 'new';
+    const pageNum = Math.max(1, Math.floor(Number(url.searchParams.get('page')) || 0));
+    const perNum = Math.min(100, Math.floor(Number(url.searchParams.get('per')) || 0));
+    const paged = pageNum > 0 && perNum > 0;
+    const orderBy = sortNew
+      ? 'COALESCE(pinned,0) DESC, rowid DESC'
+      : 'COALESCE(pinned,0) DESC, COALESCE(featured,0) DESC, COALESCE(likes,0) DESC, rowid ASC';
+    const list = await dbAll(env.DB, "SELECT *, rowid AS rid FROM comments WHERE post_id = ? AND (status = 'approved' OR status IS NULL) ORDER BY " + orderBy, postId);
+    if (!paged) return json({ ok: true, postId, comments: list }, 200, request, env, { 'Cache-Control': NO_CACHE });
+    const byId = {}; const children = {};
+    list.forEach(function (c) { byId[c.id] = c; children[c.id] = []; });
+    const roots = [];
+    list.forEach(function (c) { if (c.parent_id && byId[c.parent_id]) children[c.parent_id].push(c); else roots.push(c); });
+    const rootTotal = roots.length;
+    const pages = Math.max(1, Math.ceil(rootTotal / perNum));
+    const start = (pageNum - 1) * perNum;
+    const out = [];
+    function walk(c) { out.push(c); (children[c.id] || []).forEach(walk); }
+    roots.slice(start, start + perNum).forEach(walk);
+    return json({ ok: true, postId, comments: out, total: list.length, rootTotal: rootTotal, page: pageNum, per: perNum, pages: pages, sort: sortNew ? 'new' : 'hot' }, 200, request, env, { 'Cache-Control': NO_CACHE });
   }
 
   if (method === 'POST') {
@@ -507,10 +607,24 @@ export async function handleComments(request, env, postId) {
       console.warn('[comments] env.BLOG(KV) 未绑定，评论频率限制已禁用');
     }
     const body = await request.json().catch(() => null);
+    // 反机器人（可在后台「功能开关」关闭）：
+    //   ① 蜜罐字段被填写 → 静默丢弃（返回成功但不入库，机器人无法判断是否命中）；
+    //   ② 表单渲染到提交过快（且客户端上报了 ts）→ 拒绝。旧客户端不带 ts，不受影响。
+    if (await commentGuardEnabled(env)) {
+      const hp = String((body && (body.hp || body.website)) || '').trim();
+      if (hp) return json({ ok: true, comment: null, filtered: true }, 200, request, env);
+      const formTs = Number(body && body.ts) || 0;
+      if (formTs > 0 && Date.now() - formTs < COMMENT_MIN_FILL_MS) {
+        return json({ error: '提交太快了，请确认内容后重试' }, 429, request, env);
+      }
+    }
     const author = sanitizeText(String((body && body.author) || '').trim()).slice(0, COMMENT_CAPS.author);
     const content = sanitizeText(String((body && body.content) || '').trim()).slice(0, COMMENT_CAPS.content);
     if (!author) return json({ error: '请填写昵称' }, 400, request, env);
     if (!content) return json({ error: '评论内容不能为空' }, 400, request, env);
+    // 敏感词：命中即拒绝，避免灌水进入数据库
+    const hitWord = commentBlocklistHit(author + '\n' + content, await commentBlocklist(env));
+    if (hitWord) return json({ error: '内容包含敏感词：' + hitWord }, 400, request, env);
     // 回复：验证 parent_id（可选）
     let parentId = null;
     if (body && body.parent_id) {
@@ -556,6 +670,7 @@ export async function handleComments(request, env, postId) {
     await dbRun(env.DB,
       'INSERT INTO comments (id,post_id,author,content,date,status,parent_id) VALUES (?,?,?,?,?,?,?)',
       comment.id, postId, comment.author, comment.content, comment.date, comment.status, parentId);
+    await queueCommentNotification(env, postId, comment).catch(() => {});
     // 入库成功才计数（防刷屏）
     if (env.BLOG) {
       try { await env.BLOG.put(rk, String(cnt + 1), { expirationTtl: 120 }); } catch (e) {}
@@ -567,6 +682,26 @@ export async function handleComments(request, env, postId) {
   return json({ error: 'Method not allowed' }, 405, request, env);
 }
 
+/** POST /api/comments/:id/like（公开点赞，按 IP 频控） */
+export async function handleCommentLike(request, env, cid) {
+  if (!env || !env.DB) return json({ error: DB_ERR }, 500, request, env);
+  if (request.method === 'OPTIONS') return corsPreflight(request, env);
+  if (request.method !== 'POST') return json({ error: 'Method not allowed' }, 405, request, env);
+  const exist = await dbFirst(env.DB, 'SELECT likes FROM comments WHERE id = ?', cid).catch(() => null);
+  if (!exist) return json({ error: '评论不存在' }, 404, request, env);
+  const ip = clientIp(request);
+  const win = Math.floor(Date.now() / 60000);
+  const key = 'rate:cmtlike:' + ip + ':' + win;
+  if (env.BLOG) {
+    let n = 0;
+    try { n = Number((await env.BLOG.get(key)) || 0); } catch (e) {}
+    if (n >= COMMENT_CAPS.likePerMin) return json({ error: '点赞太频繁，请稍后再试' }, 429, request, env);
+    try { await env.BLOG.put(key, String(n + 1), { expirationTtl: 120 }); } catch (e) {}
+  }
+  await dbRun(env.DB, 'UPDATE comments SET likes = MIN(COALESCE(likes,0) + 1, 999999) WHERE id = ?', cid);
+  const row = await dbFirst(env.DB, 'SELECT likes FROM comments WHERE id = ?', cid);
+  return json({ ok: true, likes: Number(row && row.likes) || 0 }, 200, request, env, { 'Cache-Control': NO_CACHE });
+}
 /** DELETE /api/posts/:id/comments/:cid（需写入令牌，用于管理/删除不当评论） */
 export async function handleCommentId(request, env, postId, cid) {
   if (!env || !env.DB) return json({ error: DB_ERR }, 500, request, env);
@@ -580,6 +715,24 @@ export async function handleCommentId(request, env, postId, cid) {
   return json({ ok: true }, 200, request, env);
 }
 
+/** 将新评论加入站长通知发件箱；未配置收件邮箱或邮件服务时静默跳过。 */
+async function queueCommentNotification(env, postId, comment) {
+  if (!env || !env.DB || !env.RESEND_API_KEY || !env.BLOG_MAIL_FROM || !env.SITE_URL) return false;
+  let to = String(env.BLOG_ADMIN_EMAIL || env.BLOG_MAIL_REPLY_TO || '').trim();
+  if (!to) {
+    try {
+      const row = await dbFirst(env.DB, "SELECT v FROM site_settings WHERE k = 'profile'");
+      const profile = row && row.v ? JSON.parse(row.v) : {};
+      to = String(profile.email || '').trim();
+    } catch (e) {}
+  }
+  if (!to) to = String(env.BLOG_MAIL_FROM || '').trim();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to)) return false;
+  const post = await dbFirst(env.DB, 'SELECT title FROM posts WHERE id = ?', postId).catch(() => null);
+  const payload = JSON.stringify({ postId: postId, postTitle: post ? post.title : '', author: comment.author, content: comment.content, status: comment.status, commentId: comment.id });
+  await dbRun(env.DB, 'INSERT INTO mail_outbox (post_id,to_email,status,attempts,error,created_at,kind,payload) VALUES (?,?,?,?,?,?,?,?)', postId, to, 'pending', 0, '', Date.now(), 'comment', payload);
+  return true;
+}
 /** 将已发布文章加入订阅通知发件箱；发送由 Cron 异步完成。 */
 export async function queuePostNotifications(env, post) {
   if (!env || !env.DB || !post || !post.id || (post.status || 'published') !== 'published') return { queued: 0 };
@@ -701,11 +854,14 @@ export async function handlePostRevisionRestore(request, env, postId, revisionId
     content: revision.content, cover: revision.cover, ogImage: revision.ogImage,
     pinned: revision.pinned, protected: revision.protected, enc: revision.enc, tags: revision.tags,
     category: revision.category, series: revision.series, seriesOrder: revision.seriesOrder,
-    status: revision.status, publishAt: revision.publishAt
+    status: revision.status, publishAt: revision.publishAt,
+    // SEO / 作者属于元数据、不随正文版本回滚，恢复内容时保留当前设置
+    seo: (current && current.seo) || {},
+    author: (current && current.author) || ''
   };
   await dbRun(env.DB,
-    'INSERT INTO posts (id,title,date,excerpt,content,cover,og_image,pinned,protected,enc,tags,category,series,series_order,status,publish_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ' +
-    'ON CONFLICT(id) DO UPDATE SET title=excluded.title,date=excluded.date,excerpt=excluded.excerpt,content=excluded.content,cover=excluded.cover,og_image=excluded.og_image,pinned=excluded.pinned,protected=excluded.protected,enc=excluded.enc,tags=excluded.tags,category=excluded.category,series=excluded.series,series_order=excluded.series_order,status=excluded.status,publish_at=excluded.publish_at',
+    'INSERT INTO posts (id,title,date,excerpt,content,cover,og_image,pinned,protected,enc,tags,category,series,author,series_order,status,publish_at,seo) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ' +
+    'ON CONFLICT(id) DO UPDATE SET title=excluded.title,date=excluded.date,excerpt=excluded.excerpt,content=excluded.content,cover=excluded.cover,og_image=excluded.og_image,pinned=excluded.pinned,protected=excluded.protected,enc=excluded.enc,tags=excluded.tags,category=excluded.category,series=excluded.series,series_order=excluded.series_order,author=excluded.author,status=excluded.status,publish_at=excluded.publish_at,seo=excluded.seo',
     ...postToParams(post));
   await recordPostRevision(env, post, 'restore');
   await purgeTags(env, [TAG_POSTS, TAG_FEED, TAG_SITEMAP, 'post:' + postId]);
@@ -891,7 +1047,7 @@ export async function handleStats(request, env, postId) {
           await env.BLOG.put(dk, '1', { expirationTtl: LIKE_DEDUP_TTL });
         } catch (e) {}
       }
-      // 写后回读最终计数（含并发期间其他请求的增量），响应数字总是真实值
+    // 写后回读最终计数（含并发期间其他请求的增量），响应数字总是真实值
       const afterLike = await dbFirst(env.DB, 'SELECT * FROM stats WHERE post_id = ?', postId) || {};
       const s = { likes: Number(afterLike.likes) || 0, views: Number(afterLike.views) || 0 };
       await purgeTags(env, ['stats:' + postId]);   // 清 stats 缓存，保证点赞数立即生效
@@ -932,6 +1088,55 @@ export async function handleStats(request, env, postId) {
     await dbRun(env.DB,
       'INSERT INTO stats_daily (post_id,date,views,likes) VALUES (?,?,1,0) ON CONFLICT(post_id,date) DO UPDATE SET views = views + 1',
       postId, todayView).catch(() => {});
+    // 访问来源 / 设备（按天聚合，表可能尚未迁移 → 失败静默）：只在计入浏览时记录
+    try {
+      const ua = String(request.headers.get('User-Agent') || '');
+      const dev = /(bot|crawler|spider)/i.test(ua) ? 'bot'
+        : (/iPad|Tablet|Pad/i.test(ua) ? 'tablet'
+        : (/Mobile|Android|iPhone|iPod/i.test(ua) ? 'mobile' : 'desktop'));
+      // 国家/地区：Cloudflare 边缘按访问者 IP 解析（CF-IPCountry / request.cf.country）；
+      // 只存两位国家码，不落原始 IP，兼顾统计与隐私。
+      var country = String(request.headers.get('CF-IPCountry') || (request.cf && request.cf.country) || '').toUpperCase();
+      if (!country || country === 'XX' || country === 'T1') country = 'unknown';
+      // 手机/桌面系统与品牌（从 UA 推断）
+      var platform = /HarmonyOS|HongMeng/i.test(ua) ? 'HarmonyOS'
+        : (/iPhone|iPad|iPod|iOS/i.test(ua) ? 'iOS'
+        : (/Android/i.test(ua) ? 'Android'
+        : (/Windows/i.test(ua) ? 'Windows'
+        : (/Macintosh|Mac OS X/i.test(ua) ? 'macOS'
+        : (/Linux/i.test(ua) ? 'Linux' : 'other')))));
+      var vendor = /iPhone|iPad|iPod|Macintosh/i.test(ua) ? 'Apple'
+        : (/Huawei|HONOR/i.test(ua) ? 'Huawei/HONOR'
+        : (/Xiaomi|Redmi|POCO|Mi\s/i.test(ua) ? 'Xiaomi'
+        : (/Samsung|SM-/i.test(ua) ? 'Samsung'
+        : (/OPPO/i.test(ua) ? 'OPPO'
+        : (/vivo/i.test(ua) ? 'vivo'
+        : (/OnePlus/i.test(ua) ? 'OnePlus'
+        : (/Google|Pixel/i.test(ua) ? 'Google'
+        : (dev === 'bot' ? 'bot' : 'other'))))))));
+      let ref = 'direct';
+      // 前端会带 document.referrer（fetch 的 Referer 头恒为本站页面，无法反映来路）；
+      // 带 ref 字段（含空串）时以它为准：空串=直接访问，避免把直达流量误判成站内；
+      // 未带 ref 字段的旧客户端回退到 Referer 头。
+      const hasClientRef = !!(body && Object.prototype.hasOwnProperty.call(body, 'ref'));
+      const rawRef = hasClientRef ? String(body.ref || '').slice(0, 500) : String(request.headers.get('Referer') || '');
+      if (rawRef) {
+        try {
+          const h = new URL(rawRef).hostname.replace(/^www\./, '');
+          let self = '';
+          try { self = new URL(request.url).hostname.replace(/^www\./, ''); } catch (e) {}
+          ref = (h && h !== self) ? h : 'internal';
+        } catch (e) { ref = 'direct'; }
+      }
+      const SRC_SQL = 'INSERT INTO stats_sources (post_id,date,kind,name,views) VALUES (?,?,?,?,1) ON CONFLICT(post_id,date,kind,name) DO UPDATE SET views = views + 1';
+      await dbBatch(env.DB, [
+        { sql: SRC_SQL, params: [postId, todayView, 'device', dev] },
+        { sql: SRC_SQL, params: [postId, todayView, 'ref', ref] },
+        { sql: SRC_SQL, params: [postId, todayView, 'country', country] },
+        { sql: SRC_SQL, params: [postId, todayView, 'platform', platform] },
+        { sql: SRC_SQL, params: [postId, todayView, 'vendor', vendor] }
+      ]);
+    } catch (e) {}
     // 写后回读最终计数（含并发期间其他请求的增量），响应数字总是真实值
     const afterView = await dbFirst(env.DB, 'SELECT * FROM stats WHERE post_id = ?', postId) || {};
     const s = { likes: Number(afterView.likes) || 0, views: Number(afterView.views) || 0 };
@@ -1132,6 +1337,28 @@ async function validSession(env, token) {
   return !!(s && s.exp && s.exp > nowMs());
 }
 
+function bearerToken(request) {
+  const auth = String(request.headers.get('Authorization') || '').trim();
+  const m = /^Bearer\s+(.+)$/i.exec(auth);
+  return m ? m[1].trim() : '';
+}
+
+/** 返回当前请求的鉴权状态；mustChange 表示会话有效但仍需修改初始密码。 */
+async function adminAuthState(request, env) {
+  if (!env || !env.DB) return { authed: false, mustChange: false, legacy: false, token: '' };
+  const header = String(request.headers.get('Authorization') || '').trim();
+  const token = bearerToken(request);
+  if (token && await validSession(env, token)) {
+    const auth = await getAdminAuth(env);
+    return { authed: true, mustChange: !!(auth && auth.mustChange), legacy: false, token };
+  }
+  const legacy = env.BLOG_WRITE_TOKEN;
+  if (legacy && await safeEqual(header, 'Bearer ' + legacy)) {
+    return { authed: true, mustChange: false, legacy: true, token: '' };
+  }
+  return { authed: false, mustChange: false, legacy: false, token: '' };
+}
+
 /* ---------- 鉴权入口（写操作复用） ---------- */
 
 /**
@@ -1140,15 +1367,14 @@ async function validSession(env, token) {
  * 未配置任何认证（无 auth、无 token）→ 拒绝（安全默认）。
  */
 export async function isWriteAuthed(request, env) {
-  if (!env || !env.DB) return false;
-  const auth = String(request.headers.get('Authorization') || '').trim();
-  const m = /^Bearer\s+(.+)$/i.exec(auth);
-  const token = m ? m[1].trim() : '';
-  if (token && await validSession(env, token)) return true;
-  // 兼容旧配置：BLOG_WRITE_TOKEN 环境变量
-  const legacy = env.BLOG_WRITE_TOKEN;
-  if (legacy && await safeEqual(auth, 'Bearer ' + legacy)) return true;
-  return false;
+  const state = await adminAuthState(request, env);
+  return state.authed && !state.mustChange;
+}
+
+/** 改密接口专用：允许 must_change 会话调用，否则用户无法完成强制改密。 */
+async function isPasswordChangeAuthed(request, env) {
+  const state = await adminAuthState(request, env);
+  return state.authed;
 }
 
 /* ---------- 接口实现 ---------- */
@@ -1309,6 +1535,18 @@ export async function handleAdminLogin(request, env) {
   return json({ ok: true, token, expiresIn: ADMIN_SESSION_TTL, mustChange: !!auth.mustChange }, 200, request, env);
 }
 
+/** GET /api/admin/session — 轻量会话自检（不返回任何素材）
+ * 前端不能只凭 localStorage 里的 token 就认定自己是管理员：
+ * token 可能已过期或被撤销，会误把「重新生成」等管理员按钮暴露给游客。
+ * 这里让服务端真正校验一次，前端再决定是否渲染管理员按钮。 */
+export async function handleAdminSession(request, env) {
+  if (!env || !env.DB) return json({ error: DB_ERR }, 500, request, env);
+  if (request.method === 'OPTIONS') return corsPreflight(request, env);
+  if (request.method !== 'GET') return json({ error: 'Method not allowed' }, 405, request, env);
+  const state = await adminAuthState(request, env);
+  // 未登录也返回 200，前端才不会被 apiFetch 的 401 清理会话并跳登录
+  return json({ ok: true, authed: !!(state.authed && !state.mustChange), mustChange: !!state.mustChange }, 200, request, env, { 'Cache-Control': 'no-store' });
+}
 /** POST /api/admin/logout — 撤销当前会话 token */
 export async function handleAdminLogout(request, env) {
   if (!env || !env.DB) return json({ error: DB_ERR }, 500, request, env);
@@ -1350,12 +1588,24 @@ export async function handleCommentUpdate(request, env, cid) {
   if (request.method === 'OPTIONS') return corsPreflight(request, env);
   if (request.method !== 'PUT' && request.method !== 'POST') return json({ error: 'Method not allowed' }, 405, request, env);
   if (!(await isWriteAuthed(request, env))) return unauthorized(request, env);
-  const body = await request.json().catch(() => null);
-  const status = (body && body.status) || 'approved';
-  if (status !== 'approved' && status !== 'pending') return json({ error: 'status 只能是 approved 或 pending' }, 400, request, env);
+  const body = (await request.json().catch(() => null)) || {};
+  const fields = [];
+  const params = [];
+  if (Object.prototype.hasOwnProperty.call(body, 'status')) {
+    if (body.status !== 'approved' && body.status !== 'pending') return json({ error: 'status 只能是 approved 或 pending' }, 400, request, env);
+    fields.push('status = ?'); params.push(body.status);
+  }
+  if (Object.prototype.hasOwnProperty.call(body, 'featured')) {
+    fields.push('featured = ?'); params.push(body.featured ? 1 : 0);
+  }
+  if (Object.prototype.hasOwnProperty.call(body, 'pinned')) {
+    fields.push('pinned = ?'); params.push(body.pinned ? 1 : 0);
+  }
+  if (!fields.length) return json({ error: '缺少要更新的字段' }, 400, request, env);
   const exist = await dbFirst(env.DB, 'SELECT post_id FROM comments WHERE id = ?', cid);
   if (!exist) return json({ error: '评论不存在' }, 404, request, env);
-  await dbRun(env.DB, 'UPDATE comments SET status = ? WHERE id = ?', status, cid);
+  params.push(cid);
+  await dbRun(env.DB, 'UPDATE comments SET ' + fields.join(', ') + ' WHERE id = ?', ...params);
   return json({ ok: true }, 200, request, env);
 }
 
@@ -1425,6 +1675,7 @@ export async function handleMediaId(request, env, id) {
     console.error('[media] delete failed:', e && e.message, e);
     return json({ error: '删除失败，请稍后重试' }, 500, request, env);
   }
+  await recordAudit(env, request, 'media.delete', id);
   return json({ ok: true }, 200, request, env);
 }
 
@@ -1465,6 +1716,7 @@ export async function handleSettings(request, env) {
         return json({ error: '设置保存失败，请稍后重试' }, 500, request, env);
       }
     }
+    await recordAudit(env, request, 'settings.update', Object.keys(body).join(','));
     return json({ ok: true, saved: stmts.length }, 200, request, env, { 'Cache-Control': NO_CACHE });
   }
   return json({ error: 'Method not allowed' }, 405, request, env);
@@ -1480,7 +1732,7 @@ export async function handleAdminPassword(request, env) {
   if (!env || !env.DB) return json({ error: DB_ERR }, 500, request, env);
   if (request.method === 'OPTIONS') return corsPreflight(request, env);
   if (request.method !== 'POST') return json({ error: 'Method not allowed' }, 405, request, env);
-  if (!(await isWriteAuthed(request, env))) return unauthorized(request, env);
+  if (!(await isPasswordChangeAuthed(request, env))) return unauthorized(request, env);
   const body = await request.json().catch(() => null);
   const cur = String((body && body.current) || '');
   const pwd = String((body && body.password) || '');
@@ -1526,4 +1778,439 @@ export async function handleStatsTrend(request, env) {
     trend.push({ date: d, views: e.views, likes: e.likes });
   }
   return json({ ok: true, trend: trend }, 200, request, env, { 'Cache-Control': NO_CACHE });
+}
+
+/* ============================================================
+ * 后台操作审计日志（audit_log 表）
+ *   GET    /api/admin/audit   最近操作（默认 200 条，可按 action 过滤）
+ *   DELETE /api/admin/audit   清空日志
+ * 记录失败一律静默，绝不影响主业务流程。
+ * ============================================================ */
+
+/** 写入一条审计日志（永不抛出） */
+export async function recordAudit(env, request, action, target, detail) {
+  try {
+    if (!env || !env.DB || !action) return;
+    const ip = request ? clientIp(request) : '';
+    await dbRun(env.DB,
+      'INSERT INTO audit_log (id,action,target,detail,ip,created_at) VALUES (?,?,?,?,?,?)',
+      'a-' + randomToken(12), String(action), String(target || '').slice(0, 200),
+      String(detail || '').slice(0, 300), String(ip || ''), Date.now());
+  } catch (e) { /* 审计失败不影响业务 */ }
+}
+
+/** GET /api/admin/audit · DELETE /api/admin/audit */
+export async function handleAuditLog(request, env) {
+  if (!env || !env.DB) return json({ error: DB_ERR }, 500, request, env);
+  if (request.method === 'OPTIONS') return corsPreflight(request, env);
+  if (!(await isWriteAuthed(request, env))) return unauthorized(request, env);
+
+  if (request.method === 'GET') {
+    let limit = 200, action = '';
+    try {
+      const sp = new URL(request.url).searchParams;
+      const l = Number(sp.get('limit'));
+      if (l > 0 && l <= 500) limit = Math.floor(l);
+      action = String(sp.get('action') || '');
+    } catch (e) {}
+    let sql = 'SELECT * FROM audit_log';
+    const params = [];
+    if (action) { sql += ' WHERE action = ?'; params.push(action); }
+    sql += ' ORDER BY created_at DESC, id DESC LIMIT ' + limit;
+    const rows = await dbAll(env.DB, sql, ...params).catch(() => []);
+    const counts = {};
+    (rows || []).forEach(function (r) { counts[r.action] = (counts[r.action] || 0) + 1; });
+    return json({ ok: true, logs: rows || [], counts: counts }, 200, request, env, { 'Cache-Control': NO_CACHE });
+  }
+
+  if (request.method === 'DELETE') {
+    await dbRun(env.DB, 'DELETE FROM audit_log');
+    await recordAudit(env, request, 'audit.clear', '');
+    return json({ ok: true }, 200, request, env);
+  }
+
+  return json({ error: 'Method not allowed' }, 405, request, env);
+}
+
+/** POST /api/admin/tags（批量重命名 / 删除标签，一次请求完成） */
+export async function handleTags(request, env) {
+  if (!env || !env.DB) return json({ error: DB_ERR }, 500, request, env);
+  if (request.method === 'OPTIONS') return corsPreflight(request, env);
+  if (request.method !== 'POST') return json({ error: 'Method not allowed' }, 405, request, env);
+  if (!(await isWriteAuthed(request, env))) return unauthorized(request, env);
+  const body = (await request.json().catch(() => null)) || {};
+  const op = String(body.op || '');
+  const from = String(body.from || '').trim();
+  const to = String(body.to || '').trim();
+  if (!from || (op !== 'rename' && op !== 'delete')) return json({ error: '参数不完整' }, 400, request, env);
+  const rows = await dbAll(env.DB, 'SELECT id,tags FROM posts').catch(() => []);
+  const stmts = [];
+  (rows || []).forEach(function (r) {
+    let tags = [];
+    try { tags = Array.isArray(r.tags) ? r.tags : JSON.parse(r.tags || '[]'); } catch (e) { tags = []; }
+    if (!Array.isArray(tags) || tags.indexOf(from) < 0) return;
+    const next = [];
+    tags.forEach(function (x) {
+      if (x !== from) { if (next.indexOf(x) < 0) next.push(x); return; }
+      if (op === 'rename' && to && next.indexOf(to) < 0) next.push(to);
+    });
+    stmts.push({ sql: 'UPDATE posts SET tags = ? WHERE id = ?', params: [JSON.stringify(next), r.id] });
+  });
+  if (stmts.length) await dbBatch(env.DB, stmts);
+  await recordAudit(env, request, op === 'rename' ? 'tag.rename' : 'tag.delete', from, to);
+  return json({ ok: true, updated: stmts.length }, 200, request, env, { 'Cache-Control': NO_CACHE });
+}
+
+/** GET /api/admin/stats/sources?days=30（需登录）：来源 Top + 设备占比 */
+const ERROR_LOG_KEEP = 300;
+const ERROR_CAPS = { message: 500, source: 300, stack: 4000, url: 500, ua: 300 };
+/** 稳定指纹：同一错误（kind+message+source）聚合计数，避免刷爆表 */
+function errorFingerprint(kind, message, source) {
+  const str = String(kind || '') + '|' + String(message || '') + '|' + String(source || '');
+  let h = 5381;
+  for (let i = 0; i < str.length; i++) h = ((h * 33) ^ str.charCodeAt(i)) >>> 0;
+  return h.toString(16) + '-' + str.length;
+}
+export async function handleErrorReport(request, env) {
+  if (!env || !env.DB) return json({ error: DB_ERR }, 500, request, env);
+  if (request.method === 'OPTIONS') return corsPreflight(request, env);
+  if (request.method !== 'POST') return json({ error: 'Method not allowed' }, 405, request, env);
+  const ip = clientIp(request);
+  if (env.BLOG) {
+    const win = Math.floor(Date.now() / 60000);
+    const rk = 'rate:err:' + ip + ':' + win;
+    let cnt = 0;
+    try { cnt = Number(await env.BLOG.get(rk)) || 0; } catch (e) {}
+    if (cnt >= 20) return json({ ok: false }, 429, request, env);
+    try { await env.BLOG.put(rk, String(cnt + 1), { expirationTtl: 120 }); } catch (e) {}
+  }
+  const body = await request.json().catch(() => null);
+  const message = sanitizeText(String((body && body.message) || '').trim()).slice(0, ERROR_CAPS.message);
+  if (!message) return json({ error: '缺少 message' }, 400, request, env);
+  const kind = String((body && body.kind) || 'error').slice(0, 20);
+  const source = String((body && body.source) || '').slice(0, ERROR_CAPS.source);
+  const stack = String((body && body.stack) || '').slice(0, ERROR_CAPS.stack);
+  const url = String((body && body.url) || '').slice(0, ERROR_CAPS.url);
+  const ua = String(request.headers.get('User-Agent') || '').slice(0, ERROR_CAPS.ua);
+  const fp = errorFingerprint(kind, message, source);
+  const now = Date.now();
+  await dbRun(env.DB,
+    'INSERT INTO error_logs (fingerprint,kind,message,source,stack,url,ua,hits,created_at,last_at) VALUES (?,?,?,?,?,?,?,1,?,?) ' +
+    'ON CONFLICT(fingerprint) DO UPDATE SET hits = hits + 1, last_at = excluded.last_at, url = excluded.url, ua = excluded.ua, stack = excluded.stack',
+    fp, kind, message, source, stack, url, ua, now, now);
+  await dbRun(env.DB, 'DELETE FROM error_logs WHERE id NOT IN (SELECT id FROM error_logs ORDER BY last_at DESC LIMIT ' + ERROR_LOG_KEEP + ')').catch(() => {});
+  return json({ ok: true }, 200, request, env, { 'Cache-Control': NO_CACHE });
+}
+/* ============================================================
+ * 草稿预览分享链接（HMAC 签名 + 过期，无需登录即可查看未发布文章）
+ * 签名密钥：BLOG_PREVIEW_SECRET 环境变量；未配置时用管理员密码哈希派生，
+ * 因此「修改站点密码」会让所有已发出的预览链接立即失效。
+ * ============================================================ */
+const PREVIEW_MAX_TTL_DAYS = 30;
+function _b64url(bytes) {
+  const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  let str = '';
+  for (let i = 0; i < u8.length; i++) str += String.fromCharCode(u8[i]);
+  return btoa(str).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+function _b64urlEncodeStr(str) { return _b64url(new TextEncoder().encode(str)); }
+function _b64urlDecodeStr(s) {
+  const b = String(s || '').replace(/-/g, '+').replace(/_/g, '/');
+  const pad = b.length % 4 ? '='.repeat(4 - (b.length % 4)) : '';
+  const bin = atob(b + pad);
+  const u8 = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+  return new TextDecoder().decode(u8);
+}
+async function previewSecret(env) {
+  if (env && env.BLOG_PREVIEW_SECRET) return String(env.BLOG_PREVIEW_SECRET);
+  try {
+    const r = await dbFirst(env.DB, 'SELECT salt,hash FROM admin_auth WHERE k = ?', ADMIN_AUTH_KEY);
+    if (r && (r.hash || r.salt)) return 'preview:' + String(r.salt || '') + ':' + String(r.hash || '');
+  } catch (e) {}
+  return 'qingyu-preview-fallback';
+}
+async function previewSign(env, payloadStr) {
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(await previewSecret(env)), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  return _b64url(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(payloadStr)));
+}
+async function previewTokenCreate(env, postId, ttlMs) {
+  const expiresAt = Date.now() + ttlMs;
+  const payloadStr = JSON.stringify({ p: String(postId), e: expiresAt });
+  const payload = _b64urlEncodeStr(payloadStr);
+  return { token: payload + '.' + await previewSign(env, payloadStr), expiresAt: expiresAt };
+}
+async function previewTokenVerify(env, token) {
+  const parts = String(token || '').split('.');
+  if (parts.length !== 2) return null;
+  let payloadStr = '';
+  try { payloadStr = _b64urlDecodeStr(parts[0]); } catch (e) { return null; }
+  const expect = await previewSign(env, payloadStr);
+  if (expect.length !== parts[1].length) return null;
+  let diff = 0;
+  for (let i = 0; i < expect.length; i++) diff |= expect.charCodeAt(i) ^ parts[1].charCodeAt(i);
+  if (diff !== 0) return null;
+  let obj = null;
+  try { obj = JSON.parse(payloadStr); } catch (e) { return null; }
+  if (!obj || !obj.p || !obj.e || Number(obj.e) < Date.now()) return null;
+  return obj;
+}
+/** POST /api/admin/preview-link（需登录）：为指定文章生成带签名的预览链接 */
+export async function handlePreviewLink(request, env) {
+  if (!env || !env.DB) return json({ error: DB_ERR }, 500, request, env);
+  if (request.method === 'OPTIONS') return corsPreflight(request, env);
+  if (!(await isWriteAuthed(request, env))) return unauthorized(request, env);
+  if (request.method !== 'POST') return json({ error: 'Method not allowed' }, 405, request, env);
+  const body = await request.json().catch(() => null);
+  const postId = String((body && body.postId) || '').trim();
+  if (!postId) return json({ error: '缺少 postId' }, 400, request, env);
+  const exists = await dbFirst(env.DB, 'SELECT * FROM posts WHERE id = ?', postId);
+  if (!exists) return json({ error: '文章不存在，请先保存' }, 404, request, env);
+  const rawDays = Math.floor(Number((body && body.ttlDays)) || 7);
+  const ttlDays = Math.min(PREVIEW_MAX_TTL_DAYS, Math.max(1, rawDays));
+  const made = await previewTokenCreate(env, postId, ttlDays * 86400000);
+  const base = env.SITE_URL ? String(env.SITE_URL).replace(/\/+$/, '') : new URL(request.url).origin;
+  return json({ ok: true, token: made.token, url: base + '/preview/' + encodeURIComponent(made.token), expiresAt: made.expiresAt, ttlDays: ttlDays }, 200, request, env, { 'Cache-Control': NO_CACHE });
+}
+/** GET /api/preview?token=…（公开，凭签名）：返回未发布文章内容，禁止缓存 */
+export async function handlePreviewGet(request, env) {
+  if (!env || !env.DB) return json({ error: DB_ERR }, 500, request, env);
+  if (request.method === 'OPTIONS') return corsPreflight(request, env);
+  if (request.method !== 'GET') return json({ error: 'Method not allowed' }, 405, request, env);
+  const token = new URL(request.url).searchParams.get('token') || '';
+  const claims = await previewTokenVerify(env, token);
+  if (!claims) return json({ error: '预览链接无效或已过期' }, 403, request, env, { 'Cache-Control': NO_CACHE });
+  const row = await dbFirst(env.DB, 'SELECT * FROM posts WHERE id = ?', claims.p);
+  if (!row) return json({ error: '文章不存在' }, 404, request, env, { 'Cache-Control': NO_CACHE });
+  return json({ ok: true, preview: true, expiresAt: Number(claims.e), post: postFromRow(row) }, 200, request, env, { 'Cache-Control': NO_CACHE });
+}
+/* ============================================================
+ * Webmention（W3C）：外站引用本篇文章 → 校验来源页确实链接到本站后收录展示
+ * ============================================================ */
+const WEBMENTION_MAX_BYTES = 200000;
+function wmStripTags(s) {
+  return String(s == null ? '' : s).replace(/<script[\s\S]*?<\/script>/gi, ' ').replace(/<style[\s\S]*?<\/style>/gi, ' ').replace(/<[^>]*>/g, ' ').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#0?39;/g, "'").replace(/\s+/g, ' ').trim();
+}
+function wmMetaMap(html) {
+  const map = {};
+  const re = /<meta\b[^>]*>/gi;
+  let m;
+  while ((m = re.exec(html))) {
+    const tag = m[0];
+    const key = /(?:name|property)\s*=\s*["']([^"']+)["']/i.exec(tag);
+    const val = /content\s*=\s*["']([^"']*)["']/i.exec(tag);
+    if (key && val) map[String(key[1]).toLowerCase()] = val[1];
+  }
+  return map;
+}
+function wmSameUrl(a, b) {
+  try {
+    const ua = new URL(a), ub = new URL(b);
+    const norm = (u) => (u.origin.replace(/^https?:\/\/www\./, '') + u.pathname.replace(/\/+$/, '') + u.search).toLowerCase();
+    return norm(ua) === norm(ub);
+  } catch (e) { return false; }
+}
+function wmPostIdForTarget(env, target, requestUrl) {
+  try {
+    const t = new URL(target);
+    const selfHosts = [];
+    try { selfHosts.push(new URL(requestUrl).hostname.replace(/^www\./, '')); } catch (e) {}
+    if (env && env.SITE_URL) { try { selfHosts.push(new URL(env.SITE_URL).hostname.replace(/^www\./, '')); } catch (e) {} }
+    const host = t.hostname.replace(/^www\./, '');
+    if (selfHosts.length && selfHosts.indexOf(host) < 0) return null;
+    const m = /^\/posts\/([^/]+)\/?$/.exec(t.pathname);
+    if (!m) return null;
+    return decodeURIComponent(m[1]);
+  } catch (e) { return null; }
+}
+/** POST /api/webmention：接收外站引用通知（公开，频率限制 + 抓取校验） */
+export async function handleWebmention(request, env) {
+  if (!env || !env.DB) return json({ error: DB_ERR }, 500, request, env);
+  if (request.method === 'OPTIONS') return corsPreflight(request, env);
+  if (request.method !== 'POST') return json({ error: 'Method not allowed' }, 405, request, env);
+  const ip = clientIp(request);
+  if (env.BLOG) {
+    const win = Math.floor(Date.now() / 60000);
+    const rk = 'rate:wm:' + ip + ':' + win;
+    let cnt = 0;
+    try { cnt = Number(await env.BLOG.get(rk)) || 0; } catch (e) {}
+    if (cnt >= 10) return json({ error: '操作太频繁，请稍后再试' }, 429, request, env);
+    try { await env.BLOG.put(rk, String(cnt + 1), { expirationTtl: 120 }); } catch (e) {}
+  }
+  let source = '', target = '';
+  const ctype = String(request.headers.get('Content-Type') || '');
+  if (ctype.indexOf('application/json') >= 0) {
+    const body = await request.json().catch(() => null);
+    source = String((body && body.source) || '').trim();
+    target = String((body && body.target) || '').trim();
+  } else {
+    const text = await request.text().catch(() => '');
+    const params = new URLSearchParams(text);
+    source = String(params.get('source') || '').trim();
+    target = String(params.get('target') || '').trim();
+  }
+  if (!/^https?:\/\//i.test(source) || !/^https?:\/\//i.test(target)) return json({ error: 'source / target 必须是 http(s) URL' }, 400, request, env);
+  if (source.length > 2000 || target.length > 2000) return json({ error: 'URL 过长' }, 400, request, env);
+  const postId = wmPostIdForTarget(env, target, request.url);
+  if (!postId) return json({ error: 'target 不是本站文章地址' }, 400, request, env);
+  const post = await dbFirst(env.DB, 'SELECT * FROM posts WHERE id = ?', postId).catch(() => null);
+  if (!post) return json({ error: '文章不存在' }, 404, request, env);
+  // 抓取来源页并校验其中确实链接到 target
+  let html = '';
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 8000);
+    const res = await fetch(source, { redirect: 'follow', signal: ctrl.signal, headers: { 'User-Agent': 'QingyuBlog-Webmention/1.0 (+webmention)', 'Accept': 'text/html,application/xhtml+xml' } });
+    clearTimeout(timer);
+    if (!res.ok) return json({ error: '来源页无法访问 HTTP ' + res.status }, 400, request, env);
+    const ct = String(res.headers.get('content-type') || '');
+    if (ct && ct.indexOf('text/html') < 0 && ct.indexOf('text/plain') < 0) return json({ error: '来源页不是 HTML' }, 400, request, env);
+    html = (await res.text()).slice(0, WEBMENTION_MAX_BYTES);
+  } catch (e) {
+    return json({ error: '无法抓取来源页' }, 400, request, env);
+  }
+  let links = false;
+  const hrefRe = /href\s*=\s*["']([^"']+)["']/gi;
+  let hm;
+  while ((hm = hrefRe.exec(html))) {
+    let abs = '';
+    try { abs = new URL(hm[1], source).href; } catch (e) { continue; }
+    if (wmSameUrl(abs, target)) { links = true; break; }
+  }
+  if (!links) return json({ error: '来源页没有链接到该文章' }, 400, request, env);
+  const metas = wmMetaMap(html);
+  const titleM = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(html);
+  const authorName = wmStripTags(metas['author'] || metas['article:author'] || '').slice(0, 80);
+  const srcHost = (() => { try { return new URL(source).hostname.replace(/^www\./, ''); } catch (e) { return ''; } })();
+  const title = wmStripTags(titleM ? titleM[1] : (metas['og:title'] || '')).slice(0, 160) || srcHost;
+  const excerpt = wmStripTags(metas['og:description'] || metas['description'] || '').slice(0, 300);
+  const now = Date.now();
+  await dbRun(env.DB,
+    'INSERT INTO webmentions (source,target,post_id,author_name,author_url,title,excerpt,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?) ' +
+    'ON CONFLICT(source,target) DO UPDATE SET author_name=excluded.author_name, author_url=excluded.author_url, title=excluded.title, excerpt=excluded.excerpt, updated_at=excluded.updated_at',
+    source, target, postId, authorName || srcHost, source, title, excerpt, 'approved', now, now);
+  return json({ ok: true, postId: postId }, 202, request, env, { 'Cache-Control': NO_CACHE });
+}
+/** GET /api/webmention?target=URL：公开读取某篇文章的引用列表 */
+export async function handleWebmentionList(request, env) {
+  if (!env || !env.DB) return json({ error: DB_ERR }, 500, request, env);
+  if (request.method === 'OPTIONS') return corsPreflight(request, env);
+  if (request.method !== 'GET') return json({ error: 'Method not allowed' }, 405, request, env);
+  const target = String(new URL(request.url).searchParams.get('target') || '').trim();
+  if (!target) return json({ ok: true, mentions: [] }, 200, request, env, { 'Cache-Control': NO_CACHE });
+  const rows = await dbAll(env.DB, "SELECT id,source,target,author_name,author_url,title,excerpt,created_at FROM webmentions WHERE target = ? AND status = 'approved' ORDER BY created_at DESC LIMIT 100", target).catch(() => []);
+  return json({ ok: true, mentions: rows }, 200, request, env, { 'Cache-Control': NO_CACHE });
+}
+/** GET /api/admin/webmentions（需登录）：列表；DELETE 单条 */
+export async function handleWebmentionsAdmin(request, env, id) {
+  if (!env || !env.DB) return json({ error: DB_ERR }, 500, request, env);
+  if (request.method === 'OPTIONS') return corsPreflight(request, env);
+  if (!(await isWriteAuthed(request, env))) return unauthorized(request, env);
+  if (request.method === 'DELETE') {
+    if (!id) return json({ error: '缺少 id' }, 400, request, env);
+    await dbRun(env.DB, 'DELETE FROM webmentions WHERE id = ?', Number(id)).catch(() => {});
+    return json({ ok: true }, 200, request, env, { 'Cache-Control': NO_CACHE });
+  }
+  if (request.method !== 'GET') return json({ error: 'Method not allowed' }, 405, request, env);
+  const rows = await dbAll(env.DB, 'SELECT * FROM webmentions ORDER BY created_at DESC LIMIT 200').catch(() => []);
+  return json({ ok: true, total: rows.length, mentions: rows }, 200, request, env, { 'Cache-Control': NO_CACHE });
+}
+/** GET /api/admin/errors（需登录）：错误聚合列表；DELETE：清空 */
+export async function handleErrorsAdmin(request, env) {
+  if (!env || !env.DB) return json({ error: DB_ERR }, 500, request, env);
+  if (request.method === 'OPTIONS') return corsPreflight(request, env);
+  if (!(await isWriteAuthed(request, env))) return unauthorized(request, env);
+  if (request.method === 'DELETE') {
+    await dbRun(env.DB, 'DELETE FROM error_logs').catch(() => {});
+    return json({ ok: true }, 200, request, env, { 'Cache-Control': NO_CACHE });
+  }
+  if (request.method !== 'GET') return json({ error: 'Method not allowed' }, 405, request, env);
+  const rows = await dbAll(env.DB, 'SELECT * FROM error_logs ORDER BY last_at DESC LIMIT 200').catch(() => []);
+  let total = 0, sumHits = 0;
+  try {
+    const r = await dbFirst(env.DB, 'SELECT COUNT(*) AS n, COALESCE(SUM(hits),0) AS h FROM error_logs');
+    total = Number(r && r.n) || 0; sumHits = Number(r && r.h) || 0;
+  } catch (e) {}
+  return json({ ok: true, total: total, sumHits: sumHits, errors: rows }, 200, request, env, { 'Cache-Control': NO_CACHE });
+}
+/** GET /api/admin/stats/sources?days=30（需登录）：来源 Top + 设备占比 */
+export async function handleStatsSources(request, env) {
+  if (!env || !env.DB) return json({ error: DB_ERR }, 500, request, env);
+  if (request.method === 'OPTIONS') return corsPreflight(request, env);
+  if (!(await isWriteAuthed(request, env))) return unauthorized(request, env);
+  let days = 30;
+  try { const d = Number(new URL(request.url).searchParams.get('days')); if (d > 0 && d <= 365) days = Math.floor(d); } catch (e) {}
+  const since = new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
+  const rows = await dbAll(env.DB, 'SELECT kind,name,SUM(views) AS views FROM stats_sources WHERE date >= ? GROUP BY kind,name ORDER BY views DESC', since).catch(() => []);
+  const refs = [], devices = [], countries = [], platforms = [], vendors = [];
+  let refTotal = 0, devTotal = 0, countryTotal = 0, platformTotal = 0, vendorTotal = 0;
+  (rows || []).forEach(function (r) {
+    const n = Number(r.views) || 0;
+    if (r.kind === 'ref') { refs.push({ name: r.name, views: n }); refTotal += n; }
+    else if (r.kind === 'device') { devices.push({ name: r.name, views: n }); devTotal += n; }
+    else if (r.kind === 'country') { countries.push({ name: r.name, views: n }); countryTotal += n; }
+    else if (r.kind === 'platform') { platforms.push({ name: r.name, views: n }); platformTotal += n; }
+    else if (r.kind === 'vendor') { vendors.push({ name: r.name, views: n }); vendorTotal += n; }
+  });
+  return json({ ok: true, days: days, since: since,
+    referrers: refs.slice(0, 10), devices: devices,
+    countries: countries.slice(0, 12), platforms: platforms, vendors: vendors,
+    refTotal: refTotal, devTotal: devTotal, countryTotal: countryTotal, platformTotal: platformTotal, vendorTotal: vendorTotal
+  }, 200, request, env, { 'Cache-Control': NO_CACHE });
+}
+
+/** GET /api/admin/health（需登录）：站点绑定与数据健康检查 */
+export async function handleHealth(request, env) {
+  if (!env || !env.DB) return json({ error: DB_ERR }, 500, request, env);
+  if (request.method === 'OPTIONS') return corsPreflight(request, env);
+  if (!(await isWriteAuthed(request, env))) return unauthorized(request, env);
+  const items = [];
+  let dbOk = false;
+  const counts = {};
+  try {
+    await dbFirst(env.DB, 'SELECT 1 AS ok');
+    dbOk = true;
+    const tables = ['posts','comments','media','music','subscribers','backups','audit_log'];
+    for (const t of tables) {
+      const r = await dbFirst(env.DB, 'SELECT COUNT(*) AS c FROM ' + t).catch(() => null);
+      counts[t] = r ? Number(r.c) : null;
+    }
+  } catch (e) {}
+  items.push({ key: 'db', ok: dbOk, counts: counts });
+  let kvOk = false;
+  if (env.BLOG) {
+    try {
+      const probe = 'health:' + Date.now();
+      await env.BLOG.put(probe, '1', { expirationTtl: 60 });
+      kvOk = (await env.BLOG.get(probe)) !== null;
+    } catch (e) {}
+  }
+  items.push({ key: 'kv', ok: kvOk, bound: !!env.BLOG });
+  const r2Creds = !!(env.R2_ACCESS_KEY_ID && env.R2_SECRET_ACCESS_KEY && env.R2_ENDPOINT);
+  items.push({ key: 'r2media', ok: r2Creds && !!env.R2_MEDIA_BUCKET, bound: !!env.R2_MEDIA_BUCKET });
+  items.push({ key: 'r2backup', ok: r2Creds && !!env.R2_BACKUP_BUCKET, bound: !!env.R2_BACKUP_BUCKET });
+  items.push({ key: 'ai', ok: !!env.AI, bound: !!env.AI });
+  items.push({ key: 'mail', ok: !!(env.RESEND_API_KEY && env.BLOG_MAIL_FROM && env.SITE_URL), bound: !!env.RESEND_API_KEY });
+  return json({ ok: true, items: items, checkedAt: Date.now() }, 200, request, env, { 'Cache-Control': NO_CACHE });
+}
+
+/** POST /api/admin/comments/bulk（需登录）：批量通过 / 待审 / 删除 */
+export async function handleCommentsBulk(request, env) {
+  if (!env || !env.DB) return json({ error: DB_ERR }, 500, request, env);
+  if (request.method === 'OPTIONS') return corsPreflight(request, env);
+  if (request.method !== 'POST') return json({ error: 'Method not allowed' }, 405, request, env);
+  if (!(await isWriteAuthed(request, env))) return unauthorized(request, env);
+  const body = (await request.json().catch(() => null)) || {};
+  const op = String(body.op || '');
+  const ids = Array.isArray(body.ids) ? body.ids.map(String).filter(Boolean).slice(0, 200) : [];
+  if (!ids.length || ['approve', 'pending', 'delete'].indexOf(op) < 0) {
+    return json({ error: '参数不完整' }, 400, request, env);
+  }
+  const stmts = ids.map(function (id) {
+    if (op === 'delete') return { sql: 'DELETE FROM comments WHERE id = ?', params: [id] };
+    return { sql: 'UPDATE comments SET status = ? WHERE id = ?', params: [op === 'approve' ? 'approved' : 'pending', id] };
+  });
+  await dbBatch(env.DB, stmts);
+  await recordAudit(env, request, 'comment.bulk', op + ' x' + ids.length);
+  return json({ ok: true, updated: ids.length, op: op }, 200, request, env, { 'Cache-Control': NO_CACHE });
 }

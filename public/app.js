@@ -6,13 +6,21 @@
  * ============================================================================ */
 'use strict';
 
-var BLOG_VERSION = '2.9.9';
+var BLOG_VERSION = '2.10.109';
+
+/* i18n 兜底：万一 i18n.js 没加载成功（网络抖动 / 缓存缺失 / 被拦截），
+ * 也必须保证 t() 可用 —— 否则整页会在第一个 t(...) 处抛 “t is not defined” 而白屏。 */
+if (typeof t !== 'function') {
+  window.t = function (key) { return key; };
+  try { t = window.t; } catch (e) { /* 严格模式下赋值到未声明标识符会抛错，忽略即可 */ }
+}
 
 /* ---------- 全局缓存 ---------- */
 var _searchOpen = false;   // 顶部导航搜索是否展开
 var _searchDocBound = false;   // document 级外部点击监听是否已绑定
 var _commentsCache = {};
 var _statsCache = {};
+var _magazineClockTimer = null;
 
 /* ---------- Smoji 表情库 ---------- */
 var _smojiPicker = null;
@@ -145,6 +153,27 @@ function applyTheme(t) {
 function setTheme(t) { applyTheme(t); try { localStorage.setItem(themeKey(), t); } catch (e) {} }
 function toggleTheme() { var n = getTheme() === 'dark' ? 'light' : 'dark'; setTheme(n); refreshThemeIcon(); renderAccentSwatches(); renderAccentNativeSelect(); return n; }
 /* 统一 SVG 图标：currentColor 描边，自动继承文字色、hover 变主题色 */
+/* ---------- 正文字号（A- / A / A+）：本地记忆，跨页面生效 ---------- */
+var READING_SCALE_KEY = 'qingyu.readingScale';
+function getReadingScale() {
+  var v = 1;
+  try { v = Number(localStorage.getItem(READING_SCALE_KEY)) || 1; } catch (e) {}
+  if (!(v >= 0.85 && v <= 1.5)) v = 1;
+  return Math.round(v * 100) / 100;
+}
+function applyReadingScale(scale) {
+  var v = (scale === undefined) ? getReadingScale() : scale;
+  v = Math.max(0.85, Math.min(1.5, Number(v) || 1));
+  v = Math.round(v * 100) / 100;
+  try { document.documentElement.style.setProperty('--reading-scale', String(v)); } catch (e) {}
+  return v;
+}
+function setReadingScale(scale) {
+  var v = applyReadingScale(scale);
+  try { localStorage.setItem(READING_SCALE_KEY, String(v)); } catch (e) {}
+  return v;
+}
+
 function svgIcon(name, size) {
   size = size || 18;
   var s = 'width="' + size + '" height="' + size + '"';
@@ -169,6 +198,10 @@ function svgIcon(name, size) {
     doc: '<svg ' + s + ' ' + c + '><path d="M7 3h7l4 4v14H7z"/><path d="M14 3v4h4M9.5 12h5M9.5 15h5"/></svg>',
     top: '<svg ' + s + ' ' + c + '><path d="M12 20V6"/><path d="M6 11.5 12 5.5l6 6"/></svg>',
     'arrow-left': '<svg ' + s + ' ' + c + '><path d="M19 12H5M11 6l-6 6 6 6"/></svg>',
+    chevron: '<svg ' + s + ' ' + c + '><path d="M6 9.5l6 6 6-6"/></svg>',
+    plus: '<svg ' + s + ' ' + c + '><path d="M12 5.2v13.6M5.2 12h13.6"/></svg>',
+    grip: '<svg ' + s + ' ' + c + '><circle cx="9" cy="6" r="1.4"/><circle cx="15" cy="6" r="1.4"/><circle cx="9" cy="12" r="1.4"/><circle cx="15" cy="12" r="1.4"/><circle cx="9" cy="18" r="1.4"/><circle cx="15" cy="18" r="1.4"/></svg>',
+    layers: '<svg ' + s + ' ' + c + '><path d="M12 3.2l8.6 4.6-8.6 4.6-8.6-4.6L12 3.2z"/><path d="M3.4 12.4l8.6 4.6 8.6-4.6"/><path d="M3.4 16.6l8.6 4.6 8.6-4.6"/></svg>',
     pen: '<svg ' + s + ' ' + c + '><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>',
     logout: '<svg ' + s + ' ' + c + '><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5M21 12H9"/></svg>',
     trash: '<svg ' + s + ' ' + c + '><path d="M4 7h16M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/><path d="M6 7l1 13a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1l1-13M10 11v6M14 11v6"/></svg>',
@@ -182,6 +215,7 @@ function svgIcon(name, size) {
     palette: '<svg ' + s + ' ' + c + '><path d="M12 3a9 9 0 1 0 5.4 16.2A2.4 2.4 0 0 0 15.6 17h-.9a2.6 2.6 0 0 1-2.6-2.6c0-1.4 1.1-2.6 2.6-2.6h1.4A3.9 3.9 0 0 0 20.2 8 9 9 0 0 0 12 3z"/><circle cx="7.4" cy="11.3" r="1"/><circle cx="10.6" cy="7.2" r="1"/><circle cx="15.4" cy="8.6" r="1"/></svg>',
     globe: '<svg ' + s + ' ' + c + '><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a15.5 15.5 0 0 1 0 18M12 3a15.5 15.5 0 0 0 0 18"/></svg>',
     spark: '<svg ' + s + ' ' + c + '><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"/><path d="M19 16l.8 2.2L22 19l-2.2.8L19 22l-.8-2.2L16 19l2.2-.8z"/></svg>',
+    star: '<svg ' + s + ' ' + c + '><path d="M12 3.4l2.6 5.3 5.8.9-4.2 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8L3.6 9.6l5.8-.9z"/></svg>',
     copy: '<svg ' + s + ' ' + c + '><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>',
     music: '<svg ' + s + ' ' + c + '><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>',
     play: '<svg ' + s + ' ' + c + '><path d="M7 4.5v15l13-7.5z"/></svg>',
@@ -192,6 +226,7 @@ function svgIcon(name, size) {
     gauge: '<svg ' + s + ' ' + c + '><path d="M4.5 17.5A8.5 8.5 0 1 1 19.5 17.5"/><path d="M12 14.2 16.8 9.4M3 17.5h18"/></svg>',
     sliders: '<svg ' + s + ' ' + c + '><path d="M4 7h9M17 7h3M4 17h3M11 17h9M13 4.5v5M7 14.5v5"/></svg>',
     clock: '<svg ' + s + ' ' + c + '><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2.2"/></svg>',
+    bug: '<svg ' + s + ' ' + c + '><rect x="7" y="8" width="10" height="12" rx="5"/><path d="M9 6.5a3 3 0 0 1 6 0M3.5 11H7M17 11h3.5M3.5 16H7M17 16h3.5"/></svg>',
     refresh: '<svg ' + s + ' ' + c + '><path d="M20 12a8 8 0 1 1-2.5-5.8"/><path d="M20 4v4.5h-4.5"/></svg>'
   };
   return I[name] || '';
@@ -455,8 +490,97 @@ function tokenizeCode(lang, code) {
   return out;
 }
 
+/** 老文章（WordPress 导入）正文预处理：把原始 HTML 残留清理成正常的 Markdown。
+ *  背景：服务端 SSR 用 marked 会原样输出 &nbsp; / <!--more--> / <embed>，但前端接管后用自己的
+ *  渲染器重绘并对文本先做转义，这些标记就变成了字面文字。这里在转义之前把它们还原掉。
+ *  1) 删除 HTML 注释（<!--more--> 等）
+ *  2) 删除 Flash / embed / object 等已无法播放的老插件
+ *  3) 常见块级标签转成换行，老排版标签（font/span/div/p/a/img…）去掉标签本身
+ *  4) 解码 HTML 实体（&nbsp; &amp; &mdash; &#8212; …），让它们成为真正的字符而不是字面量
+ *  注意：只清白名单里的排版类标签；<script> 等其它标签仍按原样转义显示（不执行、不丢失）。 */
+var LEGACY_ENTITIES = {
+  nbsp: '\u00a0', ensp: '\u2002', emsp: '\u2003', thinsp: '\u2009',
+  amp: '&', lt: '<', gt: '>', quot: '"', apos: "'",
+  hellip: '\u2026', mdash: '\u2014', ndash: '\u2013', minus: '\u2212',
+  lsquo: '\u2018', rsquo: '\u2019', ldquo: '\u201c', rdquo: '\u201d',
+  laquo: '\u00ab', raquo: '\u00bb', middot: '\u00b7', bull: '\u2022',
+  copy: '\u00a9', reg: '\u00ae', trade: '\u2122', sect: '\u00a7', para: '\u00b6',
+  deg: '\u00b0', plusmn: '\u00b1', times: '\u00d7', divide: '\u00f7',
+  euro: '\u20ac', pound: '\u00a3', yen: '\u00a5', cent: '\u00a2',
+  dagger: '\u2020', Dagger: '\u2021', permil: '\u2030',
+  larr: '\u2190', rarr: '\u2192', harr: '\u2194',
+  ne: '\u2260', le: '\u2264', ge: '\u2265',
+  frac12: '\u00bd', frac14: '\u00bc', frac34: '\u00be',
+  sup2: '\u00b2', sup3: '\u00b3', micro: '\u00b5', shy: '\u00ad',
+  lrm: '\u200e', rlm: '\u200f', zwnj: '\u200c', zwj: '\u200d',
+  Agrave: '\u00c0', Aacute: '\u00c1', Acirc: '\u00c2', Atilde: '\u00c3',
+  Egrave: '\u00c8', Eacute: '\u00c9', Ecirc: '\u00ca', Ccedil: '\u00c7',
+  Oslash: '\u00d8', Uuml: '\u00dc', szlig: '\u00df',
+  aacute: '\u00e0', eacute: '\u00e9', egrave: '\u00e8', ccedil: '\u00e7',
+  igrave: '\u00ec', ocirc: '\u00f2', uuml: '\u00fc', agrave: '\u00e0',
+  alpha: '\u03b1', beta: '\u03b2', gamma: '\u03b3', delta: '\u03b4',
+  lambda: '\u03bb', mu: '\u03bc', pi: '\u03c0', sigma: '\u03c3',
+  theta: '\u03b8', omega: '\u03c9', infin: '\u221e',
+  star: '\u2605', check: '\u2713', cross: '\u2717'
+};
+
+function decodeHtmlEntities(t) {
+  var out = String(t == null ? '' : t);
+  out = out.replace(/&#x([0-9a-fA-F]+);/g, function (m, h) {
+    var n = parseInt(h, 16);
+    return (n > 0 && n <= 0x10ffff && !(n >= 0xd800 && n <= 0xdfff)) ? String.fromCodePoint(n) : m;
+  });
+  out = out.replace(/&#(\d+);/g, function (m, d) {
+    var n = parseInt(d, 10);
+    return (n > 0 && n <= 0x10ffff && !(n >= 0xd800 && n <= 0xdfff)) ? String.fromCodePoint(n) : m;
+  });
+  out = out.replace(/&([a-zA-Z][a-zA-Z0-9]{1,31});/g, function (m, name) {
+    var v = LEGACY_ENTITIES[name];
+    return v === undefined ? m : v;
+  });
+  // 少数不带分号的写法（WordPress 导出常见）
+  out = out.replace(/&nbsp(?![a-zA-Z0-9])/g, '\u00a0')
+           .replace(/&amp(?![a-zA-Z0-9])/g, '&')
+           .replace(/&lt(?![a-zA-Z0-9])/g, '<')
+           .replace(/&gt(?![a-zA-Z0-9])/g, '>')
+           .replace(/&quot(?![a-zA-Z0-9])/g, '"');
+  return out;
+}
+
+function preprocessLegacyHtml(md) {
+  var t = String(md == null ? '' : md);
+  // 1) HTML 注释：<!--more--> 等
+  t = t.replace(/<!--[\s\S]*?-->/g, '');
+  t = t.replace(/<!--[\s\S]*$/, '');
+  // 2) Flash / embed / object / applet：早已无法播放，直接移除整块
+  t = t.replace(/<(embed|object|applet)\b[\s\S]*?<\/\1\s*>/gi, '');
+  t = t.replace(/<(embed|object|applet)\b[^>]*\/?>/gi, '');
+  // 3) 块级标签 -> 空行；<br> -> 硬换行
+  t = t.replace(/<\s*br\s*\/?>/gi, '  \n');
+  t = t.replace(/<\s*\/?\s*(p|div|section|article|h[1-6]|ul|ol|li|tr|table|blockquote|pre)\b[^>]*>/gi, '\n\n');
+  // 4) 老文章里常见的排版标签（font/span/div/p/a/img…）：渲染器本来一律转义，直接去掉标签本身；
+  //    只清白名单里的排版类标签，<script> 等其它标签仍按原样转义显示（不执行、不丢失）
+  t = t.replace(/<\/?\s*(?:font|span|div|p|br|hr|center|small|big|u|s|strike|del|sup|sub|i|b|em|strong|code|pre|blockquote|ul|ol|li|dl|dt|dd|table|thead|tbody|tfoot|tr|td|th|caption|h1|h2|h3|h4|h5|h6|section|article|aside|header|footer|nav|figure|figcaption|a|img|map|area|embed|object|applet|param|iframe|audio|video|source|track|marquee|blink|basefont|xml|form|input|button|select|textarea|label|noscript)\b[^<>]*>/gi, '');
+  // 5) 实体解码（必须在 esc 之前，否则 &nbsp; 会变成可见的“&nbsp;”文字）
+  t = decodeHtmlEntities(t);
+  // 6) 收拾空白
+  t = t.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n');
+  return t;
+}
+
+/** 同上，但先摘出围栏代码块：示例代码里的 HTML 不能被"老文章清理"改写 */
+function preprocessLegacyMarkdown(md) {
+  var src = String(md == null ? '' : md);
+  var parts = src.split(/(```[\s\S]*?```)/g);
+  for (var i = 0; i < parts.length; i++) {
+    if (i % 2 === 1) continue;          // 奇数段是代码块本身
+    parts[i] = preprocessLegacyHtml(parts[i]);
+  }
+  return parts.join('');
+}
+
 function renderMarkdown(md) {
-  var src = String(md || '');
+  var src = preprocessLegacyMarkdown(md);
   var tocCount = 0;
   var lines = src.split(/\r?\n/);
   var html = '';
@@ -675,6 +799,187 @@ function updateReadingProgress() {
   bar.style.transform = 'scaleX(' + progress + ')';
 }
 
+/* ---------- 正文划线高亮（本机保存，按文章独立） ---------- */
+var HL_KEY = 'qingyu.highlights';
+function hlStore() {
+  try { return JSON.parse(localStorage.getItem(HL_KEY) || '{}') || {}; } catch (e) { return {}; }
+}
+function hlNorm(item) {
+  if (typeof item === 'string') return { t: item, n: '' };
+  if (item && typeof item.t === 'string') return { t: item.t, n: String(item.n || '') };
+  return null;
+}
+function hlList(id) {
+  var all = hlStore();
+  var raw = Array.isArray(all[id]) ? all[id] : [];
+  return raw.map(hlNorm).filter(Boolean);
+}
+function hlSave(id, list) {
+  try {
+    var all = hlStore();
+    if (list && list.length) all[id] = list; else delete all[id];
+    localStorage.setItem(HL_KEY, JSON.stringify(all));
+  } catch (e) {}
+}
+function applyHighlights(root, list) {
+  if (!root || !list || !list.length || !document.createTreeWalker) return;
+  list.forEach(function (rawItem) {
+    var item = hlNorm(rawItem) || {};
+    var text = item.t;
+    if (!text) return;
+    var walker = document.createTreeWalker(root, 3, null);
+    var node;
+    while ((node = walker.nextNode())) {
+      var parent = node.parentNode;
+      if (parent && parent.classList && parent.classList.contains('hl')) continue;
+      var idx = String(node.nodeValue || '').indexOf(text);
+      if (idx < 0) continue;
+      var range = document.createRange();
+      try {
+        range.setStart(node, idx);
+        range.setEnd(node, idx + text.length);
+        var mark = document.createElement('mark');
+        mark.className = 'hl';
+        if (item.n) { mark.setAttribute('data-note', item.n); mark.title = item.n; }
+        range.surroundContents(mark);
+      } catch (e) {}
+      break;
+    }
+  });
+}
+function clearHighlights(root) {
+  if (!root || !root.querySelectorAll) return;
+  root.querySelectorAll('mark.hl').forEach(function (m) {
+    var parent = m.parentNode;
+    if (!parent) return;
+    while (m.firstChild) parent.insertBefore(m.firstChild, m);
+    parent.removeChild(m);
+    if (parent.normalize) parent.normalize();
+  });
+}
+
+/* ---------- 阅读位置记忆（每篇文章各自记忆，最多保留 50 篇 / 30 天） ---------- */
+var READ_POS_KEY = 'qingyu.readPos';
+/* 站内路由（SPA）跳转标记：用于区分「刷新 / 直接打开」与「点击链接跳转」，
+ * 只有前者才恢复上次阅读位置，点「上一篇 / 下一篇」时一律从文章开头开始读。 */
+var _spaNav = false;
+/* toast：站内轻提示。全局兜底实现，避免任何调用点因 toast 未定义而中断页面渲染。 */
+if (typeof window.toast !== 'function') {
+  window.toast = function (msg, kind) {
+    try {
+      var wrap = document.querySelector('.toast-wrap');
+      if (!wrap) {
+        wrap = document.createElement('div');
+        wrap.className = 'toast-wrap';
+        document.body.appendChild(wrap);
+      }
+      var el = document.createElement('div');
+      el.className = 'toast-item' + (kind ? ' toast-' + kind : '');
+      el.textContent = String(msg == null ? '' : msg);
+      wrap.appendChild(el);
+      setTimeout(function () {
+        if (el.parentNode) el.parentNode.removeChild(el);
+      }, 2200);
+    } catch (e) {}
+  };
+}
+var _readPosCurrent = null;
+var _readPosTimer = null;
+function readPositions() {
+  try { return JSON.parse(localStorage.getItem(READ_POS_KEY) || '{}') || {}; } catch (e) { return {}; }
+}
+function saveReadPos(id, y) {
+  if (!id) return;
+  try {
+    var all = readPositions();
+    all[id] = { y: Math.max(0, Math.round(Number(y) || 0)), at: Date.now() };
+    var keys = Object.keys(all);
+    if (keys.length > 50) {
+      keys.sort(function (a, b) { return (all[a].at || 0) - (all[b].at || 0); });
+      keys.slice(0, keys.length - 50).forEach(function (k) { delete all[k]; });
+    }
+    localStorage.setItem(READ_POS_KEY, JSON.stringify(all));
+  } catch (e) {}
+}
+function getReadPos(id) {
+  var v = readPositions()[id];
+  if (!v) return 0;
+  if (Date.now() - (Number(v.at) || 0) > 30 * 86400000) return 0;
+  return Number(v.y) || 0;
+}
+function clearReadPos(id) {
+  try { var all = readPositions(); delete all[id]; localStorage.setItem(READ_POS_KEY, JSON.stringify(all)); } catch (e) {}
+}
+/** 滚动节流保存；滚过正文底部视为「已读完」并清除记录 */
+function readPosTick() {
+  var id = _readPosCurrent;
+  if (!id) return;
+  var y = (typeof window !== 'undefined' && typeof window.scrollY === 'number') ? window.scrollY : 0;
+  var article = document.querySelector('.article');
+  if (article && article.getBoundingClientRect) {
+    var rect = article.getBoundingClientRect();
+    if (rect.bottom && rect.bottom < 80) { clearReadPos(id); return; }
+  }
+  saveReadPos(id, y);
+}
+function bindReadPos() {
+  if (typeof window === 'undefined' || window.__readPosBound) return;
+  window.__readPosBound = true;
+  window.addEventListener('scroll', function () {
+    if (_readPosTimer) return;
+    _readPosTimer = setTimeout(function () { _readPosTimer = null; readPosTick(); }, 500);
+  }, { passive: true });
+  window.addEventListener('beforeunload', readPosTick);
+}
+
+/* ---------- reading history / read-later (localStorage) ---------- */
+var HISTORY_KEY = 'qingyu.history';
+var LATER_KEY = 'qingyu.later';
+function _lsArr(k){try{var a=JSON.parse(localStorage.getItem(k)||'[]');return Array.isArray(a)?a:[]}catch(e){return[]}}
+function _lsSet(k,a){try{localStorage.setItem(k,JSON.stringify(a||[]))}catch(e){}}
+function historyList(){return _lsArr(HISTORY_KEY)}
+function historyRecord(post){
+  if(!post||!post.id)return;
+  var l=historyList().filter(function(x){return String(x.id)!==String(post.id)});
+  l.unshift({id:post.id,title:post.title||'',date:post.date||'',at:Date.now()});
+  _lsSet(HISTORY_KEY,l.slice(0,100));
+}
+function historyClear(){_lsSet(HISTORY_KEY,[])}
+function laterList(){return _lsArr(LATER_KEY)}
+function isLater(id){return laterList().some(function(x){return String(x.id)===String(id)})}
+function toggleLater(post){
+  var l=laterList();
+  var has=l.some(function(x){return String(x.id)===String(post.id)});
+  if(has)l=l.filter(function(x){return String(x.id)!==String(post.id)});
+  else l.unshift({id:post.id,title:post.title||'',date:post.date||'',at:Date.now()});
+  _lsSet(LATER_KEY,l);
+  return !has;
+}
+
+/* ---------- 文章加密（AES-GCM + PBKDF2，纯前端） ---------- */
+var PF_ITER = 100000;
+function _u8ToB64(u8) { var s = ''; for (var i = 0; i < u8.length; i++) { s += String.fromCharCode(u8[i]); } return btoa(s); }
+function _b64ToU8(b64) { var s = atob(b64); var u8 = new Uint8Array(s.length); for (var i = 0; i < s.length; i++) { u8[i] = s.charCodeAt(i); } return u8; }
+async function pfDeriveKey(password, salt, iter) {
+  var base = await crypto.subtle.importKey('raw', new TextEncoder().encode(String(password)), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey({ name: 'PBKDF2', salt: salt, iterations: iter, hash: 'SHA-256' }, base, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+}
+async function pfEncrypt(text, password) {
+  var salt = crypto.getRandomValues(new Uint8Array(16));
+  var iv = crypto.getRandomValues(new Uint8Array(12));
+  var key = await pfDeriveKey(password, salt, PF_ITER);
+  var ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, key, new TextEncoder().encode(String(text)));
+  return { v: 1, alg: 'AES-GCM', kdf: 'PBKDF2-SHA256', iter: PF_ITER, salt: _u8ToB64(salt), iv: _u8ToB64(iv), data: _u8ToB64(new Uint8Array(ct)) };
+}
+async function pfDecrypt(encObj, password) {
+  if (!encObj || !encObj.data || !encObj.salt || !encObj.iv) throw new Error('bad-format');
+  var key = await pfDeriveKey(password, _b64ToU8(encObj.salt), Number(encObj.iter) || PF_ITER);
+  var pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: _b64ToU8(encObj.iv) }, key, _b64ToU8(encObj.data));
+  return new TextDecoder().decode(pt);
+}
+window.pfEncrypt = pfEncrypt;
+window.pfDecrypt = pfDecrypt;
+
 function updateTocActive() {
   var links = document.querySelectorAll('a[data-toc]');
   if (!links || !links.length) return;
@@ -814,23 +1119,64 @@ function getConfig() {
   var footer = cfg.footer || {};
   if (siteInfo.copyright) footer = Object.assign({}, footer, { copyrightName: siteInfo.copyright });
   if (siteInfo.footerText) footer = Object.assign({}, footer, { decl: siteInfo.footerText });
+  // 后台「功能开关」保存的运行时配置（site_settings.features）：首页分页 / 广告位
+  // 覆盖 config.js 的默认值，站长无需改代码即可开关。
+  var features = (s && s.features != null) ? parseJsonSafe(s.features) : {};
+  var featAds = (features && typeof features.ads === 'object' && features.ads) ? features.ads : {};
+  var ads = Object.assign({}, cfg.ads || {}, featAds);
+  var featPageSize = (features && features.pageSize != null && Number(features.pageSize) >= 0) ? Math.floor(Number(features.pageSize)) : null;
   return {
     mode: cfg.mode || 'auto',
     apiBase: cfg.apiBase || '',
     siteUrl: cfg.siteUrl || (typeof location !== 'undefined' ? location.origin : ''),
     writeToken: cfg.writeToken || '',
     adminPwd: cfg.adminPwd || '',
-    pageSize: (typeof cfg.pageSize === 'number' && cfg.pageSize >= 0) ? cfg.pageSize : 8,
+    pageSize: (featPageSize != null) ? featPageSize : ((typeof cfg.pageSize === 'number' && cfg.pageSize >= 0) ? cfg.pageSize : 8),
     nav: parseArrSafe(s && s.nav_menu),
+    // 后台「功能开关 → 首页显示的标签」：站长自选标签白名单，为空则显示全部
+    homeTags: (function () {
+      var cloudTags = parseArrSafe(s && s.home_tags);
+      return (cloudTags.length ? cloudTags : parseArrSafe(cfg.homeTags))
+        .map(function (x) { return String(x).trim(); }).filter(Boolean);
+    })(),
+    navDefaultsVersion: Number((s && s.nav_defaults_version) || 0),
     footerNav: parseArrSafe(s && s.footer_nav),
     friendLinks: parseArrSafe(s && s.friend_links),
     footer: footer,
     site: siteInfo,        // 站点信息（头像/名称/简介）供关于页等使用
+    homeTheme: siteInfo.homeTheme === 'magazine' ? 'magazine' : 'classic',
     profile: prof,         // 个人信息（头像/昵称/简介/邮箱）供关于页等使用
-    ads: cfg.ads || {}
+    features: features,    // 后台「功能开关」的原始配置（供错误上报等读取）
+    ads: ads
   };
 }
 
+// 阅读工具栏开关：后台「功能开关」可分别隐藏 正文字号 / 划线高亮 / 收藏（稍后读）。
+// 未设置时默认全部开启（向后兼容）。
+function readingFontEnabled() {
+  var f = getConfig().features || {};
+  return f.readingFont !== false;
+}
+function highlightToolsEnabled() {
+  var f = getConfig().features || {};
+  return f.highlight !== false;
+}
+function bookmarkEnabled() {
+  var f = getConfig().features || {};
+  return f.bookmark !== false;
+}
+// 音乐播放器开关：后台「功能开关 → 音乐播放器」关闭后，右下角悬浮播放器不再出现
+// （不构建 DOM、不发 /api/music 请求、不注册任何事件）。未设置时默认开启（向后兼容）。
+function musicPlayerEnabled() {
+  var f = getConfig().features || {};
+  return f.musicPlayer !== false;
+}
+// 「功能开关」就绪广播：music-player.js 是独立模块，拿不到 getConfig 内部的 _siteSettings，
+// 因此设置落地后广播一次，播放器据此决定是否加载（配合 window.__qyFeaturesReady 供晚到者查询）。
+function notifyFeaturesReady() {
+  try { window.__qyFeaturesReady = true; } catch (e) {}
+  try { window.dispatchEvent(new CustomEvent('qy:features')); } catch (e) {}
+}
 // 站点名称：优先使用云端「站点基础信息 → 站点名称」，其次页脚版权署名，
 // 最后回退到 i18n 默认（site.title）。改完站点名称后，左上角品牌、
 // 浏览器标签页标题、页脚署名、OG/结构化数据都会实时跟随变化。
@@ -903,15 +1249,20 @@ async function apiFetch(url, opts) {
     // 优先透传后端返回的 error 文案（如「请勿重复发送相同内容」「评论太频繁」），
     // 便于用户直接理解失败原因；解析失败再退回 HTTP 状态码。
     var msg = 'HTTP ' + res.status;
+    var payload = null;
     try {
-      var j = await res.json();
-      if (j && j.error) msg = String(j.error);
+      payload = await res.json();
+      if (payload && payload.error) msg = String(payload.error);
     } catch (e) { /* 非 JSON 响应体，保留状态码提示 */ }
     var e401 = new Error(msg);
     e401.status = res.status;
-    // 全局会话失效处理：401 且非登录/首次设密端点 → 自动退出登录状态。
-    // 抛给调用方的同时派发事件，让当前 SPA（后台/前台编辑器）主动跳转或提示。
-    if (res.status === 401 && !/api\/admin\/(login|setup)/.test(String(url))) {
+    e401.code = (payload && payload.code) || '';
+    // 强制改密：保留当前会话，由后台展示不可跳过的改密界面。
+    if (res.status === 403 && e401.code === 'PASSWORD_CHANGE_REQUIRED') {
+      _setMustChange(true);
+      try { window.dispatchEvent(new CustomEvent('qy:password-change-required')); } catch (e2) { /* 无 CustomEvent 环境忽略 */ }
+    } else if (res.status === 401 && !/api\/admin\/(login|setup|password)/.test(String(url))) {
+      // 401 = 会话过期/清除；改密接口的 401 是「当前密码错误」，不能误退登录。
       handleSessionExpired(e401);
     }
     throw e401;
@@ -923,8 +1274,11 @@ async function apiFetch(url, opts) {
  * 仅当本地确实持有会话时才处理，避免「未登录访问公开接口被 401」误触发。 */
 function handleSessionExpired(err) {
   var had = !!_sessionToken();
+  resetAdminVerified();
   _setSessionToken('');
   _setAdminSession(false);
+  _setMustChange(false);
+  _setInitialAdminPwd('');
   if (!had) return;
   try {
     window.dispatchEvent(new CustomEvent('qy:session-expired', { detail: (err && err.status) || 401 }));
@@ -1046,7 +1400,7 @@ async function fetchCloudSearchPage(query, page) {
 }
 function searchResultHtml(post, query) {
   var snip = searchSnippet(post, query);
-  var tags = Array.isArray(post.tags) ? post.tags.join(' · ') : String(post.tags || '');
+  var tags = Array.isArray(post.tags) ? post.tags.join(' / ') : String(post.tags || '');
   var qLow = String(query || '').toLowerCase();
   var tagLine = tags && tags.toLowerCase().indexOf(qLow) >= 0
     ? '<div class="sh-tags">' + highlightQuery(tags, query) + '</div>'
@@ -1153,7 +1507,7 @@ async function loadComments(postId) {
   return arr;
 }
 
-async function saveComment(postId, author, content, parentId) {
+async function saveComment(postId, author, content, parentId, guard) {
   var id = String(postId || '');
   author = String(author || '').trim().slice(0, 30);
   content = String(content || '').trim().slice(0, 1000);
@@ -1164,7 +1518,12 @@ async function saveComment(postId, author, content, parentId) {
     // 由调用方（文章评论 / 留言板）在状态行展示，用户能明确知道为何未发表成功。
     var data = await apiFetch(commentApi(id), {
       method: 'POST',
-      body: JSON.stringify({ author: author, content: content, parent_id: parentId })
+      // 反机器人：蜜罐字段（正常用户不会填）+ 表单渲染时间戳
+      body: JSON.stringify({
+        author: author, content: content, parent_id: parentId,
+        hp: (guard && guard.hp) || '',
+        ts: (guard && guard.ts) || 0
+      })
     });
     var c = (data && data.comment) || null;
     if (c) { try { delete _commentsCache[id]; } catch (e) {} }
@@ -1239,7 +1598,10 @@ async function incView(postId) {
   } catch (e) {}
   if (_cloudOn()) {
     try {
-      var data = await apiFetch(statApi(postId), { method: 'POST', body: JSON.stringify({ action: 'views' }) });
+      // 上报 document.referrer：fetch 的 Referer 头是「本站当前页」，无法反映真实来路
+      var docRef = '';
+      try { docRef = String((typeof document !== 'undefined' && document.referrer) || '').slice(0, 500); } catch (e) { docRef = ''; }
+      var data = await apiFetch(statApi(postId), { method: 'POST', body: JSON.stringify({ action: 'views', ref: docRef }) });
       var s = (data && data.stats) || { views: 0, likes: 0 };
       _statsCache[postId] = s;
       return s;
@@ -1336,7 +1698,7 @@ function loadFeaturedPosts(excludeId) {
     grid.innerHTML = items.map(function (p, idx) {
       return '<div class="featured-card" data-idx="' + idx + '">'
         + '<div class="featured-card-title">' + esc(p.title) + '</div>'
-        + '<div class="featured-card-meta">' + svgIcon('eye', 12) + ' ' + p.views + ' · ' + svgIcon('heart', 12) + ' ' + p.likes + ' · ' + svgIcon('quote', 12) + ' ' + p.comments
+        + '<div class="featured-card-meta">' + svgIcon('eye', 12) + ' ' + p.views + svgIcon('heart', 12) + ' ' + p.likes + svgIcon('quote', 12) + ' ' + p.comments
         + '</div></div>';
     }).join('');
     // 用 div + click 直接跳转
@@ -1374,7 +1736,7 @@ function renderPopularList(items) {
     return;
   }
   box.innerHTML = items.map(function (p, index) {
-    var tags = normalizeTags(p).slice(0, 3).join(' · ');
+    var tags = normalizeTags(p).slice(0, 3).join(' / ');
     return '<a class="popular-card" href="' + esc(href(postUrl(p.id))) + '">'
       + '<span class="popular-rank">' + (index + 1) + '</span>'
       + '<div class="popular-main"><div class="popular-card-title">' + esc(p.title || t('post.untitled')) + '</div>'
@@ -1436,6 +1798,17 @@ function _localPwd() { try { return localStorage.getItem('qingyu.admin.pwd') || 
 function _setLocalPwd(v) { try { localStorage.setItem('qingyu.admin.pwd', String(v)); } catch (e) {} }
 function _adminSession() { try { return localStorage.getItem('qingyu.admin.ok') === '1'; } catch (e) { return false; } }
 function _setAdminSession(v) { try { localStorage.setItem('qingyu.admin.ok', v ? '1' : '0'); } catch (e) {} }
+function _mustChangeRequired() { try { return localStorage.getItem('qingyu.admin.mustChange') === '1'; } catch (e) { return false; } }
+function _setMustChange(v) {
+  try { if (v) localStorage.setItem('qingyu.admin.mustChange', '1'); else localStorage.removeItem('qingyu.admin.mustChange'); } catch (e) {}
+}
+function _initialAdminPwd() { try { return sessionStorage.getItem('qingyu.admin.initialPwd') || ''; } catch (e) { return ''; } }
+function _setInitialAdminPwd(v) {
+  try { if (v) sessionStorage.setItem('qingyu.admin.initialPwd', String(v)); else sessionStorage.removeItem('qingyu.admin.initialPwd'); } catch (e) {}
+}
+window._mustChangeRequired = _mustChangeRequired;
+window._setMustChange = _setMustChange;
+window._initialAdminPwd = _initialAdminPwd;
 /** 简单 SHA-256 哈希（前端 PBKDF2 不需要，用轻量版即可） */
 async function _hashLocalPwd(pwd) {
   var enc = new TextEncoder();
@@ -1459,6 +1832,29 @@ var _cloudReady = false;      // 云端探测是否已完成（成功或失败�
 function needAdminSetup() {
   return !_cfgPwd() && !_localPwd();
 }
+/* 管理员身份“服务端确认”结果（含未请求时的未知）。
+ * adminOk() 只看 localStorage 里有没有 token，token 过期/被撤销后依然返回 true，
+ * 会让游客看到「重新生成」等管理员按钮。这里让服务端真正校验一次。
+ * 结果会记在 sessionStorage，同一会话内只请求一次。 */
+var _adminVerified = null;
+function adminVerified() {
+  if (_adminVerified !== null) return Promise.resolve(_adminVerified);
+  // 本地模式（静态部署且无云端）：只能信本地会话标志
+  if (!_cloudOn()) { _adminVerified = Promise.resolve(_adminSession()); return _adminVerified; }
+  var cached = null;
+  try { var raw = sessionStorage.getItem('qingyu.admin.ok'); if (raw) { var ps = String(raw).split('|'); if (Number(ps[1]) + 600000 > Date.now()) cached = ps[0] === '1'; } } catch (e) {}
+  if (cached !== null) { _adminVerified = Promise.resolve(cached); return _adminVerified; }
+  _adminVerified = apiFetch('api/admin/session', { method: 'GET' })
+    .then(function (d) { return !!(d && d.authed); })
+    .catch(function () { return false; })
+    .then(function (ok) {
+      _adminVerified = Promise.resolve(ok);
+      try { sessionStorage.setItem('qingyu.admin.ok', (ok ? '1' : '0') + '|' + Date.now()); } catch (e) {}
+      return ok;
+    });
+  return _adminVerified;
+}
+function resetAdminVerified() { _adminVerified = null; try { sessionStorage.removeItem('qingyu.admin.ok'); } catch (e) {} }
 function adminOk() {
   // 云端：有会话 token 即视为已登录（有效性由服务端鉴权兜底）
   if (_cloudOn()) return !!_sessionToken();
@@ -1502,7 +1898,10 @@ async function cloudLogin(pwd, setupKey) {
     });
     if (!data || !data.token) return { ok: false, status: 0, message: (data && data.error) || t('admin.loginFail') };
     _setSessionToken(data.token);
+    resetAdminVerified();
     _setAdminSession(true);
+    _setMustChange(!!data.mustChange);
+    if (data.mustChange && data.defaultPassword) _setInitialAdminPwd(data.defaultPassword);
     return { ok: true, mustChange: !!data.mustChange, defaultPassword: data.defaultPassword || '' };
   } catch (e) {
     var status = (e && e.status) || 0;
@@ -1517,7 +1916,10 @@ async function cloudLogin(pwd, setupKey) {
 async function cloudLogout() {
   var t = _sessionToken();
   _setSessionToken('');
+  resetAdminVerified();
   _setAdminSession(false);
+  _setMustChange(false);
+  _setInitialAdminPwd('');
   if (_cloudOn() && t) {
     try { await apiFetch('api/admin/logout', { method: 'POST', body: '{}' }); } catch (e) {}
   }
@@ -1539,13 +1941,14 @@ async function cloudSetupAdmin(pwd, setupKey) {
   }
 }
 function adminLogout() {
+  resetAdminVerified();
   if (_cloudOn()) { cloudLogout(); }
   else { _setAdminSession(false); }
 }
 
 /**
  * 首次登录默认密码提示：模态框化、不会自动消失，确保随机默认密码清晰可读、可复制，
- * 避免以前“闪现一下看不清”的问题。用户可选择立刻改密或暂不改密进入后台。
+ * 避免以前“闪现一下看不清”的问题。用户必须先记下默认密码，再进入强制改密页。
  */
 function showFirstLoginPwd(defaultPassword) {
   var pwd = String(defaultPassword || '');
@@ -1556,7 +1959,6 @@ function showFirstLoginPwd(defaultPassword) {
   mask.className = 'flp-mask';
   mask.innerHTML =
     '<div class="flp-modal">'
-    + '<button class="flp-close" data-act="close" aria-label="关闭">✕</button>'
     + '<div class="flp-icon">' + svgIcon('lock', 26) + '</div>'
     + '<h3 class="flp-title">' + t('admin.firstLoginTitle') + '</h3>'
     + '<p class="flp-desc">' + t('admin.firstLoginDesc') + '</p>'
@@ -1566,7 +1968,6 @@ function showFirstLoginPwd(defaultPassword) {
       : '')
     + '<p class="flp-warn">' + t('admin.firstLoginWarn') + '</p>'
     + '<div class="flp-actions">'
-    + '<button class="flp-btn ghost" data-act="later">' + t('admin.firstLoginLater') + '</button>'
     + '<button class="flp-btn primary" data-act="change">' + t('admin.firstLoginChange') + '</button>'
     + '</div></div>';
   document.body.appendChild(mask);
@@ -1593,14 +1994,13 @@ function showFirstLoginPwd(defaultPassword) {
     setTimeout(function () { if (mask.parentNode) mask.parentNode.removeChild(mask); }, 200);
   }
 
-  // 点击遮罩空白处、关闭按钮、暂不修改 → 关闭（保持登录态，进入后台）
+  // 不能从遮罩或关闭按钮绕过；只有「前往修改密码」一个出口。
   function goAdmin() {
     if (typeof navigate === 'function') navigate('/admin'); else { try { location.href = href('/admin'); } catch (e) {} }
   }
   mask.addEventListener('click', function (e) {
     var act = e.target && e.target.getAttribute && e.target.getAttribute('data-act');
-    if (e.target === mask || act === 'close' || act === 'later') { close(); goAdmin(); }
-    else if (act === 'change') { close(); goAdmin(); ensureAdminBundle().then(function () { setTimeout(function () { if (window.QingyuAdmin && window.QingyuAdmin.openPwdModal) window.QingyuAdmin.openPwdModal(); }, 350); }); }
+    if (act === 'change') { close(); goAdmin(); }
   });
 }
 
@@ -1652,6 +2052,7 @@ function buildPostsJs() {
       pinned: !!d.pinned,
       protected: !!d.protected,
       enc: d.protected ? (d.enc || null) : null,
+      seo: d.seo || {},
       content: d.content || ''
     };
     if (idx >= 0) all[idx] = item; else all.push(item);
@@ -1738,19 +2139,114 @@ function app() { return document.querySelector('#app'); }
   var NAV = [
     { i18n: 'nav.home',     url: '/',          path: '/' },
     { i18n: 'nav.tags',     url: '/tags',      path: '/tags' },
+    { i18n: 'nav.categories', url: '/categories', path: '/categories' },
+    { i18n: 'nav.history', url: '/history', path: '/history' },
     { i18n: 'nav.series',   url: '/series',    path: '/series' },
     { i18n: 'nav.popular',  url: '/popular',   path: '/popular' },
     { i18n: 'nav.archive',  url: '/archive',   path: '/archive' },
     { i18n: 'nav.guestbook',url: '/guestbook', path: '/guestbook' },
     { i18n: 'nav.about',    url: '/about',     path: '/about' }
   ];
+  // 导航默认项版本：老后台保存的 nav_menu 没有这个版本号时，说明它还是升级前
+  // 的旧导航；首次加载自动补齐当时没有的新默认项，但不会在用户删除后反复加回。
+  var NAV_DEFAULT_VERSION = 1;
+  var NAV_EXTRA_PATHS = { '/history': 1, '/series': 1, '/popular': 1 };
+  function hideExtraNav(items) {
+    return items.filter(function (it) { return !NAV_EXTRA_PATHS[navUrlKey(it)]; });
+  }
 
-  // 前台导航项：优先使用后台「博客设置 → 顶部导航」保存的配置，
-  // 未配置时回退到内置 NAV 默认值，保证样式与原有行为一致。
+  // 「发现」下拉菜单的固定内容：标签 / 历史 / 系列 / 热门。
+  // 「分类」已独立为一级导航入口，不再收纳在这里。
+  // 这里无视旧版 navExtras 隐藏开关：这些入口始终可从二级菜单打开。
+  var SECONDARY_NAV = [
+    { i18n: 'nav.tags',       url: '/tags',       path: '/tags' },
+    { i18n: 'nav.history',    url: '/history',     path: '/history' },
+    { i18n: 'nav.series',     url: '/series',     path: '/series' },
+    { i18n: 'nav.popular',    url: '/popular',    path: '/popular' }
+  ];
+  var SECONDARY_NAV_KEYS = {};
+  SECONDARY_NAV.forEach(function (it) { SECONDARY_NAV_KEYS[navUrlKey(it)] = 1; });
+  function navUrlKey(it) {
+    var u = String((it && it.url) || '/').replace(/^#/, '');
+    if (u.charAt(0) !== '/') return u;
+    return u.replace(/\/+$/, '') || '/';
+  }
+  function mergeNavDefaults(items) {
+    if (!Array.isArray(items) || !items.length) return NAV.slice();
+    var out = items.slice();
+    var order = {};
+    NAV.forEach(function (it, i) { order[navUrlKey(it)] = i; });
+    NAV.forEach(function (def) {
+      var key = navUrlKey(def);
+      var exists = out.some(function (it) { return navUrlKey(it) === key; });
+      if (exists) return;
+      var insertAt = out.length;
+      for (var i = 0; i < out.length; i++) {
+        var curKey = navUrlKey(out[i]);
+        var curOrder = Object.prototype.hasOwnProperty.call(order, curKey) ? order[curKey] : Infinity;
+        if (curOrder > order[key]) { insertAt = i; break; }
+      }
+      out.splice(insertAt, 0, def);
+    });
+    return out;
+  }
+
+  // 前台导航项：优先使用后台「博客设置 → 顶部导航」保存的配置。
+  // 旧数据首次加载会按 NAV_DEFAULT_VERSION 补齐新默认项；版本已同步后，
+  // 用户在后台删除的项目会保持删除，不再被自动加回。
   function navItems() {
     var c = getConfig();
-    if (Array.isArray(c.nav) && c.nav.length) return c.nav;
-    return NAV;
+    var items;
+    if (Array.isArray(c.nav) && c.nav.length) {
+      items = c.navDefaultsVersion < NAV_DEFAULT_VERSION ? mergeNavDefaults(c.nav) : c.nav;
+    } else {
+      items = NAV;
+    }
+    if (c.features && c.features.navExtras === false) items = hideExtraNav(items);
+    return items;
+  }
+
+  // 是否归入「发现」二级下拉：内置四项（按路径识别，兼容旧数据）+ 后台手动标记的项。
+  function isDiscoverItem(it) {
+    if (!it) return false;
+    // 后台显式设为 false 的项（discover:false）一律移出一级导航，即使路径是内置入口
+    if (it.discover === false) return false;
+    return !!SECONDARY_NAV_KEYS[navUrlKey(it)] || !!it.discover;
+  }
+  // 一级导航中移出「发现」下拉里的入口，改由「发现」按钮点击展开。
+  function primaryNavItems() {
+    return navItems().filter(function (it) { return !isDiscoverItem(it); });
+  }
+
+  // 「发现」下拉内容：严格按后台配置里的顺序输出。
+  // 后台拖拽排序即下拉顺序；后台删除的入口不再自动补回；也可加入自定义项（discover:true）。
+  function secondaryNavItems() {
+    var out = [];
+    navItems().forEach(function (it) {
+      if (!isDiscoverItem(it)) return;
+      var key = navUrlKey(it);
+      var def = null;
+      for (var i = 0; i < SECONDARY_NAV.length; i++) {
+        if (navUrlKey(SECONDARY_NAV[i]) === key) { def = SECONDARY_NAV[i]; break; }
+      }
+      if (!def) {
+        // 自定义放进「发现」的项：直接沿用后台配置
+        out.push({ text: it.text || '', url: it.url, path: it.path, i18n: it.i18n, children: it.children });
+        return;
+      }
+      var item = {};
+      Object.keys(def).forEach(function (k) { item[k] = def[k]; });
+      if (it.path) item.path = it.path;
+      if (it.i18n) {
+        item.i18n = it.i18n;
+      } else if (it.text) {
+        delete item.i18n;
+        item.text = it.text;
+      }
+      if (it.children && it.children.length) item.children = it.children;
+      out.push(item);
+    });
+    return out;
   }
 
   // 旧后台保存数据里的默认中文文案：路径命中内置项时，仅当文本为空或等于当初的
@@ -1758,6 +2254,8 @@ function app() { return document.querySelector('#app'); }
   var NAV_DEFAULT_ZH = {
     '/': '首页',
     '/tags': '标签',
+    '/categories': '分类',
+    '/history': '历史',
     '/series': '系列',
     '/popular': '热门',
     '/archive': '归档',
@@ -1799,37 +2297,139 @@ function app() { return document.querySelector('#app'); }
       var i18n = it.i18n || (isDefaultZhText(norm, it.text) ? (defMap[norm] || '') : '');
       var text = (i18n ? t(i18n) : '') || it.text || '';
       var n = { text: text, url: it.url, path: it.path };
+      var isCatParent = navUrlKey(it) === '/categories';
       if (it.children && it.children.length) {
         n.children = it.children.map(function (c) {
           var cNorm = String(c.url || '/').replace(/^#?\//, '/');
           var cI18n = c.i18n || (isDefaultZhText(cNorm, c.text) ? (defMap[cNorm] || '') : '');
-          return { text: (cI18n ? t(cI18n) : '') || c.text || '', url: c.url };
+          var cText = (cI18n ? t(cI18n) : '') || c.text || '';
+          // 分类导航的子项 = 自定义分类：链接自动指向「按该分类筛选」的文章列表（/?category=名称），
+          // 后台只需填写分类名称，无需手写链接
+          var cUrl = isCatParent ? ('/?category=' + encodeURIComponent(String(cText).trim())) : c.url;
+          return { text: cText, url: cUrl };
         });
       }
       return n;
     });
   }
 
+  /* ---------- 自定义分类 ----------
+   * 「分类」导航（/categories）的子菜单 = 自定义分类列表，后台可自由增删改名，不写死。
+   * 每篇文章只属于一个分类；点击分类即按 ?category= 过滤，列表样式与首页一致。 */
+  function categoryNavItem() {
+    var list = resolveNav(navItems());
+    for (var i = 0; i < list.length; i++) {
+      if (navUrlKey(list[i]) === '/categories') return list[i];
+    }
+    return null;
+  }
+  function configuredCategories() {
+    var it = categoryNavItem();
+    if (!it || !it.children || !it.children.length) return null;
+    var seen = {}, out = [];
+    it.children.forEach(function (c) {
+      var n = String(c.text || '').trim();
+      if (n && !seen[n]) { seen[n] = 1; out.push(n); }
+    });
+    return out.length ? out : null;
+  }
+  function categoryCounts() {
+    var counts = {};
+    getPublishedPosts().forEach(function (p) {
+      var c = String(p.category || '').trim();
+      if (c) counts[c] = (counts[c] || 0) + 1;
+    });
+    return counts;
+  }
+  // 分类总表：后台自定义的分类在前，其余历史用过的按字母补在后面
+  function allCategories() {
+    var out = [], seen = {};
+    (configuredCategories() || []).forEach(function (n) { if (!seen[n]) { seen[n] = 1; out.push(n); } });
+    Object.keys(categoryCounts()).sort().forEach(function (n) { if (!seen[n]) { seen[n] = 1; out.push(n); } });
+    return out;
+  }
+
+  // 外链自动补 target="_blank" rel="noopener"
+  function extOf(url) {
+    return url && /^https?:|^\/\//.test(url) ? ' target="_blank" rel="noopener"' : '';
+  }
   function renderNav(active) {
-  var navs = resolveNav(navItems());
+  var navs = resolveNav(primaryNavItems());
+  var secondaryNavs = resolveNav(secondaryNavItems());
+  var secondaryActive = secondaryNavs.some(function (n) {
+    var raw = n.url || '/';
+    var key = n.path || (/^#\//.test(raw) ? raw.slice(1) : (/^\//.test(raw) ? raw : null));
+    return !!key && key === active;
+  });
+
+  // 当前选中的分类（首页按 ?category= 过滤时高亮对应项）
+  var _routeQ = (typeof currentRoute === 'function' ? currentRoute() : null);
+  var activeCategory = String((_routeQ && _routeQ.query && _routeQ.query.category) || '').trim();
+
+  // 二级菜单链接：点击「发现」后展示。带子项的入口（如分类）再挂一层可就地展开的子菜单
+  var secondaryLinks = secondaryNavs.map(function (n) {
+    var raw = n.url || '/';
+    var pathKey = n.path || (/^#\//.test(raw) ? raw.slice(1) : (/^\//.test(raw) ? raw : null));
+    var url = (/^#\//.test(raw)) ? href(raw.slice(1)) : (/^\//.test(raw) ? href(raw) : raw);
+    var cls = (pathKey && pathKey === active) ? 'nav-link active' : 'nav-link';
+    var tgt = url && /^https?:|^\/\//.test(url) ? ' target="_blank" rel="noopener"' : '';
+    if (n.children && n.children.length) {
+      var kids = n.children.map(function (c) {
+        var cRaw = c.url || '/';
+        var cUrl = (/^#\//.test(cRaw)) ? href(cRaw.slice(1)) : (/^\//.test(cRaw) ? href(cRaw) : cRaw);
+        var cTxt = String(c.text || '').trim();
+        var cCls = (cTxt && cTxt === activeCategory) ? 'nav-link active' : 'nav-link';
+        return '<a href="' + esc(cUrl) + '" class="' + cCls + '" role="menuitem">' + esc(c.text || '') + '</a>';
+      }).join('');
+      return '<div class="sub-item-group" data-nav-dropdown>'
+        + '<div class="sub-item-row">'
+        + '<a href="' + esc(url) + '" class="' + cls + '"' + tgt + ' role="menuitem">' + esc(n.text || '') + '</a>'
+        + '<button type="button" class="sub-caret" data-nav-dropdown-trigger="true" aria-label="' + esc(n.text || '') + '" aria-haspopup="true" aria-expanded="false">'
+        + '<span class="nav-caret" aria-hidden="true">' + svgIcon('chevron', 15) + '</span></button>'
+        + '</div>'
+        + '<div class="sub-menu sub-sub-menu" role="menu">' + kids + '</div></div>';
+    }
+    return '<a href="' + esc(url) + '" class="' + cls + '" role="menuitem"' + tgt + '>' + esc(n.text || '') + '</a>';
+  }).join('');
+
   var links = navs.map(function (n) {
     var raw = n.url || '/';
     var pathKey = n.path || (/^#\//.test(raw) ? raw.slice(1) : (/^\//.test(raw) ? raw : null));
     var url = (/^#\//.test(raw)) ? href(raw.slice(1)) : (/^\//.test(raw) ? href(raw) : raw);
     var cls = (pathKey && pathKey === active) ? 'nav-link active' : 'nav-link';
-    var isChildPath = n.children && n.children.length;
-    if (isChildPath) {
+    if (n.children && n.children.length) {
       var kids = n.children.map(function (c) {
         var cRaw = c.url || '/';
         var cUrl = (/^#\//.test(cRaw)) ? href(cRaw.slice(1)) : (/^\//.test(cRaw) ? href(cRaw) : cRaw);
-        var tgt = cUrl && /^https?:|^\/\//.test(cUrl) ? ' target="_blank" rel="noopener"' : '';
-        return '<a href="' + esc(cUrl) + '" class="nav-link"' + tgt + '>' + esc(c.text || '') + '</a>';
+        var cTgt = cUrl && /^https?:|^\/\//.test(cUrl) ? ' target="_blank" rel="noopener"' : '';
+        return '<a href="' + esc(cUrl) + '" class="nav-link"' + cTgt + ' role="menuitem">' + esc(c.text || '') + '</a>';
       }).join('');
-      return '<div class="nav-item has-sub"><a href="' + esc(url) + '" class="' + cls + '">' + esc(n.text || '') + '</a><div class="sub-menu">' + kids + '</div></div>';
+      // 主链接保留跳转能力（点标题直达该页），右侧箭头单独负责展开下拉
+      return '<div class="nav-item has-sub click-dropdown" data-nav-dropdown>' +
+        '<a href="' + esc(url) + '" class="' + cls + '"' + extOf(url)
+        + ' data-nav-dropdown-trigger="true" aria-haspopup="true" aria-expanded="false">' + esc(n.text || '') + '</a>' +
+        '<button type="button" class="nav-sub-caret" data-nav-dropdown-trigger="true"' +
+        ' aria-label="' + esc(n.text || '') + '" aria-haspopup="true" aria-expanded="false">' +
+        '<span class="nav-caret" aria-hidden="true">' + svgIcon('chevron', 15) + '</span></button>' +
+        '<div class="sub-menu" role="menu">' + kids + '</div></div>';
     }
     var ext = url && /^https?:|^\/\//.test(url) ? ' target="_blank" rel="noopener"' : '';
     return '<div class="nav-item"><a href="' + esc(url) + '" class="' + cls + '"' + ext + '>' + esc(n.text || '') + '</a></div>';
-  }).join('');
+  });
+
+  // 「发现」入口：button 负责点击展开/收起，本身不触发页面跳转
+  var dropdownHtml = secondaryNavs.length ? '<div class="nav-item has-sub click-dropdown" data-nav-dropdown>'
+    + '<button type="button" class="nav-link nav-dropdown-trigger' + (secondaryActive ? ' active' : '') + '"'
+    + ' data-nav-dropdown-trigger="true" aria-haspopup="true" aria-expanded="false" aria-controls="navExploreMenu">'
+    + esc(t('nav.explore')) + '<span class="nav-caret" aria-hidden="true">' + svgIcon('chevron', 15) + '</span></button>'
+    + '<div class="sub-menu" id="navExploreMenu" role="menu">' + secondaryLinks + '</div></div>' : '';
+  var insertAt = 0;
+  for (var pi = 0; pi < navs.length; pi++) {
+    var pRaw = navs[pi].url || '/';
+    var pKey = navs[pi].path || (/^#\//.test(pRaw) ? pRaw.slice(1) : (/^\//.test(pRaw) ? pRaw : null));
+    if (pKey === '/') { insertAt = pi + 1; break; }
+  }
+  if (dropdownHtml) links.splice(insertAt, 0, dropdownHtml);
 
   var langSwitch = '<div class="lang-wrap" id="langWrap" role="group" aria-label="' + langTitle() + '">'
     + '<button class="icon-btn" id="langToggle" aria-label="' + langTitle() + '" title="' + langTitle() + '" aria-haspopup="listbox" aria-controls="langPop" aria-expanded="false">' + svgIcon('globe', 18) + '</button>'
@@ -1850,15 +2450,67 @@ function app() { return document.querySelector('#app'); }
   var bgAnimBtn = '<button class="icon-btn" id="bgAnimToggle" aria-pressed="' + (bgAnimOn ? 'true' : 'false') + '" aria-label="' + t('bgAnim.title') + '" title="' + (bgAnimOn ? t('bgAnim.on') : t('bgAnim.off')) + '">' + svgIcon('spark', 18) + '</button>';
   var hamburger = '<button class="hamburger-btn" id="hamburgerBtn" aria-label="' + t('nav.toggle') + '"><span></span><span></span><span></span></button>';
 
-  // 侧边栏导航项（移动端用）
-  var sidebarLinks = navs.map(function (n) {
+  // 侧边栏同样采用点击展开的二级菜单（移动端没有桌面顶栏）
+  var sidebarPrimary = navs.map(function (n) {
     var raw = n.url || '/';
     var pathKey = n.path || (/^#\//.test(raw) ? raw.slice(1) : (/^\//.test(raw) ? raw : null));
     var url = (/^#\//.test(raw)) ? href(raw.slice(1)) : (/^\//.test(raw) ? href(raw) : raw);
     var cls = (pathKey && pathKey === active) ? 'sidebar-link active' : 'sidebar-link';
-    var ext = url && /^https?:|^\/\//.test(url) ? ' target="_blank" rel="noopener"' : '';
+    var ext = extOf(url);
+    if (n.children && n.children.length) {
+      var kids = n.children.map(function (c) {
+        var cRaw = c.url || '/';
+        var cUrl = (/^#\//.test(cRaw)) ? href(cRaw.slice(1)) : (/^\//.test(cRaw) ? href(cRaw) : cRaw);
+        return '<a href="' + esc(cUrl) + '" class="sidebar-link sidebar-child"' + extOf(cUrl) + '>' + esc(c.text || '') + '</a>';
+      }).join('');
+      return '<div class="sidebar-nav-group" data-nav-dropdown>' +
+        '<div class="sidebar-link-row">' +
+        '<a href="' + esc(url) + '" class="' + cls + '"' + ext
+        + ' data-nav-dropdown-trigger="true" aria-haspopup="true" aria-expanded="false">' + esc(n.text || '') + '</a>' +
+        '<button type="button" class="sidebar-sub-caret" data-nav-dropdown-trigger="true"' +
+        ' aria-label="' + esc(n.text || '') + '" aria-haspopup="true" aria-expanded="false">' +
+        '<span class="nav-caret" aria-hidden="true">' + svgIcon('chevron', 15) + '</span></button>' +
+        '</div><div class="sidebar-submenu">' + kids + '</div></div>';
+    }
     return '<a href="' + esc(url) + '" class="' + cls + '"' + ext + '>' + esc(n.text || '') + '</a>';
+  });
+  var sidebarSecondary = secondaryNavs.map(function (n) {
+    var raw = n.url || '/';
+    var pathKey = n.path || (/^#\//.test(raw) ? raw.slice(1) : (/^\//.test(raw) ? raw : null));
+    var url = (/^#\//.test(raw)) ? href(raw.slice(1)) : (/^\//.test(raw) ? href(raw) : raw);
+    var cls = (pathKey && pathKey === active) ? 'sidebar-link sidebar-child active' : 'sidebar-link sidebar-child';
+    if (n.children && n.children.length) {
+      var kids = n.children.map(function (c) {
+        var cRaw = c.url || '/';
+        var cUrl = (/^#\//.test(cRaw)) ? href(cRaw.slice(1)) : (/^\//.test(cRaw) ? href(cRaw) : cRaw);
+        var cTxt = String(c.text || '').trim();
+        var cCls = (cTxt && cTxt === activeCategory) ? 'sidebar-link sidebar-child active' : 'sidebar-link sidebar-child';
+        return '<a href="' + esc(cUrl) + '" class="' + cCls + '">' + esc(c.text || '') + '</a>';
+      }).join('');
+      return '<div class="sidebar-nav-group" data-nav-dropdown>'
+        + '<div class="sidebar-link-row">'
+        + '<a href="' + esc(url) + '" class="' + cls + '"'
+        + ' data-nav-dropdown-trigger="true" aria-haspopup="true" aria-expanded="false">' + esc(n.text || '') + '</a>'
+        + '<button type="button" class="sidebar-sub-caret" data-nav-dropdown-trigger="true" aria-label="' + esc(n.text || '') + '" aria-haspopup="true" aria-expanded="false">'
+        + '<span class="nav-caret" aria-hidden="true">' + svgIcon('chevron', 15) + '</span></button>'
+        + '</div><div class="sidebar-submenu">' + kids + '</div></div>';
+    }
+    return '<a href="' + esc(url) + '" class="' + cls + '">' + esc(n.text || '') + '</a>';
   }).join('');
+  var sidebarGroup = '<div class="sidebar-nav-group' + (secondaryActive ? ' has-active' : '') + '" data-nav-dropdown>'
+    + '<button type="button" class="sidebar-link sidebar-dropdown-trigger' + (secondaryActive ? ' active' : '') + '"'
+    + ' data-nav-dropdown-trigger="true" aria-haspopup="true" aria-expanded="false" aria-controls="sidebarExploreMenu">'
+    + '<span>' + esc(t('nav.explore')) + '</span><span class="nav-caret" aria-hidden="true">' + svgIcon('chevron', 15) + '</span></button>'
+    + '<div class="sidebar-submenu" id="sidebarExploreMenu">' + sidebarSecondary + '</div></div>';
+  var sidebarInsert = 0;
+  for (var si = 0; si < navs.length; si++) {
+    var sRaw = navs[si].url || '/';
+    var sKey = navs[si].path || (/^#\//.test(sRaw) ? sRaw.slice(1) : (/^\//.test(sRaw) ? sRaw : null));
+    if (sKey === '/') { sidebarInsert = si + 1; break; }
+  }
+  // 「发现」下拉没有任何内容时不渲染（避免出现点开是空的菜单）
+  if (secondaryNavs.length) sidebarPrimary.splice(sidebarInsert, 0, sidebarGroup);
+  var sidebarLinks = sidebarPrimary.join('');
 
   // 侧栏：品牌名 + 主题切换 + 导航链接 + 语言切换
   var sidebar = '<div class="sidebar-overlay" id="sidebarOverlay"></div>'
@@ -1888,12 +2540,49 @@ function app() { return document.querySelector('#app'); }
     + '<header class="topbar' + (active && _searchOpen ? ' searching' : '') + '">'
     + '<div class="container topbar-inner">'
     + '<div class="topbar-left">' + hamburger + '<a class="brand" href="' + esc(href('/')) + '">' + getSiteName() + '</a></div>'
-    + '<nav class="main-nav">' + links + '</nav>'
+    + '<nav class="main-nav">' + links.join('') + '</nav>'
     + '<div class="topbar-actions">' + searchBtn + langSwitch + accentSwitch + bgAnimBtn + themeBtn + '</div>'
     + searchForm
     + '</div>'
     + '<div class="search-panel" id="searchPanel"></div>'
-    + '</header>';
+    + '</header>'
+    + renderAnnounce();
+}
+
+var _announceBound = false;
+/** 站点公告栏：后台「站点信息」开启后在顶栏下方展示，访客可关闭（本地记住） */
+function renderAnnounce() {
+  var site = (getConfig() && getConfig().site) || {};
+  if (!site.announceEnabled) return '';
+  var text = String(site.announceText || '').trim();
+  if (!text) return '';
+  var link = String(site.announceLink || '').trim();
+  var sig = text + '|' + link;
+  try { if (localStorage.getItem('qingyu.announceClosed') === sig) return ''; } catch (e) {}
+  if (!_announceBound) {
+    _announceBound = true;
+    document.addEventListener('click', function (ev) {
+      var node = ev && ev.target;
+      var btn = (node && node.closest) ? node.closest('[data-announce-close]') : null;
+      if (!btn) return;
+      var bar = document.querySelector('#announceBar');
+      if (!bar) return;
+      try { localStorage.setItem('qingyu.announceClosed', bar.getAttribute('data-announce-sig') || ''); } catch (e2) {}
+      bar.style.display = 'none';
+    });
+  }
+  var linkText = String(site.announceLinkText || '').trim() || t('announce.more');
+  var inner = esc(text);
+  if (link) inner += ' <a class="announce-link" href="' + esc(link) + '">' + esc(linkText) + '</a>';
+  var close = site.announceClosable
+    ? '<button class="announce-close" data-announce-close="1" aria-label="' + t('announce.close') + '" title="' + t('announce.close') + '">✕</button>'
+    : '';
+  return '<div class="announce-bar" id="announceBar" data-announce-sig="' + esc(sig) + '" role="status">'
+    + '<div class="container announce-inner">'
+    + '<span class="announce-ico" aria-hidden="true">' + svgIcon('spark', 14) + '</span>'
+    + '<span class="announce-text">' + inner + '</span>'
+    + close
+    + '</div></div>';
 }
 
 function renderFooter() {
@@ -1910,6 +2599,7 @@ function renderFooter() {
   var nav = custom ? custom.map(function (it) {
     return { text: it.text || '', url: it.url || '/' };
   }) : resolveNav(navItems());
+  if (!nav.some(function (x) { return String(x.url || '') === '/links'; })) nav = nav.slice().concat([{ text: t('nav.links'), url: '/links' }]);
   if (adminOk()) nav.push({ text: t('nav.admin'), url: '/admin' });
   function l(x) {
     var u = x.url || '/';
@@ -1918,14 +2608,15 @@ function renderFooter() {
     else if (/^\//.test(u)) u = href(u);
     return '<a href="' + esc(u) + '"' + ext + '>' + esc(x.text || '') + '</a>';
   }
-  var navHtml = nav.map(l).join('<span class="footer-dot">·</span>');
+  // 导航项之间不再插入小圆点，只靠间距分隔
+  var navHtml = nav.map(l).join('');
   // RSS：仅非管理员显示（管理员有写作后台入口）。云端模式指向动态
   // /api/feed.xml（含全部云端文章、自动取站点域名）；file:// 直开时同目录；
   // 其余静态托管用根路径 feed.xml
   if (!adminOk()) {
     var rssHref = _cloudOn() ? '/api/feed.xml' : (useHashMode() ? 'feed.xml' : '/feed.xml');
-    navHtml += '<span class="footer-dot footer-rss">·</span><a class="footer-rss" href="' + esc(rssHref) + '">RSS</a>';
-    navHtml += '<span class="footer-dot">·</span><a href="' + esc(href('/subscribe')) + '">' + esc(t('subscribe.title')) + '</a>';
+    navHtml += '<a class="footer-rss" href="' + esc(rssHref) + '">RSS</a>';
+    navHtml += '<a href="' + esc(href('/subscribe')) + '">' + esc(t('subscribe.title')) + '</a>';
   }
   // 电脑端专属区块：自定义文字 / 站点声明 / 联系方式 / 友情链接
   var extra = '';
@@ -1979,9 +2670,12 @@ function homeListHtml(filtered, ads, adsEnabled, page, pageSize, emptyMsg, empty
  * 仅在第 1 页时显示「下一页」，末页时显示「上一页」，单页则不显示翻页器。 */
 function pagerHtml(page, totalPages) {
   if (totalPages <= 1) return '';
-  var tag = (currentRoute().query.tag) || '';
-  var prevHref = href('/', tag ? { tag: tag, page: page - 1 } : { page: page - 1 });
-  var nextHref = href('/', tag ? { tag: tag, page: page + 1 } : { page: page + 1 });
+  var q0 = currentRoute().query || {};
+  var tag = q0.tag || '';
+  var cat = q0.category || '';
+  function _pg(p) { var o = {}; if (tag) o.tag = tag; if (cat) o.category = cat; o.page = p; return href('/', o); }
+  var prevHref = _pg(page - 1);
+  var nextHref = _pg(page + 1);
   var parts = [];
   if (page > 1) parts.push('<a class="pager-btn" href="' + esc(prevHref) + '">' + t('pagination.prev') + '</a>');
   parts.push('<span class="pager-info">' + t('pagination.page', { current: page, total: totalPages }) + '</span>');
@@ -1994,6 +2688,7 @@ function renderHome() {
   var posts = sortPagePosts(getPublishedPosts());
   var cur = currentRoute();
   var tag = cur.query.tag || '';
+  var cat = cur.query.category || '';
   var ads = cfg.ads || {};
   var adsEnabled = !!ads.enabled;
   var pageSize = homePageSize();
@@ -2003,9 +2698,14 @@ function renderHome() {
   if (tag) {
     html += '<div class="current-tag"><span class="tag-chip">' + esc(tag) + ' <a class="tag-clear" href="' + esc(href('/')) + '">✕</a></span></div>';
   }
+  if (cat) {
+    html += '<div class="current-tag"><span class="tag-chip">' + svgIcon('tag', 13) + ' ' + esc(cat) + ' <a class="tag-clear" href="' + esc(href('/')) + '">✕</a></span></div>';
+  }
   html += renderHomeTagRow(posts, tag);
   if (adsEnabled && ads.belowSearch) html += '<div class="ad-slot"><span class="ad-label">' + t('ad.label') + '</span>' + ads.belowSearch + '</div>';
-  var filtered = tag ? posts.filter(function (p) { return (p.tags || []).indexOf(tag) >= 0; }) : posts;
+  var filtered = posts;
+  if (tag) filtered = filtered.filter(function (p) { return (p.tags || []).indexOf(tag) >= 0; });
+  if (cat) filtered = filtered.filter(function (p) { return String(p.category || '') === cat; });
   var body;
   // 云端探测中且尚无数据 → 显示加载动画（避免先渲染「还没有文章」空态，等数据到了才变列表）
   var cloudProbing = !_cloudReady && (cfg.mode === 'api' || cfg.mode === 'auto');
@@ -2013,17 +2713,252 @@ function renderHome() {
     body = { html: '<div id="listContainer" class="list-nopager">' + homeLoadingHtml() + '</div>', page: 1, totalPages: 1 };
   } else {
     // 云端已确认在线且列表为空 → 「你还未发布文章」+ 写文章引导；静态空（或探测失败）→ 原「还没有文章」
+    // 带标签 / 分类筛选时的空列表属于「该筛选下暂无内容」，不是「本站还没有文章」，
+    // 因此不显示「去写一篇」——否则任何访客点开一个空的二级菜单就能看到后台写作入口
+    var isFiltered = !!(tag || cat);
     var cloudEmpty = _cloudReady && _cloudOn() && !filtered.length;
-    var emptyMsg = cloudEmpty ? t('home.noPostsCloud') : t('home.noPosts');
-    var emptyExtra = cloudEmpty
+    var emptyMsg = isFiltered ? t('home.noPostsFiltered') : (cloudEmpty ? t('home.noPostsCloud') : t('home.noPosts'));
+    var emptyExtra = (cloudEmpty && !isFiltered)
       ? '<a class="btn btn-sm btn-primary" style="margin-top:14px" href="' + esc(href('/admin/posts/new')) + '" data-no-hijack="1">' + svgIcon('pen', 14) + ' ' + t('admin.dashboard.goWrite') + '</a>'
       : '';
     body = homeListHtml(filtered, ads, adsEnabled, page, pageSize, emptyMsg, emptyExtra);
   }
-  html += '<div id="homeBody">' + body.html + '</div>';
-  html += '</main>';
+  if (cfg.homeTheme === 'magazine') {
+    var siteName = (cfg.site && cfg.site.name) || getSiteName();
+    var siteDesc = (cfg.site && cfg.site.desc) || '';
+    var featured = !tag && !cat && page === 1 && filtered.length ? filtered[0] : null;
+    var magazineBody = body.html;
+    // 精选卡与文章流不重复；分页仍按原始数据计数，翻页链接不变。
+    if (featured && !(cloudProbing && !filtered.length)) {
+      var start = 1;
+      var end = pageSize > 0 ? pageSize : filtered.length;
+      var rest = filtered.slice(start, end);
+      magazineBody = '<div id="listContainer"' + (body.totalPages <= 1 ? ' class="list-nopager"' : '') + '>'
+        + renderCardList(rest, ads, adsEnabled) + '</div>' + pagerHtml(body.page, body.totalPages);
+    }
+    html = renderNav(cur.path);
+    html += '<main class="container page-fade home-magazine">'
+      + '<section class="magazine-masthead"><div class="magazine-masthead-copy"><div class="magazine-kicker">' + esc(t('home.magazineKicker')) + '</div>'
+      + '<h1>' + esc(siteName) + '</h1><p>' + esc(siteDesc || t('home.magazineIntro')) + '</p></div>'
+      + '<div class="magazine-edition"><span>INDEPENDENT JOURNAL</span><strong>01</strong><span>NOTES & STORIES</span></div></section>'
+      + (featured ? renderMagazineFeature(featured) : '')
+      + '<div class="magazine-layout"><section class="magazine-feed"><div class="magazine-feed-head"><div><span class="magazine-kicker">' + esc(t('home.magazineLatest')) + '</span><h2>' + t('home.latest') + '</h2></div>'
+      + '<span class="magazine-count">' + filtered.length + ' ' + esc(t('home.magazineArticles')) + '</span></div>'
+      + (tag ? '<div class="current-tag"><span class="tag-chip">' + esc(tag) + ' <a class="tag-clear" href="' + esc(href('/')) + '">✕</a></span></div>' : '')
+      + (cat ? '<div class="current-tag"><span class="tag-chip">' + svgIcon('tag', 13) + ' ' + esc(cat) + ' <a class="tag-clear" href="' + esc(href('/')) + '">✕</a></span></div>' : '')
+      + (tag ? '<div class="magazine-filter-note">' + esc(t('home.magazineFiltering', { tag: tag })) + '</div>' : '')
+      + (adsEnabled && ads.belowSearch ? '<div class="ad-slot"><span class="ad-label">' + t('ad.label') + '</span>' + ads.belowSearch + '</div>' : '')
+      + '<div id="homeBody">' + magazineBody + '</div></section>'
+      + '<aside class="magazine-rail">'
+      + (cfg.profile && cfg.profile.name ? '<section class="magazine-card magazine-author"><div class="magazine-author-body">' + (cfg.profile.avatar ? '<img class="magazine-avatar" src="' + esc(cfg.profile.avatar) + '" alt="' + esc(cfg.profile.name) + '" referrerpolicy="no-referrer">' : '<span class="magazine-avatar magazine-avatar-fallback">' + esc(String(cfg.profile.name).slice(0, 1)) + '</span>') + '<div class="magazine-author-meta"><strong>' + esc(cfg.profile.name) + '</strong>' + (cfg.profile.bio ? '<p>' + esc(cfg.profile.bio) + '</p>' : '') + '</div></div></section>' : '')
+      + '<section class="magazine-card magazine-clock"><div class="clock-head"><span class="clock-dot"></span><span class="clock-zone" id="magazineClockZone">GMT+8</span></div><strong class="clock-time" id="magazineClockTime">--:--:--</strong><span class="clock-date" id="magazineClockDate">----</span><div class="clock-weather" id="magazineWeather"><span class="weather-ico">☁</span><span class="weather-text">' + esc(t('home.weatherLoading')) + '</span><button type="button" class="weather-locate" id="magazineWeatherLocate" title="' + esc(t('home.weatherLocate')) + '" aria-label="' + esc(t('home.weatherLocate')) + '">⌖</button></div></section>'
+      + '<section class="magazine-card magazine-rail-tags">' + renderMagazineTags(posts, tag) + '</section></aside></div></main>';
+  } else {
+    html += '<div id="homeBody">' + body.html + '</div></main>';
+  }
   html += renderFooter();
   return html;
+}
+
+function updateMagazineClock() {
+  var timeEl = document.getElementById('magazineClockTime');
+  var dateEl = document.getElementById('magazineClockDate');
+  var zoneEl = document.getElementById('magazineClockZone');
+  if (!timeEl || !dateEl) return;
+  var now = new Date();
+  var pad = function (n) { return String(n).padStart(2, '0'); };
+  timeEl.textContent = pad(now.getHours()) + ':' + pad(now.getMinutes()) + ':' + pad(now.getSeconds());
+  dateEl.textContent = now.getFullYear() + ' / ' + pad(now.getMonth() + 1) + ' / ' + pad(now.getDate()) + ' · ' + ['SUN', 'MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT'][now.getDay()];
+  if (zoneEl) {
+    var offset = -now.getTimezoneOffset();
+    zoneEl.textContent = 'GMT' + (offset >= 0 ? '+' : '-') + pad(Math.floor(Math.abs(offset) / 60)) + (Math.abs(offset) % 60 ? ':' + pad(Math.abs(offset) % 60) : '');
+  }
+}
+
+function startMagazineClock() {
+  if (_magazineClockTimer) clearInterval(_magazineClockTimer);
+  updateMagazineClock();
+  _magazineClockTimer = setInterval(updateMagazineClock, 1000);
+  loadMagazineWeather();
+}
+
+/* ---------- 侧栏实时天气 ----------
+ * 位置来源优先级：本地缓存（30 分钟）→ IP 定位（静默、免授权）→ 用户点击 ⌖ 用浏览器精确定位。
+ * 天气数据来自 Open-Meteo 公共接口，无需 API Key；失败时静默降级，不影响页面其他功能。 */
+var WEATHER_CODES = {
+  0: ['晴', '☀️'], 1: ['晴间多云', '🌤️'], 2: ['多云', '⛅'], 3: ['阴', '☁️'],
+  45: ['雾', '🌫️'], 48: ['雾凇', '🌫️'],
+  51: ['毛毛雨', '🌦️'], 53: ['小雨', '🌦️'], 55: ['细雨', '🌧️'],
+  56: ['冻雨', '🌧️'], 57: ['冻雨', '🌧️'],
+  61: ['小雨', '🌧️'], 63: ['中雨', '🌧️'], 65: ['大雨', '🌧️'],
+  66: ['冻雨', '🌧️'], 67: ['冻雨', '🌧️'],
+  71: ['小雪', '🌨️'], 73: ['中雪', '❄️'], 75: ['大雪', '❄️'], 77: ['雪粒', '❄️'],
+  80: ['阵雨', '🌦️'], 81: ['强阵雨', '🌧️'], 82: ['暴雨', '⛈️'],
+  85: ['阵雪', '🌨️'], 86: ['强阵雪', '❄️'],
+  95: ['雷阵雨', '⛈️'], 96: ['雷阵雨伴冰雹', '⛈️'], 99: ['强雷暴冰雹', '⛈️']
+};
+var WEATHER_CACHE_KEY = 'qingyu.weather';
+var WEATHER_TTL = 1800000;   // 30 分钟
+
+function weatherLabel(code) {
+  return WEATHER_CODES[Number(code)] || ['天气', '🌡'];
+}
+function readWeatherCache() {
+  try {
+    var v = JSON.parse(localStorage.getItem(WEATHER_CACHE_KEY) || 'null');
+    if (v && v.text && Date.now() - Number(v.ts || 0) < WEATHER_TTL) return v;
+  } catch (e) {}
+  return null;
+}
+function setMagazineWeather(text, icon, city, ok) {
+  var box = document.getElementById('magazineWeather');
+  if (!box) return;
+  var btn = box.querySelector('#magazineWeatherLocate');
+  box.classList.toggle('is-error', !ok);
+  box.innerHTML = '<span class="weather-ico">' + esc(icon) + '</span>'
+    + '<span class="weather-text">' + esc(text) + '</span>'
+    + (city ? '<span class="weather-city">' + esc(city) + '</span>' : '')
+    + (btn ? String(btn.outerHTML) : '');
+  bindMagazineWeather();   // innerHTML 会生成新的按钮节点，需重新绑定点击
+}
+/* fetch 超时保护：任何第三方接口挂起都不能让天气一直卡在「获取中」 */
+function fetchWithTimeout(url, ms) {
+  var ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  var timer = setTimeout(function () { if (ctrl) ctrl.abort(); }, ms || 7000);
+  return fetch(url, ctrl ? { signal: ctrl.signal } : undefined)
+    .then(function (r) { if (!r.ok) throw new Error('http ' + r.status); return r.json(); })
+    .then(function (d) { clearTimeout(timer); return d; }, function (e) { clearTimeout(timer); throw e; });
+}
+function num(v) { var n = Number(v); return isFinite(n) ? n : NaN; }
+/* IP 定位多源兜底：按国内网络可达性排序，任一家可用即返回。
+   均为公开、免 Key、Access-Control-Allow-Origin: * 的接口，
+   避免单家限流 / DNS 被拦导致天气拿不到。 */
+var IP_LOCATION_SOURCES = [
+  function () { return fetchWithTimeout('https://api.ip.sb/geoip', 6000).then(function (d) {
+    return { lat: num(d.latitude), lon: num(d.longitude), city: d.city || d.region || '' }; }); },
+  function () { return fetchWithTimeout('https://ipinfo.io/json', 6000).then(function (d) {
+    var loc = String(d.loc || '').split(',');
+    return { lat: num(loc[0]), lon: num(loc[1]), city: d.city || '' }; }); },
+  function () { return fetchWithTimeout('https://ipapi.co/json/', 6000).then(function (d) {
+    return { lat: num(d.latitude), lon: num(d.longitude), city: d.city || '' }; }); },
+  function () { return fetchWithTimeout('https://ipwho.is/', 6000).then(function (d) {
+    return { lat: num(d.latitude), lon: num(d.longitude), city: d.city || '' }; }); }
+];
+function fetchAutoLocation() {
+  var chain = Promise.reject(new Error('no source'));
+  IP_LOCATION_SOURCES.forEach(function (fn) { chain = chain.catch(fn); });
+  return chain.then(function (loc) {
+    if (!loc || isNaN(loc.lat) || isNaN(loc.lon)) throw new Error('bad location');
+    return loc;
+  });
+}
+function fetchWeatherByCoords(lat, lon, city) {
+  var url = 'https://api.open-meteo.com/v1/forecast?latitude=' + lat + '&longitude=' + lon
+    + '&current=temperature_2m,weather_code&timezone=auto';
+  return fetchWithTimeout(url, 8000).then(function (d) {
+    var cur = (d && d.current) || {};
+    if (cur.temperature_2m == null) throw new Error('bad weather payload');
+    var info = weatherLabel(cur.weather_code);
+    var data = { text: info[0] + ' ' + Math.round(Number(cur.temperature_2m)) + '°', icon: info[1], city: city || '' };
+    try { data.ts = Date.now(); localStorage.setItem(WEATHER_CACHE_KEY, JSON.stringify(data)); } catch (e) {}
+    setMagazineWeather(data.text, data.icon, data.city, true);
+  });
+}
+/* 全自动加载，无需点击：
+   ①已授权过定位 → 直接静默用精确定位（最准）
+   ②否则 → IP 定位多源兜底（静默、免授权）
+   ③都不行 → 自动请求浏览器定位（仅此时浏览器会弹一次授权询问，之后永久静默）
+   结果缓存 30 分钟。 */
+function geoPermissionState() {
+  return new Promise(function (resolve) {
+    try {
+      if (navigator.permissions && navigator.permissions.query) {
+        navigator.permissions.query({ name: 'geolocation' }).then(function (s) { resolve(s.state); }, function () { resolve('unknown'); });
+        return;
+      }
+    } catch (e) {}
+    resolve('unknown');
+  });
+}
+function loadMagazineWeather(force) {
+  var cached = readWeatherCache();
+  if (cached && !force) setMagazineWeather(cached.text, cached.icon, cached.city, true);
+  else setMagazineWeather(t('home.weatherLoading'), '☁', '', true);
+  return geoPermissionState().then(function (state) {
+    if (state === 'granted') return requestPreciseWeather(true);
+    return fetchAutoLocation()
+      .then(function (loc) { return fetchWeatherByCoords(loc.lat, loc.lon, loc.city); })
+      .catch(function () { return requestPreciseWeather(true); });
+  }).catch(function () { setMagazineWeather(t('home.weatherFail'), '·', '', false); });
+}
+/* 浏览器精确定位取天气；auto=true 时用于 IP 失败后的自动兜底 */
+function requestPreciseWeather(auto) {
+  if (!navigator.geolocation) return Promise.reject(new Error('no geolocation'));
+  setMagazineWeather(auto ? t('home.weatherLoading') : t('home.weatherLocating'), '⌖', '', true);
+  return new Promise(function (resolve, reject) {
+    navigator.geolocation.getCurrentPosition(function (pos) {
+      var lat = Number(pos.coords.latitude).toFixed(3);
+      var lon = Number(pos.coords.longitude).toFixed(3);
+      fetchWeatherByCoords(lat, lon, '').then(resolve, reject);
+    }, reject, { timeout: 8000, maximumAge: 600000 });
+  });
+}
+function locateByBrowser() {
+  requestPreciseWeather(false).catch(function () { loadMagazineWeather(true); });
+}
+
+function bindMagazineWeather() {
+  var btn = document.getElementById('magazineWeatherLocate');
+  if (!btn || btn.__bound) return;
+  btn.__bound = true;
+  btn.addEventListener('click', function (e) { e.preventDefault(); locateByBrowser(); });
+}
+
+/* 右栏首卡与左侧「第一篇文章卡片」顶端对齐：
+ * 列表标题（最新发布 + 分隔线）只占左栏，所以用实测高度把右栏整体下移，
+ * 比写死像素更稳——标题字号、换行、响应式变化时都能自动跟随。 */
+function alignMagazineRail() {
+  var rail = document.querySelector('.magazine-rail');
+  if (!rail) return;
+  // 单栏布局（平板 / 手机）下右栏在列表下方，不需要对齐偏移
+  var single = window.innerWidth <= 860;
+  var head = single ? null : document.querySelector('.magazine-feed-head');
+  var offset = 0;
+  if (head) {
+    var cs = window.getComputedStyle(head);
+    offset = Math.round(head.getBoundingClientRect().height) + (parseFloat(cs.marginBottom) || 0);
+  }
+  rail.style.marginTop = offset + 'px';
+}
+
+function renderMagazineFeature(post) {
+  if (!post) return '';
+  var cover = String(post.cover || '').trim() || firstImageFrom(post.content || '');
+  var summary = post.excerpt || stripMd(post.content || '').slice(0, 180);
+  var tags = normalizeTags(post).slice(0, 3).map(function (name) { return '<span>' + esc(name) + '</span>'; }).join('');
+  var visual = cover
+    ? '<img src="' + esc(cover) + '" alt="' + esc(post.title || '') + '" loading="eager" decoding="async" fetchpriority="high" referrerpolicy="no-referrer">'
+    : renderGeneratedCover(post, post.title || '');
+  return '<a class="magazine-feature" href="' + esc(href(postUrl(post.id))) + '"><div class="magazine-feature-image">' + visual + '<span class="magazine-feature-label">' + esc(t('home.magazineFeatured')) + '</span></div>'
+    + '<div class="magazine-feature-copy"><div class="magazine-feature-meta"><span>' + esc(post.date || '') + '</span>' + (post.category ? '<span>' + esc(post.category) + '</span>' : '') + '</div>'
+    + '<h2>' + esc(post.title || '') + '</h2><p>' + esc(summary) + '</p><div class="magazine-feature-bottom"><span class="magazine-feature-tags">' + tags + '</span><span class="magazine-read">' + esc(t('home.magazineRead')) + ' <b>↗</b></span></div></div></a>';
+}
+
+function getMagazineTagCount(posts) {
+  var seen = {};
+  (posts || []).forEach(function (p) { normalizeTags(p).forEach(function (name) { seen[name] = 1; }); });
+  return Object.keys(seen).length;
+}
+
+function renderMagazineTags(posts, activeTag) {
+  var seen = {};
+  var tags = [];
+  (posts || []).forEach(function (p) { normalizeTags(p).forEach(function (name) {
+    if (!seen[name]) { seen[name] = 1; tags.push(name); }
+  }); });
+  return tags.length ? '<div class="magazine-tag-list">' + tags.slice(0, 12).map(function (name) {
+    return '<a class="magazine-tag' + (name === activeTag ? ' active' : '') + '" href="' + esc(href('/', { tag: name })) + '">' + esc(name) + '</a>';
+  }).join('') + '</div>' : '<p class="magazine-muted">' + esc(t('home.magazineNoTags')) + '</p>';
 }
 
 /* 云端文章加载动画：与首页卡片同构的骨架屏（shimmer），顶部一行「正在拉取文章…」 */
@@ -2062,6 +2997,12 @@ function renderHomeTagRow(posts, activeTag) {
       counts[t]++;
     });
   });
+  // 标签堆积过多时，站长可在后台勾选「首页要显示的标签」；白名单为空 = 保持原样全显示。
+  var allow = (getConfig().homeTags || []);
+  if (allow.length) {
+    var allowSet = {}; allow.forEach(function (x) { allowSet[x] = 1; });
+    order = order.filter(function (x) { return allowSet[x] || x === activeTag; });
+  }
   if (!order.length) return '';
   var html = '<div class="home-tags">';
   html += '<span class="home-tags-label">' + t('home.categoryLabel') + '</span>';
@@ -2123,7 +3064,57 @@ function renderPostThumb(p, idx) {
     var lazy = (idx !== undefined && idx < 2) ? 'eager' : 'lazy';
     return '<span class="post-thumb has-img"><img src="' + esc(url) + '" alt="' + esc(title || t('post.thumbnailAlt')) + '" loading="' + lazy + '" decoding="async" fetchpriority="' + pri + '" referrerpolicy="no-referrer" onload="this.classList.add(\'thumb-in\')" onerror="this.remove()"></span>';
   }
-  return '<span class="post-thumb ph"><span class="post-thumb-ph">' + svgIcon('image', 26) + '</span></span>';
+  return renderGeneratedCover(p, title);
+}
+
+/* ---------- 无图文章的默认封面（v2.10.105）----------
+ * 用户没上传缩略图时，不再显示中性图片图标占位，而是**按文章自动生成一张渐变封面**：
+ *   · 配色从固定色板里按标题哈希挑——保证任何文章都不会出现刺眼 / 脏配色，
+ *     不用随机 HSL（随机 HSL 迟早会蹦出荧光绿那种配色）；
+ *   · 渐变角度同样由哈希决定，同一篇文章每次刷新颜色一致（不会闪烁变色）；
+ *   · 叠加两个半透明圆形做装饰，模拟截图里的构图；
+ *   · 文字用标题 + 副标题（分类 → 首个标签 → 日期，逐级回退），全部转义。
+ * 全部走内联样式 / 纯 CSS，无额外网络请求，不影响首屏。 */
+const GENERATED_COVERS = [
+  ['#2b4a7a', '#4a80c2'],   // 靛蓝
+  ['#7a3b2e', '#c2705a'],   // 陶土
+  ['#2f5c46', '#5f9e7d'],   // 松绿
+  ['#5b3568', '#9a68a8'],   // 藕紫
+  ['#1f4c5c', '#4d8f9e'],   // 湖蓝
+  ['#6b4226', '#a9713f'],   // 赭石
+  ['#3d4a6b', '#7382ab'],   // 雾蓝
+  ['#63324a', '#a4607e'],   // 梅红
+  ['#2d5240', '#6a9b62'],   // 苔绿
+  ['#4a4520', '#9a8f4a']    // 秋金
+];
+/** 字符串 → 32 位无符号哈希（FNV-1a），用于稳定地挑选配色 / 角度 */
+function hashString(str) {
+  var h = 2166136261;
+  var s = String(str || '');
+  for (var i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = (h * 16777619) >>> 0;
+  }
+  return h >>> 0;
+}
+function renderGeneratedCover(p, title) {
+  var seed = String((p && (p.id || p.slug)) || title || 'post');
+  var h = hashString(seed);
+  var pair = GENERATED_COVERS[h % GENERATED_COVERS.length];
+  var angle = 100 + (h >>> 8) % 80;   // 100~180°，斜向渐变，与截图观感一致
+  var t = String(title || (p && p.title) || '').trim();
+  var sub = String((p && p.category) || '').trim();
+  if (!sub) {
+    var tg = normalizeTags(p);
+    if (tg && tg.length) sub = String(tg[0] || '').trim();
+  }
+  if (!sub) sub = String((p && p.date) || '').trim();
+  return '<span class="post-thumb ph gen" style="--gc1:' + pair[0] + ';--gc2:' + pair[1] + ';--ga:' + angle + 'deg">'
+    + '<span class="ptg-tex">'
+    + '<span class="ptg-title">' + esc(t) + '</span>'
+    + (sub ? '<span class="ptg-sub">' + esc(sub) + '</span>' : '')
+    + '<span class="ptg-line"></span>'
+    + '</span></span>';
 }
 
 /** 从正文 Markdown 提取第一张图片 URL（![alt](url) 或 <img src="url">） */
@@ -2185,11 +3176,11 @@ function bindFitCardLineClamps() {
   var timer = null;
   window.addEventListener('resize', function () {
     clearTimeout(timer);
-    timer = setTimeout(fitCardLineClamps, 120);
+    timer = setTimeout(function () { fitCardLineClamps(); alignMagazineRail(); }, 120);
   });
   // 字体加载完成后再测一次（iOS 首屏字体 swapping 会使标题行数变化）
   if (document.fonts && document.fonts.ready) {
-    document.fonts.ready.then(function () { fitCardLineClamps(); }).catch(function () {});
+    document.fonts.ready.then(function () { fitCardLineClamps(); alignMagazineRail(); }).catch(function () {});
   }
 }
 
@@ -2248,31 +3239,72 @@ function clearPostCache(id) {
  * 统一供首次加载与发表/删除后的刷新使用，保证嵌套结构、缩进与“回复”按钮一致。
  * 注意：若父评论被删除或不在列表内，其子孙评论会归并到顶层，避免丢失。
  */
-function renderCommentTree(list, canDel) {
+function likedCommentIds() {
+  try {
+    var list = JSON.parse(localStorage.getItem('qingyu.commentLikedIds') || '[]');
+    return Array.isArray(list) ? list : [];
+  } catch (e) { return []; }
+}
+function hasLikedComment(id) { return likedCommentIds().indexOf(String(id)) >= 0; }
+function markCommentLiked(id) {
+  try {
+    var list = likedCommentIds();
+    if (list.indexOf(String(id)) < 0) list.push(String(id));
+    localStorage.setItem('qingyu.commentLikedIds', JSON.stringify(list.slice(-1000)));
+  } catch (e) {}
+}
+function unmarkCommentLiked(id) {
+  try { localStorage.setItem('qingyu.commentLikedIds', JSON.stringify(likedCommentIds().filter(function (x) { return String(x) !== String(id); }))); } catch (e) {}
+}
+function commentSort(a, b) {
+  // 最热：置顶 > 精选 > 点赞 > 写入顺序
+  return (Number(b.pinned) || 0) - (Number(a.pinned) || 0)
+    || (Number(b.featured) || 0) - (Number(a.featured) || 0)
+    || (Number(b.likes) || 0) - (Number(a.likes) || 0)
+    || (Number(a.rid) || 0) - (Number(b.rid) || 0);
+}
+function commentSortNew(a, b) {
+  // 最新：置顶仍然优先，其余按写入顺序倒序
+  return (Number(b.pinned) || 0) - (Number(a.pinned) || 0)
+    || (Number(b.rid) || 0) - (Number(a.rid) || 0);
+}
+/** 顶层评论数量：分页以顶层为准，回复跟随其父评论一起渲染 */
+function commentRootCount(list) {
+  if (!Array.isArray(list) || !list.length) return 0;
+  var byId = {};
+  list.forEach(function (c) { byId[c.id] = 1; });
+  var n = 0;
+  list.forEach(function (c) { if (!(c.parent_id && byId[c.parent_id])) n++; });
+  return n;
+}
+function renderCommentTree(list, canDel, opts) {
+  opts = opts || {};
+  var sorter = typeof opts.sorter === 'function' ? opts.sorter : commentSort;
+  var limit = Number(opts.limit) > 0 ? Number(opts.limit) : 0;
   if (!Array.isArray(list) || !list.length) return '<li class="comment-empty">' + t('comment.noComments') + '</li>';
   var roots = [];
   var childMap = {};
   var byId = {};
   list.forEach(function (c) { byId[c.id] = c; childMap[c.id] = []; });
   list.forEach(function (c) {
-    // 只有父评论存在且在同一列表内才作为子评论挂靠，否则归到顶层
     if (c.parent_id && byId[c.parent_id]) childMap[c.parent_id].push(c);
     else roots.push(c);
   });
+  roots.sort(sorter);
+  if (limit && roots.length > limit) roots = roots.slice(0, limit);
 
-  // 递归渲染单个评论及其子评论
   function renderOne(c, depth) {
     var replies = childMap[c.id] || [];
+    var liked = hasLikedComment(c.id);
+    var likeBtn = '<button class="comment-like' + (liked ? ' liked' : '') + '" data-like-id="' + esc(c.id) + '" aria-label="' + esc(t('comment.like')) + '">' + svgIcon('heart', 12) + ' <span>' + (Number(c.likes) || 0) + '</span></button>';
     var replyBtn = (depth < 3)
       ? '<button class="comment-reply-btn" data-reply-id="' + esc(c.id) + '" data-reply-author="' + esc(c.author) + '">' + t('comment.reply') + '</button>'
       : '';
     var delBtn = canDel
       ? '<button class="comment-del" data-cid="' + esc(c.id) + '">' + t('comment.delete') + '</button>'
       : '';
-    // 在内容下方标注“回复了某人”（若该评论是回复）
-    // 安全：t() 的插值不做转义，作者名可能含 HTML（服务端只清控制字符），
-    // 必须对整个结果 esc 再进 innerHTML（同 admin.js 的 comment.replyTo 用法），
-    // 否则父评论作者名可构造存储型 XSS（他人回复时对所有访客触发）。
+    var badges = (Number(c.pinned) ? '<span class="comment-badge pinned">' + t('comment.pinned') + '</span>' : '')
+      + (Number(c.featured) ? '<span class="comment-badge featured">' + t('comment.featured') + '</span>' : '');
     var replyToLabel = '';
     if (c.parent_id && byId[c.parent_id]) {
       replyToLabel = '<div class="comment-reply-to">' + esc(t('comment.replyTo', { author: byId[c.parent_id].author })) + '</div>';
@@ -2281,11 +3313,11 @@ function renderCommentTree(list, canDel) {
       ? '<ul class="comment-children">' + replies.map(function (r) { return renderOne(r, depth + 1); }).join('') + '</ul>'
       : '';
     var initial = String(c.author || '?').trim().slice(0, 1) || '?';
-    return '<li class="comment" data-id="' + esc(c.id) + '"><div class="comment-head">'
+    return '<li class="comment' + (Number(c.pinned) ? ' pinned' : '') + (Number(c.featured) ? ' featured' : '') + '" data-id="' + esc(c.id) + '"><div class="comment-head">'
       + '<span class="comment-avatar" aria-hidden="true">' + esc(initial) + '</span>'
-      + '<span class="comment-author">' + esc(c.author) + '</span>'
+      + '<span class="comment-author">' + esc(c.author) + '</span>' + badges
       + '<span class="comment-date">' + esc(c.date || '') + '</span>'
-      + '<span class="comment-actions">' + replyBtn + delBtn + '</span>'
+      + '<span class="comment-actions">' + likeBtn + replyBtn + delBtn + '</span>'
       + '</div>'
       + '<div class="comment-main">'
       + replyToLabel
@@ -2400,7 +3432,7 @@ function renderRelationsHtml(relations) {
   if (related.length) {
     html += '<section class="relations-section related-posts"><div class="relations-title">' + svgIcon('link', 15) + ' ' + esc(t('post.related')) + '</div><div class="related-grid">';
     related.forEach(function (p) {
-      var tags = normalizeTags(p).slice(0, 2).join(' · ');
+      var tags = normalizeTags(p).slice(0, 2).join(' / ');
       html += '<a class="related-card" href="' + esc(href(postUrl(p.id))) + '"><div class="related-card-title">' + esc(p.title || t('post.untitled')) + '</div><div class="related-card-meta">' + esc(tags || p.date || '') + '</div></a>';
     });
     html += '</div></section>';
@@ -2461,13 +3493,14 @@ async function renderPost(id) {
     var fromCache = false;
     if (!hasContent) {
       var cachedPost = readPostCache(post.id);
-      if (cachedPost && cachedPost.content) {
-        post.content = cachedPost.content;
+      if (cachedPost && (cachedPost.content || cachedPost.enc)) {
+        if (cachedPost.content) post.content = cachedPost.content;
+        if (cachedPost.enc) post.enc = cachedPost.enc;
         post._fullLoaded = true;
         fromCache = true;
       }
     }
-    if (!hasContent && !post.content) {
+    if (!hasContent && !post.content && !post.enc) {
       html += '<div class="empty"><div class="big">' + svgIcon('spinner', 26) + '</div><p>' + t('site.loading') + '…</p></div>';
       html += '</div></main>' + renderFooter();
       app().innerHTML = html;
@@ -2480,7 +3513,7 @@ async function renderPost(id) {
       var full = (data && data.post) || null;
       if (!full) {
         post._fullLoaded = true;
-        if (!hasContent && !fromCache) {
+        if (!hasContent && !fromCache && !post.enc) {   // 加密文章已拿到密文即可渲染锁屏，拉取失败不回退错误页
           // 文章已被删除（404/不存在）：从本地列表移除并重渲染 → 显示「内容不存在」，终止无限拉取
           if (err && /404|410|not.?found|不存在|未找到|找不到/i.test(String((err && err.message) || err))) {
             if (Array.isArray(window.BLOG_POSTS)) {
@@ -2494,40 +3527,87 @@ async function renderPost(id) {
         }
         return;
       }
-      var changed = full.content !== undefined && full.content !== post.content;
+      // 受保护文章的明文 content 恒为空、正文存于 enc；列表摘要会删掉 enc，
+      // 必须在详情返回后补回 enc，否则锁屏无法渲染、且会陷入反复重渲染。
+      var changed = (full.content !== undefined && full.content !== post.content) || (!!full.enc !== !!post.enc);
       if (full.content !== undefined) post.content = full.content;
+      if (full.enc !== undefined) post.enc = full.enc;
+      if (full.protected !== undefined) post.protected = full.protected;
       if (full.content) writePostCache(post.id, full);
       post._fullLoaded = true;
-      if (changed || (!hasContent && !fromCache)) route();
+      if (changed) route();
+      else if (!hasContent && !fromCache && !post.enc && !post.content) renderPostFail(post);
     }
     apiFetch('api/posts/' + encodeURIComponent(post.id))
       .then(function (data) { finish(data); })
       .catch(function (err) { finish(null, err); });
     setTimeout(function () { finish(null); }, 10000);
-    if (!post.content) return;   // 无内容（含无缓存）：等待拉取后重渲染或显示失败页
+    if (!post.content && !post.enc) return;   // 无正文且非加密：等待拉取后重渲染或显示失败页（加密文章无明文也要渲染锁屏）
     // 有内容（缓存或已加载）：继续渲染正文，后台拉取完成后若有更新会重渲染
   }
   var content = post.content || '';
-  var bodyHtml = renderMarkdown(content || '');
+  var locked = !!post.enc;
+  var bodyHtml = locked ? '' : renderMarkdown(content || '');
   var tocRes = buildToc(bodyHtml);
   var toc = tocRes.html;
   var tocHeadings = tocRes.headings;
   var tags = normalizeTags(post).map(function (t) { return '<a href="' + esc(href('/', { tag: t })) + '" data-tag-link>' + esc(t) + '</a>'; }).join('');
   var minutes = Math.max(1, Math.ceil((stripMd(content || '').length / 400)));
   var seriesMeta = post.series ? '<a class="pin" href="' + esc(href(seriesUrl(post.series))) + '">' + svgIcon('list', 13) + ' ' + esc(post.series) + '</a>' : '';
-  html += '<div class="post-header"><h1>' + esc(post.title || '') + '</h1><div class="meta"><span class="meta-date">' + esc(post.date || '') + '</span><span class="meta-dot">·</span><span>' + minutes + ' ' + t('post.minRead') + '</span><span class="meta-dot">·</span><span class="meta-views">' + svgIcon('eye', 14) + ' <span id="viewCount">0</span> ' + t('post.views') + '</span>' + seriesMeta + (post.pinned ? '<span class="pin">' + svgIcon('pin', 13) + ' ' + t('post.pin') + '</span>' : '') + '</div></div>';
+  html += '<div class="post-header"><h1>' + esc(post.title || '') + '</h1><div class="meta"><span class="meta-date">' + esc(post.date || '') + '</span>' + (post.author ? '<span class="meta-author">' + esc(post.author) + '</span>' : '') + '<span>' + minutes + ' ' + t('post.minRead') + '</span><span class="meta-views">' + svgIcon('eye', 14) + ' <span id="viewCount">0</span> ' + t('post.views') + '</span>' + seriesMeta + (post.pinned ? '<span class="pin">' + svgIcon('pin', 13) + ' ' + t('post.pin') + '</span>' : '') + '</div></div>';
+  // 正文字号调节：后台「功能开关 → 阅读字号」可整体隐藏（默认开启）
+  html += '<div class="reading-tools">' + (readingFontEnabled()
+    ? '<span class="rt-label">' + t('post.fontSize') + '</span>' +
+      '<button type="button" class="rt-btn" data-rs="-1" aria-label="' + t('post.fontSmaller') + '" title="' + t('post.fontSmaller') + '">A−</button>' +
+      '<button type="button" class="rt-btn" data-rs="0" aria-label="' + t('post.fontReset') + '" title="' + t('post.fontReset') + '">A</button>' +
+      '<button type="button" class="rt-btn" data-rs="1" aria-label="' + t('post.fontLarger') + '" title="' + t('post.fontLarger') + '">A+</button>'
+    : '') +
+    '</div>';
   html += aiPostSlot(post);
   html += toc;
-  html += '<article class="article">' + bodyHtml + '</article>';
+  if (locked) {
+    html += '<div class="post-lock" id="postLock"><div class="post-lock-ico">' + svgIcon('lock', 26) + '</div>'
+      + '<p class="post-lock-title">' + t('post.lockedTitle') + '</p>'
+      + '<p class="post-lock-desc">' + t('post.lockedDesc') + '</p>'
+      + '<div class="post-lock-row"><input type="password" class="post-lock-input" id="postLockPwd" placeholder="' + t('post.lockedPlaceholder') + '" maxlength="64">'
+      + '<button type="button" class="btn btn-primary" id="postUnlockBtn">' + t('post.unlock') + '</button></div>'
+      + '<p class="post-lock-err" id="postLockErr"></p></div>'
+      + '<article class="article" id="postArticle" style="display:none"></article>';
+  } else {
+    html += '<article class="article">' + bodyHtml + '</article>';
+  }
+  // 仅打印时显示的页脚：站点名 + 原文链接（便于纸质/PDF 溯源）
+  var printBase = getConfig().siteUrl || (typeof location !== 'undefined' ? location.origin : '');
+  html += '<div class="print-only print-foot">' + esc(getSiteName()) + ' · ' + esc(String(printBase).replace(/\/+$/, '') + postUrl(post.id)) + '</div>';
+  if (toc) {
+    html += '<button type="button" class="toc-fab" id="tocFab" aria-label="' + t('toc.open') + '">' + svgIcon('list', 18) + '</button>' +
+      '<div class="toc-sheet" id="tocSheet" hidden><div class="toc-sheet-head"><span>' + t('toc.title') + '</span>' +
+      '<button type="button" class="toc-sheet-close" id="tocSheetClose" aria-label="' + t('announce.close') + '">✕</button></div>' +
+      '<div class="toc-sheet-list">' + tocHeadings.map(function (h) {
+        return '<a href="#' + esc(h.id) + '" data-toc="' + esc(h.id) + '" style="padding-left:' + (8 + (h.lvl - 1) * 14) + 'px"><span class="toc-num">' + esc(h.num) + '</span>' + esc(h.text) + '</a>';
+      }).join('') + '</div></div>';
+  }
   // 点赞：正文尾部，水平居中
   html += '<div class="like-bar"><button class="btn like-btn" id="likeBtn">' + svgIcon('heart', 15) + ' <span id="likeCount">0</span></button></div>';
   // 底部：左标签、右复制链接(+编辑)
   var afEdit = adminOk()
     ? '<a class="btn" href="' + esc(href(postUrl(post.id) + 'edit')) + '">' + svgIcon('pen', 13) + ' ' + t('post.edit') + '</a>'
     : '';
-  html += '<div class="article-footer"><div class="af-tags">' + (tags || '') + '</div><div class="af-actions">' + afEdit + '<button class="btn" id="btnCopyLink">' + svgIcon('link', 14) + ' ' + t('post.copyLink') + '</button></div></div>';
-  // 双向链接与相关文章（静态模式本地计算，云端异步拉取）
-  html += '<div class="relations-slot" id="postRelations"></div>';
+  var shareSupported = !!(typeof navigator !== 'undefined' && navigator.share);
+  var shareMenu = '<div class="share-wrap">'
+    + '<button class="btn" id="btnShare" aria-haspopup="true" aria-expanded="false" title="' + esc(t('post.share')) + '">' + svgIcon('external', 14) + ' ' + t('post.share') + '</button>'
+    + '<div class="share-menu" id="shareMenu" role="menu" hidden>'
+    + '<button class="share-item" id="btnCopyLink" data-share="copy" role="menuitem">' + svgIcon('link', 14) + ' ' + t('post.copyLink') + '</button>'
+    + (shareSupported ? '<button class="share-item" data-share="native" role="menuitem">' + svgIcon('send', 14) + ' ' + t('post.shareNative') + '</button>' : '')
+    + '<a class="share-item" data-share="weibo" role="menuitem" target="_blank" rel="noopener">' + t('post.shareWeibo') + '</a>'
+    + '<a class="share-item" data-share="x" role="menuitem" target="_blank" rel="noopener">' + t('post.shareX') + '</a>'
+    + '<a class="share-item" data-share="facebook" role="menuitem" target="_blank" rel="noopener">' + t('post.shareFacebook') + '</a>'
+    + '<a class="share-item" data-share="telegram" role="menuitem" target="_blank" rel="noopener">' + t('post.shareTelegram') + '</a>'
+    + '<a class="share-item" data-share="email" role="menuitem">' + t('post.shareEmail') + '</a>'
+    + '</div></div>';
+  var printBtn = '<button class="btn" id="btnPrint" title="' + esc(t('post.print')) + '">' + svgIcon('file', 14) + ' ' + t('post.print') + '</button>';
+  html += '<div class="article-footer"><div class="af-tags">' + (tags || '') + '</div><div class="af-actions">' + afEdit + printBtn + shareMenu + '</div></div>';
+  // 注：双向链接 / 相关文章移到「上一篇 · 下一篇」之后渲染（见下方 pn-nav 之后）
 
   // 系列内上一篇 / 下一篇
   if (post.series) {
@@ -2559,13 +3639,17 @@ async function renderPost(id) {
     html += '<a class="pn-item pn-single" href="' + esc(href(postUrl(next.id))) + '"><span class="pn-dir">' + t('post.next') + '</span><span class="pn-title">' + esc(next.title || '') + '</span></a>';
   }
   html += '</div>';
+  // 双向链接与相关文章（静态模式本地计算，云端异步拉取）：位于上下篇之后、评论区之前
+  html += '<div class="relations-slot" id="postRelations"></div>';
+  html += '<div class="webmentions" id="postWebmentions" hidden></div>';
 
   // comments
-  html += '<div class="comments"><h3>' + t('comment.title') + ' <span class="comment-count" id="commentCount">' + '0' + '</span></h3>';
+  html += '<div class="comments"><div class="comments-head"><h3>' + t('comment.title') + ' <span class="comment-count" id="commentCount">0</span></h3>' +
+    '<div class="comment-sort" id="commentSort" role="tablist"><button type="button" class="cs-btn active" data-sort="hot" role="tab" aria-selected="true">' + t('comment.sortHot') + '</button><button type="button" class="cs-btn" data-sort="new" role="tab" aria-selected="false">' + t('comment.sortNew') + '</button></div></div>';
   html += '<p class="comment-hint">' + t('comment.hint') + '</p>';
   html += '<div class="reply-indicator" id="replyIndicator" style="display:none"><span id="replyTo"></span><button class="reply-cancel" id="replyCancel">✕</button></div>';
-  html += '<div class="comment-form"><input type="text" id="commentAuthor" maxlength="30" placeholder="' + t('comment.authorPlaceholder') + '"><div class="comment-editor-row"><textarea id="commentContent" rows="2" maxlength="1000" placeholder="' + t('comment.contentPlaceholder') + '"></textarea><button type="button" class="comment-emoji-btn" id="commentEmoji" title="' + t('comment.emoji') + '" aria-label="' + t('comment.emoji') + '">😊</button></div><div class="comment-submit-row"><button class="btn btn-primary" id="commentSubmit">' + t('comment.submit') + '</button><span class="c-status" id="commentStatus"></span></div></div>';
-  html += '<ul class="comment-list" id="commentList"></ul></div>';
+  html += '<div class="comment-form"><input class="hp-field" type="text" id="commentHp" name="hp" tabindex="-1" autocomplete="off" aria-hidden="true">' + '<input type="text" id="commentAuthor" maxlength="30" placeholder="' + t('comment.authorPlaceholder') + '"><div class="comment-editor-row"><textarea id="commentContent" rows="2" maxlength="1000" placeholder="' + t('comment.contentPlaceholder') + '"></textarea><button type="button" class="comment-emoji-btn" id="commentEmoji" title="' + t('comment.emoji') + '" aria-label="' + t('comment.emoji') + '">😊</button></div><div class="comment-submit-row"><button class="btn btn-primary" id="commentSubmit">' + t('comment.submit') + '</button><span class="c-status" id="commentStatus"></span></div></div>';
+  html += '<ul class="comment-list" id="commentList"></ul><div class="comment-more" id="commentMore" style="display:none"><button type="button" class="btn" id="commentMoreBtn">' + t('comment.loadMore') + '</button></div></div>';
 
   // 精选文章（评论区下方）
   html += renderFeaturedHtml(post.id);
@@ -2576,6 +3660,7 @@ async function renderPost(id) {
   html += '</div></main>' + renderFooter();
   app().innerHTML = html;
   stampHeadingNumbers(tocHeadings);
+  enhanceRichContent(document.querySelector('.article'));
 
   // stats load
   loadStats(post.id).then(function (s) {
@@ -2587,6 +3672,8 @@ async function renderPost(id) {
   incView(post.id).then(function (s) {
     var v = document.querySelector('#viewCount'); if (v && s) v.textContent = String(s.views);
   });
+  var printBtnEl = document.querySelector('#btnPrint');
+  if (printBtnEl) printBtnEl.addEventListener('click', function () { try { window.print(); } catch (e) {} });
   var likeBtn = document.querySelector('#likeBtn');
   if (likeBtn) {
     if (wasLiked(post.id)) { likeBtn.classList.add('liked'); likeBtn.disabled = true; }
@@ -2600,25 +3687,344 @@ async function renderPost(id) {
     });
   }
 
-  var copyBtn = document.querySelector('#btnCopyLink');
-  if (copyBtn) copyBtn.addEventListener('click', function () {
+  // 分享：复制链接 / 系统分享 / 社交平台（点击展开菜单）
+  (function initShare() {
+    var shareBtn = document.querySelector('#btnShare');
+    var menu = document.querySelector('#shareMenu');
+    if (!shareBtn || !menu) return;
     var url = location.origin + appRoot() + postUrl(post.id);
-    navigator.clipboard && navigator.clipboard.writeText(url) && (copyBtn.textContent = t('post.copied'));
-  });
+    var text = post.title || document.title || '';
+    var targets = {
+      weibo: 'https://service.weibo.com/share/share.php?url=' + encodeURIComponent(url) + '&title=' + encodeURIComponent(text),
+      x: 'https://twitter.com/intent/tweet?url=' + encodeURIComponent(url) + '&text=' + encodeURIComponent(text),
+      facebook: 'https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(url),
+      telegram: 'https://t.me/share/url?url=' + encodeURIComponent(url) + '&text=' + encodeURIComponent(text),
+      email: 'mailto:?subject=' + encodeURIComponent(text) + '&body=' + encodeURIComponent(url)
+    };
+    function closeMenu() { menu.hidden = true; shareBtn.setAttribute('aria-expanded', 'false'); }
+    function openMenu() { menu.hidden = false; shareBtn.setAttribute('aria-expanded', 'true'); }
+    shareBtn.addEventListener('click', function (e) {
+      if (e && e.stopPropagation) e.stopPropagation();
+      if (menu.hidden) openMenu(); else closeMenu();
+    });
+    document.addEventListener('click', function (e) {
+      if (!menu.hidden && e.target !== shareBtn && !(menu.contains && menu.contains(e.target))) closeMenu();
+    });
+    document.addEventListener('keydown', function (e) { if (e.key === 'Escape') closeMenu(); });
+    menu.querySelectorAll('[data-share]').forEach(function (el) {
+      var kind = el.getAttribute('data-share');
+      if (kind === 'copy') {
+        el.addEventListener('click', function () {
+          var done = function () {
+            el.textContent = t('post.copied');
+            closeMenu();
+            setTimeout(function () { el.innerHTML = svgIcon('link', 14) + ' ' + t('post.copyLink'); }, 1600);
+          };
+          if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(url).then(done, done); else done();
+        });
+      } else if (kind === 'native') {
+        el.addEventListener('click', function () {
+          closeMenu();
+          if (navigator.share) { try { navigator.share({ title: text, url: url }).catch(function () {}); } catch (err) {} }
+        });
+      } else if (targets[kind]) {
+        el.setAttribute('href', targets[kind]);
+      }
+    });
+  })();
 
-  // load comments（构建评论树：顶层 + 嵌套回复统一渲染）
+  // 正文字号：就地调整并记忆
+  var rsWrap = document.querySelector('#readingToolsHost') || document.querySelector('.reading-tools');
+  if (rsWrap) {
+    rsWrap.querySelectorAll('[data-rs]').forEach(function (b) {
+      b.addEventListener('click', function () {
+        var step = Number(b.getAttribute('data-rs'));
+        var next = step === 0 ? 1 : (getReadingScale() + step * 0.1);
+        setReadingScale(next);
+        toast(t('post.fontSize') + ' ' + Math.round(getReadingScale() * 100) + '%', 'ok');
+      });
+    });
+  }
+  // 移动端浮动目录：抽屉展开 / 关闭
+  var tocFab = document.querySelector('#tocFab');
+  var tocSheet = document.querySelector('#tocSheet');
+  function closeTocSheet() { if (tocSheet) tocSheet.hidden = true; }
+  if (tocFab && tocSheet) {
+    tocFab.addEventListener('click', function () { tocSheet.hidden = !tocSheet.hidden; });
+    var tocClose = document.querySelector('#tocSheetClose');
+    if (tocClose) tocClose.addEventListener('click', closeTocSheet);
+    tocSheet.querySelectorAll('a[data-toc]').forEach(function (a) { a.addEventListener('click', closeTocSheet); });
+  }
+
+  // 受保护文章：输入密码解密后渲染正文
+  (function initLock() {
+    var btn = document.querySelector('#postUnlockBtn');
+    if (!btn) return;
+    function fill(plain) {
+      var art = document.querySelector('#postArticle');
+      var lockEl = document.querySelector('#postLock');
+      if (!art) return;
+      art.innerHTML = renderMarkdown(plain || '');
+      art.style.display = '';
+      if (lockEl) lockEl.style.display = 'none';
+      try { applyHighlights(art, hlList(post.id)); } catch (e) {}
+      try { stampHeadingNumbers(buildToc(art.innerHTML).headings); } catch (e) {}
+      try { bindArticleEnhancements(); } catch (e) {}
+      try { updateReadingProgress(); updateTocActive(); } catch (e) {}
+    }
+    btn.addEventListener('click', async function () {
+      var inp = document.querySelector('#postLockPwd');
+      var err = document.querySelector('#postLockErr');
+      var pwd = inp ? String(inp.value) : '';
+      if (!pwd) { if (err) err.textContent = t('post.lockedPlaceholder'); return; }
+      btn.disabled = true;
+      try {
+        var plain = await pfDecrypt(post.enc, pwd);
+        if (err) err.textContent = '';
+        window.__postPlain = plain;
+        fill(plain);
+        toast(t('post.unlocked'), 'ok');
+      } catch (e) { if (err) err.textContent = t('post.unlockFail'); }
+      btn.disabled = false;
+    });
+  })();
+
+  // 划线高亮：恢复历史高亮，选中正文后浮出「高亮」按钮（按钮动态创建，避免改动渲染模板）
+  (function initHighlight() {
+    var article = document.querySelector('.article');
+    if (!article || !document.createElement) return;
+    // 后台「功能开关」可分别关闭：划线高亮（汇总/清除/导出/导入）与收藏（稍后读）
+    var hlOn = highlightToolsEnabled();
+    var bmOn = bookmarkEnabled();
+    if (hlOn) applyHighlights(article, hlList(post.id));
+
+    var tools = document.querySelector('.reading-tools');
+    var clearBtn = null, sumBtn = null;
+    if (tools && tools.appendChild && hlOn) {
+      sumBtn = document.createElement('button');
+      sumBtn.type = 'button'; sumBtn.className = 'rt-btn'; sumBtn.id = 'btnHlSummary';
+      sumBtn.textContent = t('post.hlSummary');
+      tools.appendChild(sumBtn);
+      clearBtn = document.createElement('button');
+      clearBtn.type = 'button'; clearBtn.className = 'rt-btn'; clearBtn.id = 'btnClearHl';
+      clearBtn.textContent = t('post.clearHl');
+      tools.appendChild(clearBtn);
+      if (bmOn) {
+        var lb = document.createElement('button');
+        lb.type = 'button'; lb.className = 'rt-btn'; lb.id = 'btnLater';
+        function _laterLabel() { if (isLater(post.id)) { lb.textContent = t('post.removeLater'); } else { lb.textContent = t('post.saveLater'); } }
+        _laterLabel();
+        lb.addEventListener('click', function () { toggleLater(post); _laterLabel(); });
+        tools.appendChild(lb);
+      }
+      // 高亮导出 / 导入（JSON，便于跨设备迁移）
+      var expBtn = document.createElement('button');
+      expBtn.type = 'button'; expBtn.className = 'rt-btn'; expBtn.id = 'btnHlExport';
+      expBtn.textContent = t('post.hlExport');
+      expBtn.addEventListener('click', function () {
+        try {
+          var data = { v: 1, post: post.id, at: Date.now(), items: hlList(post.id) };
+          transferDownloadText('highlights-' + post.id + '.json', JSON.stringify(data, null, 2), 'application/json;charset=utf-8');
+        } catch (e) { toast(t('post.hlImportFail'), 'err'); }
+      });
+      tools.appendChild(expBtn);
+      var impBtn = document.createElement('button');
+      impBtn.type = 'button'; impBtn.className = 'rt-btn'; impBtn.id = 'btnHlImport';
+      impBtn.textContent = t('post.hlImport');
+      var impFile = document.createElement('input');
+      impFile.type = 'file'; impFile.accept = '.json,application/json'; impFile.hidden = true;
+      impBtn.addEventListener('click', function () { impFile.click(); });
+      impFile.addEventListener('change', function () {
+        var f = impFile.files && impFile.files[0];
+        if (!f || !f.text) return;
+        f.text().then(function (txt) {
+          var parsed = null;
+          try { parsed = JSON.parse(txt); } catch (e) { parsed = null; }
+          var items = parsed && Array.isArray(parsed.items) ? parsed.items : (Array.isArray(parsed) ? parsed : null);
+          if (!items) { toast(t('post.hlImportFail'), 'err'); return; }
+          var cur = hlList(post.id);
+          var added = 0;
+          items.map(hlNorm).filter(Boolean).forEach(function (it) {
+            if (!cur.some(function (x) { return x.t === it.t; })) { cur.push(it); added++; }
+          });
+          hlSave(post.id, cur);
+          applyHighlights(article, cur);
+          toast(t('post.hlImported', { n: added }), 'ok');
+        }).catch(function () { toast(t('post.hlImportFail'), 'err'); });
+      });
+      tools.appendChild(impBtn);
+      if (document.body && document.body.appendChild) document.body.appendChild(impFile);
+    }
+    if (!hlOn) return;
+    var panel = document.createElement('div');
+    panel.className = 'hl-panel'; panel.id = 'hlPanel'; panel.hidden = true;
+    if (document.body && document.body.appendChild) document.body.appendChild(panel);
+    function renderPanel() {
+      var list = hlList(post.id);
+      panel.innerHTML = '<div class="hl-panel-title">' + t('post.hlSummary') + ' (' + list.length + ')</div>' +
+        (list.length ? '<div class="hl-panel-list">' + list.map(function (it, idx) {
+          return '<button type="button" class="hl-panel-item" data-hl-jump="' + idx + '"><span class="hl-panel-text">' + esc(it.t.slice(0, 60)) + '</span>' + (it.n ? '<span class="hl-panel-note">' + esc(it.n) + '</span>' : '') + '</button>';
+        }).join('') + '</div>' : '<div class="hl-panel-empty">' + t('post.hlEmpty') + '</div>');
+      panel.querySelectorAll('[data-hl-jump]').forEach(function (b) {
+        b.addEventListener('click', function () {
+          var idx = Number(b.getAttribute('data-hl-jump')) || 0;
+          var marks = article.querySelectorAll('mark.hl');
+          if (marks[idx] && marks[idx].scrollIntoView) marks[idx].scrollIntoView({ behavior: 'smooth', block: 'center' });
+          panel.hidden = true;
+        });
+      });
+    }
+    if (sumBtn) sumBtn.addEventListener('click', function () { renderPanel(); panel.hidden = !panel.hidden; });
+    var bar = document.createElement('button');
+    bar.type = 'button';
+    bar.className = 'hl-btn';
+    bar.id = 'hlBar';
+    bar.hidden = true;
+    bar.textContent = t('post.highlight');
+    var barNote = document.createElement('button');
+    barNote.type = 'button';
+    barNote.className = 'hl-btn hl-btn-note';
+    barNote.id = 'hlBarNote';
+    barNote.hidden = true;
+    barNote.textContent = t('post.hlWithNote');
+    if (document.body && document.body.appendChild) { document.body.appendChild(bar); document.body.appendChild(barNote); }
+
+    function hideHlBar() { bar.hidden = true; barNote.hidden = true; bar.removeAttribute('data-text'); }
+    function addHighlight(note) {
+      var text = bar.getAttribute('data-text') || '';
+      if (!text) return;
+      var cur = hlList(post.id);
+      var exists = cur.some(function (x) { return x.t === text; });
+      if (!exists) { cur.push({ t: text, n: note || '' }); hlSave(post.id, cur); }
+      applyHighlights(article, [{ t: text, n: note || '' }]);
+      hideHlBar();
+      toast(t('post.highlighted'), 'ok');
+    }
+    bar.addEventListener('click', function () { addHighlight(''); });
+    barNote.addEventListener('click', function () {
+      var note = window.prompt ? window.prompt(t('post.hlNotePrompt'), '') : '';
+      addHighlight(String(note || '').trim());
+    });
+    if (clearBtn) clearBtn.addEventListener('click', function () {
+      clearHighlights(article);
+      hlSave(post.id, []);
+      toast(t('post.hlCleared'), 'ok');
+    });
+    if (article.addEventListener) article.addEventListener('mouseup', function () {
+      setTimeout(function () {
+        var sel = window.getSelection ? window.getSelection() : null;
+        var text = sel ? String(sel).trim() : '';
+        if (!sel || !sel.rangeCount || text.length < 2 || text.length > 200) { hideHlBar(); return; }
+        var r = sel.getRangeAt(0);
+        var rect = r.getBoundingClientRect ? r.getBoundingClientRect() : null;
+        if (!rect || (!rect.width && !rect.height)) { hideHlBar(); return; }
+        var top = Math.max(8, rect.top - 44) + 'px';
+        var left = Math.max(8, rect.left + rect.width / 2 - 70) + 'px';
+        bar.hidden = false; barNote.hidden = false;
+        bar.style.top = top; bar.style.left = left;
+        barNote.style.top = top; barNote.style.left = 'calc(' + left + ' + 72px)';
+        bar.setAttribute('data-text', text);
+      }, 10);
+    });
+  })();
+
+  // 阅读位置记忆：先恢复上次位置，滚动过程中持续记录
+  _readPosCurrent = post.id;
+  historyRecord(post);
+  bindReadPos();
+  (function restoreReadPos() {
+    // 站内点击跳转（含上一篇 / 下一篇）不恢复阅读位置，一律从文章开头开始；
+    // 只有刷新页面或直接打开链接时才回到上次读到的位置。
+    if (_spaNav) return;
+    var y = getReadPos(post.id);
+    if (y > 300 && window.scrollTo) {
+      setTimeout(function () {
+        try { window.scrollTo({ top: y, behavior: 'smooth' }); } catch (e) { window.scrollTo(0, y); }
+        toast(t('post.readRestored'), 'ok');
+      }, 150);
+    }
+  })();
+
+  // load comments（顶层 + 嵌套回复统一渲染；支持「最热 / 最新」排序与分页）
+  var CMT_PAGE = 8;
+  var _cmtState = { sort: 'hot', shown: CMT_PAGE, list: [], serverPaged: false, serverPage: 0, serverPages: 1, loading: false };
   function refreshComments(list) {
+    _cmtState.list = Array.isArray(list) ? list : [];
+    _cmtState.shown = CMT_PAGE;
+    renderCommentView();
+  }
+  // 评论切换中的骨架：行数跟随当前已加载条数，形状与真实评论一致，切换时视觉连贯
+  function cmtLoadingSkeleton(n) {
+    n = Math.max(1, Math.min(n, 6));
+    var out = '';
+    for (var i = 0; i < n; i++) {
+      out += '<li class="comment comment-skeleton" aria-hidden="true"><div class="comment-head">'
+        + '<span class="comment-avatar cs-avatar"></span><span class="cs-line w25"></span>'
+        + '</div><div class="comment-main"><div class="cs-line w95"></div><div class="cs-line w60"></div>'
+        + '<div class="cs-line w35"></div></div></li>';
+    }
+    return out;
+  }
+  function renderCommentView() {
     var ul = document.querySelector('#commentList');
     var cnt = document.querySelector('#commentCount');
+    var moreWrap = document.querySelector('#commentMore');
     if (!ul) return;
-    if (cnt) cnt.textContent = String(list ? list.length : 0);
+    var list = _cmtState.list;
+    if (cnt) cnt.textContent = String(list.length);
+    if (_cmtState.loading) {
+      // 排序切换中：保留原有评论的骨架占位，避免出现「空白 / 无数据」再突然刷出内容
+      ul.innerHTML = cmtLoadingSkeleton(list.length || 3);
+      if (moreWrap) moreWrap.style.display = 'none';
+      return;
+    }
+    if (!list.length) {
+      ul.innerHTML = '<li class="comment-empty">' + t('comment.noComments') + '</li>';
+      if (moreWrap) moreWrap.style.display = 'none';
+      return;
+    }
     var canDel = !_cloudOn() || adminOk();
-    if (!list || !list.length) { ul.innerHTML = '<li class="comment-empty">' + t('comment.noComments') + '</li>'; return; }
-    ul.innerHTML = renderCommentTree(list, canDel);
+    var sorter = _cmtState.sort === 'new' ? commentSortNew : commentSort;
+    var paged = _cmtState.serverPaged;
+    ul.innerHTML = renderCommentTree(list, canDel, { sorter: sorter, limit: paged ? 0 : _cmtState.shown });
+    var hasMore = paged ? (_cmtState.serverPage < _cmtState.serverPages) : (commentRootCount(list) > _cmtState.shown);
+    if (moreWrap) moreWrap.style.display = hasMore ? 'block' : 'none';
+    bindCommentActions(ul);
+  }
+  function bindCommentActions(ul) {
     // 删除按钮
     ul.querySelectorAll('.comment-del').forEach(function (b) {
       b.addEventListener('click', function () {
         deleteComment(post.id, b.getAttribute('data-cid')).then(refreshComments);
+      });
+    });
+    // 评论点赞（每浏览器一次，云端调用点赞接口）
+    ul.querySelectorAll('.comment-like').forEach(function (b) {
+      b.addEventListener('click', async function () {
+        var cid = b.getAttribute('data-like-id');
+        if (!cid || b.classList.contains('liked') || b.disabled) return;
+        b.disabled = true;
+        markCommentLiked(cid);
+        b.classList.add('liked');
+        var countEl = b.querySelector('span');
+        var oldCount = countEl ? Number(countEl.textContent) || 0 : 0;
+        if (countEl) countEl.textContent = String(oldCount + 1);
+        try {
+          if (_cloudOn()) {
+            var result = await apiFetch('api/comments/' + encodeURIComponent(cid) + '/like', { method: 'POST', body: '{}' });
+            if (countEl && result && result.likes !== undefined) countEl.textContent = String(Number(result.likes) || 0);
+          } else {
+            var localList = await loadComments(post.id);
+            var target = localList.find(function (item) { return String(item.id) === String(cid); });
+            if (target) target.likes = oldCount + 1;
+            try { localStorage.setItem(commentKey(post.id), JSON.stringify(localList)); } catch (e) {}
+          }
+        } catch (e) {
+          unmarkCommentLiked(cid);
+          b.classList.remove('liked');
+          if (countEl) countEl.textContent = String(oldCount);
+          toast(t('comment.likeFail'), 'err');
+        } finally { b.disabled = false; }
       });
     });
     // 回复按钮（含二级/三级回复，均可继续回复）
@@ -2636,7 +4042,80 @@ async function renderPost(id) {
       });
     });
   }
-  loadComments(post.id).then(refreshComments);
+  var sortWrap = document.querySelector('#commentSort');
+  if (sortWrap) {
+    sortWrap.querySelectorAll('[data-sort]').forEach(function (b) {
+      b.addEventListener('click', function () {
+        var v = b.getAttribute('data-sort');
+        if (v === _cmtState.sort || _cmtState.loading) return;
+        _cmtState.sort = v;
+        _cmtState.shown = CMT_PAGE;
+        // 立刻给出选中反馈（选中态 / 按钮按下态），再去取数据
+        sortWrap.querySelectorAll('[data-sort]').forEach(function (x) {
+          var on = x === b;
+          x.classList.toggle('active', on);
+          x.setAttribute('aria-selected', on ? 'true' : 'false');
+        });
+        b.classList.add('pressed');
+        setTimeout(function () { b.classList.remove('pressed'); }, 220);
+        if (_cmtState.serverPaged) {
+          // 旧列表留在原地做骨架占位，数据回来后再整块替换，过渡不闪空
+          _cmtState.loading = true;
+          renderCommentView();
+          cloudCommentPage(1, v).then(function (res) {
+            _cmtState.serverPage = 1;
+            _cmtState.serverPages = Number(res && res.pages) || 1;
+            _cmtState.list = (res && res.comments) || [];
+          }).catch(function () {
+            toast(t('comment.loadFail'), 'err');
+          }).then(function () {
+            _cmtState.loading = false;
+            _cmtState.shown = CMT_PAGE;
+            renderCommentView();
+          });
+          return;
+        }
+        renderCommentView();
+      });
+    });
+  }
+  var moreBtn = document.querySelector('#commentMoreBtn');
+  if (moreBtn) moreBtn.addEventListener('click', async function () {
+    if (_cmtState.serverPaged) {
+      moreBtn.disabled = true;
+      try {
+        var next = _cmtState.serverPage + 1;
+        var res = await cloudCommentPage(next, _cmtState.sort);
+        var have = {};
+        _cmtState.list.forEach(function (c) { have[c.id] = 1; });
+        ((res && res.comments) || []).forEach(function (c) { if (!have[c.id]) _cmtState.list.push(c); });
+        _cmtState.serverPage = next;
+        _cmtState.serverPages = Number(res && res.pages) || _cmtState.serverPages;
+      } catch (e) { toast(t('comment.likeFail'), 'err'); }
+      moreBtn.disabled = false;
+      renderCommentView();
+      return;
+    }
+    _cmtState.shown += CMT_PAGE;
+    renderCommentView();
+  });
+  function cloudCommentPage(page, sort) {
+    var qs = '?page=' + page + '&per=' + CMT_PAGE + '&sort=' + encodeURIComponent(sort || 'hot') + '&_=' + Date.now();
+    return apiFetch('api/posts/' + encodeURIComponent(post.id) + '/comments' + qs);
+  }
+  (function loadInitialComments() {
+    if (_cloudOn()) {
+      cloudCommentPage(1, _cmtState.sort).then(function (res) {
+        _cmtState.serverPaged = true;
+        _cmtState.serverPage = 1;
+        _cmtState.serverPages = Number(res && res.pages) || 1;
+        refreshComments((res && res.comments) || []);
+      }).catch(function () { _cmtState.serverPaged = false; loadComments(post.id).then(refreshComments); });
+      return;
+    }
+    _cmtState.serverPaged = false;
+    loadComments(post.id).then(refreshComments);
+  })();
 
   // 取消回复
   var replyCancel = document.querySelector('#replyCancel');
@@ -2651,6 +4130,7 @@ async function renderPost(id) {
   if (commentEmoji && commentContent && window.initSmojiPicker) window.initSmojiPicker(commentEmoji, commentContent);
 
   var submit = document.querySelector('#commentSubmit');
+  var commentFormTs = Date.now();   // 反机器人：表单渲染时间
   if (submit) submit.addEventListener('click', async function () {
     var a = document.querySelector('#commentAuthor');
     var c = document.querySelector('#commentContent');
@@ -2661,7 +4141,8 @@ async function renderPost(id) {
     var parentId = (indicator && indicator.getAttribute('data-reply-id')) || null;
     submit.disabled = true;
     try {
-      await saveComment(post.id, a.value, c.value, parentId);
+      var hpEl = document.querySelector('#commentHp');
+      await saveComment(post.id, a.value, c.value, parentId, { hp: hpEl ? hpEl.value : '', ts: commentFormTs });
       if (st) st.textContent = t('comment.posted');
       if (c) c.value = '';
       if (indicator) { indicator.style.display = 'none'; indicator.removeAttribute('data-reply-id'); }
@@ -2675,9 +4156,158 @@ async function renderPost(id) {
   });
 
   loadPostRelations(post.id);
+  loadWebmentions(post);
 }
 
-/* 正文加载失败（网络/超时）时渲染的静态失败页：保留标题，提供手动重试，不再自动循环拉取 */
+/* ============================================================================
+ * 富内容按需渲染：Mermaid 图表 + KaTeX 数学公式
+ * ----------------------------------------------------------------------------
+ * 只有页面里真的出现 ```mermaid 代码块 / $…$ 公式时才加载对应库（本地 libs/ 自托管），
+ * 普通页面零额外请求；可用后台「功能开关 → 图表 / 公式渲染」关闭。
+ * ============================================================================ */
+var _katexPromise = null, _mermaidPromise = null;
+function _loadScriptOnce(src) {
+  return new Promise(function (resolve, reject) {
+    var s = document.createElement('script');
+    s.src = src; s.async = true;
+    s.onload = function () { resolve(true); };
+    s.onerror = function () { reject(new Error('load failed: ' + src)); };
+    document.head.appendChild(s);
+  });
+}
+function _richContentOff() {
+  try { var f = getConfig().features || {}; return f.richContent === false; } catch (e) { return false; }
+}
+function ensureKatex() {
+  if (window.katex && window.renderMathInElement) return Promise.resolve(true);
+  if (_katexPromise) return _katexPromise;
+  _katexPromise = new Promise(function (resolve) {
+    try {
+      if (!document.querySelector('link[data-katex-css]')) {
+        var l = document.createElement('link');
+        l.rel = 'stylesheet'; l.href = appRoot() + 'libs/katex/katex.min.css'; l.setAttribute('data-katex-css', '1');
+        document.head.appendChild(l);
+      }
+    } catch (e) {}
+    _loadScriptOnce(appRoot() + 'libs/katex/katex.min.js')
+      .then(function () { return _loadScriptOnce(appRoot() + 'libs/katex/contrib/auto-render.min.js'); })
+      .then(function () { resolve(!!window.renderMathInElement); })
+      .catch(function () { _katexPromise = null; resolve(false); });
+  });
+  return _katexPromise;
+}
+function ensureMermaid() {
+  if (window.mermaid) return Promise.resolve(window.mermaid);
+  if (_mermaidPromise) return _mermaidPromise;
+  _mermaidPromise = _loadScriptOnce(appRoot() + 'libs/mermaid/mermaid.min.js').then(function () {
+    if (!window.mermaid) throw new Error('mermaid missing');
+    try {
+      window.mermaid.initialize({ startOnLoad: false, securityLevel: 'strict', theme: (getTheme() === 'dark' ? 'dark' : 'default') });
+    } catch (e) {}
+    return window.mermaid;
+  }).catch(function (e) { _mermaidPromise = null; throw e; });
+  return _mermaidPromise;
+}
+/** 在给定容器内按需渲染 Mermaid / KaTeX（root 通常是 .article 或编辑器预览） */
+function enhanceRichContent(root) {
+  try {
+    if (!root || _richContentOff()) return;
+    // —— Mermaid ——
+    var codes = root.querySelectorAll('code.lang-mermaid, code.language-mermaid');
+    if (codes.length) {
+      var nodes = [];
+      Array.prototype.forEach.call(codes, function (code) {
+        var pre = code.parentNode;
+        var box = document.createElement('div');
+        box.className = 'mermaid';
+        box.textContent = code.textContent || '';
+        if (pre && pre.parentNode) pre.parentNode.replaceChild(box, pre);
+        nodes.push(box);
+      });
+      ensureMermaid().then(function (mm) {
+        try { return mm.run({ nodes: nodes }); } catch (e) { return null; }
+      }).catch(function () {
+        Array.prototype.forEach.call(nodes, function (n) { n.classList.add('mermaid-failed'); });
+      });
+    }
+    // —— KaTeX 数学公式 ——
+    var txt = root.textContent || '';
+    if (/\$\$[\s\S]+?\$\$/.test(txt) || /(^|[^\\$])\$(?!\s)[^$\n]{1,400}?\$/.test(txt)) {
+      ensureKatex().then(function (ok) {
+        if (!ok || !window.renderMathInElement) return;
+        try {
+          window.renderMathInElement(root, {
+            delimiters: [
+              { left: '$$', right: '$$', display: true },
+              { left: '\\[', right: '\\]', display: true },
+              { left: '$', right: '$', display: false },
+              { left: '\\(', right: '\\)', display: false }
+            ],
+            throwOnError: false
+          });
+        } catch (e) {}
+      });
+    }
+  } catch (e) { /* 富内容渲染失败不影响正文 */ }
+}
+
+/* ---------- Webmention：外站引用展示 ----------
+ * 云端模式下按文章绝对地址查询引用，有数据才显示区块。 */
+function loadWebmentions(post) {
+  try {
+    var box = document.querySelector('#postWebmentions');
+    if (!box || !_cloudOn() || !post) return;
+    var base = String(getConfig().siteUrl || (typeof location !== 'undefined' ? location.origin : '')).replace(/\/+$/, '');
+    var target = base + postUrl(post.id);
+    apiFetch('api/webmention?target=' + encodeURIComponent(target)).then(function (d) {
+      var list = (d && d.mentions) || [];
+      if (!list.length) return;
+      box.hidden = false;
+      box.innerHTML = '<h3 class="wm-title">' + svgIcon('link', 15) + ' ' + esc(t('webmention.title', { n: list.length })) + '</h3>' +
+        '<div class="wm-list">' + list.map(function (m) {
+          var dt = m.created_at ? new Date(Number(m.created_at)).toISOString().slice(0, 10) : '';
+          return '<div class="wm-item">' +
+            '<div class="wm-head"><a href="' + esc(m.source) + '" target="_blank" rel="noopener nofollow">' + esc(m.author_name || m.title || m.source) + '</a><span class="wm-date">' + esc(dt) + '</span></div>' +
+            (m.title ? '<div class="wm-sub">' + esc(m.title) + '</div>' : '') +
+            (m.excerpt ? '<p class="wm-excerpt">' + esc(m.excerpt) + '</p>' : '') +
+            '</div>';
+        }).join('') + '</div>';
+    }).catch(function () {});
+  } catch (e) {}
+}
+
+/* 凭签名令牌读取未发布文章，展示「预览模式」提示条；不索引、不统计、不加载评论。 */
+async function renderPreviewPage(token) {
+  app().innerHTML = renderNav('/') + '<main class="container page-fade"><div class="post-body">' +
+    '<div class="preview-banner">' + svgIcon('eye', 14) + ' ' + t('preview.banner') + '</div>' +
+    '<div class="empty"><div class="big">' + svgIcon('spinner', 26) + '</div><p>' + t('site.loading') + '…</p></div>' +
+    '</div></main>' + renderFooter();
+  try { _setMeta('robots', 'noindex, nofollow'); } catch (e) {}
+  try {
+    var d = await apiFetch('api/preview?token=' + encodeURIComponent(token || ''));
+    var post = d && d.post;
+    if (!post) throw new Error(t('preview.invalid'));
+    var bodyHtml = post.enc ? '' : renderMarkdown(post.content || '');
+    var tocRes = buildToc(bodyHtml);
+    var html = renderNav('/');
+    html += '<main class="container page-fade"><div class="post-body">';
+    html += '<div class="preview-banner">' + svgIcon('eye', 14) + ' ' + t('preview.banner') + ' ' + esc(post.title || t('post.untitled')) + '</div>';
+    html += '<div class="post-header"><h1>' + esc(post.title || t('post.untitled')) + '</h1><div class="meta"><span class="meta-date">' + esc(post.date || '') + '</span>' + (post.tags && post.tags.length ? '<span>' + post.tags.map(function (x) { return esc(x); }).join(' / ') + '</span>' : '') + '</div></div>';
+    html += tocRes.html;
+    if (post.enc) {
+      html += '<div class="post-lock"><div class="post-lock-ico">' + svgIcon('lock', 26) + '</div><p class="post-lock-title">' + t('post.lockedTitle') + '</p><p class="post-lock-desc">' + t('post.lockedDesc') + '</p></div>';
+    } else {
+      html += '<article class="article">' + bodyHtml + '</article>';
+    }
+    html += '</div></main>' + renderFooter();
+    app().innerHTML = html;
+    try { _setMeta('robots', 'noindex, nofollow'); document.title = '（预览）' + (post.title || '') + ' · ' + getSiteName(); } catch (e) {}
+    enhanceRichContent(document.querySelector('.article'));
+  } catch (e) {
+    app().innerHTML = renderNav('/') + '<main class="container page-fade"><div class="empty"><div class="big">' + svgIcon('lock', 36) + '</div><p>' + esc((e && e.message) || t('preview.invalid')) + '</p><p><a href="' + esc(href('/')) + '">' + t('post.backHome') + '</a></p></div></main>' + renderFooter();
+  }
+}
+
 function renderPostFail(post) {
   var html = renderNav(currentRoute().path);
   html += '<main class="container page-fade"><div class="post-body"><div class="post-header"><h1>' + esc(post.title || t('post.untitled')) + '</h1><div class="meta"><span class="meta-date">' + esc(post.date || '') + '</span></div></div>';
@@ -2686,6 +4316,36 @@ function renderPostFail(post) {
   app().innerHTML = html;
   var retry = document.querySelector('#retryPostBtn');
   if (retry) retry.addEventListener('click', function () { route(); });
+}
+
+/* ---------- 多作者：/authors 列表与 /authors/<name> 作者主页 ---------- */
+function authorsIndex() {
+  var map = {};
+  getPublishedPosts().forEach(function (p) { var a = String(p.author || '').trim(); if (a) map[a] = (map[a] || 0) + 1; });
+  return Object.keys(map).sort(function (x, y) { return x.localeCompare(y); }).map(function (a) { return { name: a, count: map[a] }; });
+}
+function authorPosts(name) {
+  var key = String(name || '').trim();
+  return sortPagePosts(getPublishedPosts().filter(function (p) { return String(p.author || '').trim() === key; }));
+}
+function renderAuthors() {
+  var list = authorsIndex();
+  var html = renderNav('/authors');
+  html += '<main class="container page-fade"><div class="list-head"><h2 class="page-title">' + t('authors.title') + '</h2></div>';
+  if (!list.length) html += '<div class="empty"><div class="big">' + svgIcon('pen', 36) + '</div><p>' + t('authors.empty') + '</p></div>';
+  else html += '<div class="author-grid">' + list.map(function (a) {
+    return '<a class="author-card" href="' + esc(href('/authors/' + encodeURIComponent(a.name))) + '"><span class="author-avatar">' + esc(a.name.slice(0, 1)) + '</span><span class="author-info"><b>' + esc(a.name) + '</b><span class="author-count">' + esc(t('authors.count', { n: a.count })) + '</span></span></a>';
+  }).join('') + '</div>';
+  html += '</main>' + renderFooter();
+  return html;
+}
+function renderAuthorPage(name) {
+  var posts = authorPosts(name);
+  var html = renderNav('/authors');
+  html += '<main class="container page-fade"><div class="list-head"><h2 class="page-title">' + esc(name) + ' <span class="author-count">' + esc(t('authors.count', { n: posts.length })) + '</span></h2></div>';
+  html += posts.length ? '<div id="listContainer" class="list-nopager">' + renderCardList(posts, {}, false) + '</div>' : '<div class="empty"><p>' + esc(t('authors.empty')) + '</p></div>';
+  html += '</main>' + renderFooter();
+  return html;
 }
 
 function renderArchive() {
@@ -2800,7 +4460,7 @@ function renderSeriesList() {
       var first = g.posts[0] || {};
       html += '<a class="post-card" href="' + esc(href(seriesUrl(g.name))) + '"><div class="post-card-main">' +
         '<div class="meta"><span class="date">' + esc(t('series.count', { count: g.posts.length })) + '</span><span class="pin">' + svgIcon('list', 13) + ' ' + esc(t('series.label')) + '</span></div>' +
-        '<h2>' + esc(g.name) + '</h2><div class="excerpt">' + esc(g.posts.slice(0, 4).map(function (p) { return p.title || ''; }).join(' · ')) + '</div>' +
+        '<h2>' + esc(g.name) + '</h2><div class="excerpt">' + esc(g.posts.slice(0, 4).map(function (p) { return p.title || ''; }).join('、')) + '</div>' +
         '<div class="mini-tags"><span>' + esc(t('series.part')) + '</span></div></div>' + renderPostThumb(first, idx) + '</a>';
     });
     html += '</div>';
@@ -2891,6 +4551,18 @@ function renderTags() {
   return html;
 }
 
+function renderCategories() {
+  var counts = categoryCounts();
+  // 分类来源：后台「分类」导航的自定义子分类 + 历史文章已用分类
+  var names = allCategories();
+  var html = renderNav(currentRoute().path);
+  html += '<main class="container page-fade"><h2 class="page-title">' + svgIcon('tag', 20) + ' ' + t('categories.title') + '</h2><div class="tag-cloud">';
+  names.forEach(function (c) { html += '<a class="cloud-chip" href="' + esc(href('/', { category: c })) + '">' + esc(c) + '<span class="cloud-count">' + counts[c] + '</span></a>'; });
+  if (!names.length) html += '<p class="ab-muted">' + t('categories.empty') + '</p>';
+  html += '</div></main>' + renderFooter();
+  return html;
+}
+
 /* ============================================================
  * 留言板（云端，复用评论域的安全管道）
  * ------------------------------------------------------------
@@ -2904,6 +4576,33 @@ function renderTags() {
  *   · 可选审核（moderate_comments）
  * 不新增后端接口与数据表，避免重复实现安全逻辑。
  * ============================================================ */
+function renderHistory() {
+  var h=historyList(); var l2=laterList();
+  var out=renderNav(currentRoute().path);
+  out += '<main class="container page-fade"><h2 class="page-title">' + t('history.title') + '</h2>';
+  out += '<div class="ab-card"><div class="ab-section-title">' + t('history.reading') + ' (' + h.length + ')</div><div class="tag-cloud">' + h.map(function (x) { return '<a class="cloud-chip" href="' + esc(href(postUrl(x.id))) + '">' + esc(x.title || x.id) + '</a>'; }).join('') + '</div></div>';
+  out += '<div class="ab-card"><div class="ab-section-title">' + t('history.later') + ' (' + l2.length + ')</div><div class="tag-cloud">' + l2.map(function (x) { return '<a class="cloud-chip" href="' + esc(href(postUrl(x.id))) + '">' + esc(x.title || x.id) + '</a>'; }).join('') + '</div></div>';
+  out += '</main>' + renderFooter(); return out;
+}
+
+function renderLinks() {
+  var cfg = getConfig();
+  var links = (cfg.friendLinks || []).filter(function (x) { return x && x.url; });
+  var html = renderNav(currentRoute().path);
+  html += L + 'main class="container page-fade"' + G + L + 'h2 class="page-title"' + G + t('links.title') + L + '/h2' + G;
+  if (links.length) {
+    html += L + 'div class="friend-grid"' + G + links.map(function (x) {
+      var ext = /^https?:/.test(x.url) ? ' target="_blank" rel="noopener"' : '';
+      return L + 'a class="friend-card" href="' + esc(x.url) + '"' + ext + G + L + 'span class="friend-name"' + G + esc(x.text || x.url) + L + '/span' + G + L + '/a' + G;
+    }).join('') + L + '/div' + G;
+  } else {
+    html += L + 'p class="ab-muted"' + G + t('links.empty') + L + '/p' + G;
+  }
+  html += L + '/main' + G + renderFooter();
+  return html;
+}
+var L = String.fromCharCode(60), G = String.fromCharCode(62);
+
 var GUESTBOOK_IDS = { note: 'gb-note', idea: 'gb-idea' };
 function guestbookId(kind) { return GUESTBOOK_IDS[kind] || GUESTBOOK_IDS.note; }
 
@@ -2924,7 +4623,7 @@ function renderGuestbook() {
     // 发表表单
     + '<div class="guestbook-form card">'
     + '<div class="gb-form-row">'
-    + '<input type="text" id="gbAuthor" maxlength="30" placeholder="' + t('guestbook.authorPlaceholder') + '" autocomplete="name">'
+    + '<input class="hp-field" type="text" id="gbHp" name="hp" tabindex="-1" autocomplete="off" aria-hidden="true">' + '<input type="text" id="gbAuthor" maxlength="30" placeholder="' + t('guestbook.authorPlaceholder') + '" autocomplete="name">'
     + '<button class="gb-submit" id="gbSubmit" type="button" aria-label="' + t('guestbook.postAnon') + '">' + svgIcon('send', 15) + '</button>'
     + '</div>'
     + '<div class="gb-kind-hint" id="gbKindHint">' + svgIcon('pen', 13) + ' <span></span></div>'
@@ -3004,13 +4703,15 @@ async function bindGuestbook() {
       if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); onPost(); }
     });
   }
+  var gbFormTs = Date.now();   // 反机器人：表单渲染时间
   async function onPost() {
     if (!author || !content || !status) return;
     if (!author.value.trim() || !content.value.trim()) { status.textContent = t('guestbook.fillBoth'); return; }
     submit.disabled = true;
     status.textContent = t('guestbook.posting');
     try {
-      var c = await saveComment(guestbookId(kind), author.value, content.value);
+      var gbHpEl = document.querySelector('#gbHp');
+      var c = await saveComment(guestbookId(kind), author.value, content.value, null, { hp: gbHpEl ? gbHpEl.value : '', ts: gbFormTs });
       status.textContent = t('guestbook.posted');
       content.value = '';
       load();
@@ -3233,7 +4934,7 @@ function renderEditorBody() {
     + '<button class="btn btn-outline-danger btn-logout" id="btnClearData" title="' + t('editor.clearDataTitle') + '">' + svgIcon('trash', 14) + ' ' + t('editor.cleanData') + '</button>'
     + '<button class="btn btn-ghost btn-logout" id="btnLogout">' + svgIcon('logout', 15) + ' ' + t('editor.exitLogin') + '</button></span>'
     + '</div>';
-  body += '<p class="keys-hint"><kbd>Ctrl</kbd>+<kbd>S</kbd> ' + t('editor.saveDraft') + ' · <kbd>Ctrl</kbd>+<kbd>Enter</kbd> ' + t('editor.savePost') + '</p>';
+  body += '<p class="keys-hint"><kbd>Ctrl</kbd>+<kbd>S</kbd> ' + t('editor.saveDraft') + ' <kbd>Ctrl</kbd>+<kbd>Enter</kbd> ' + t('editor.savePost') + '</p>';
   body += '<h3 class="draft-hint"><b>' + t('editor.exportAll') + ':</b> ' + t('editor.exportHint') + '</h3>';
   return body;
 }
@@ -3937,6 +5638,26 @@ function href(path, query) {
 function postUrl(id) {
   return '/posts/' + encodeURIComponent(id) + '/';
 }
+/* ---------- 视图切换过渡 ----------
+ * 上一页 / 下一篇 等站内跳转时，先让当前内容轻微淡出，再渲染新页面并淡入。
+ * 纯透明度交叉淡入淡出，没有位移与翻转，避免出现「翻书」般的观感。
+ * 用户开启了「减少动态效果」时直接渲染，不做任何动画。 */
+var _viewBusy = false;
+function prefersReducedMotion() {
+  try { return typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches; } catch (e) { return false; }
+}
+function withViewTransition(run) {
+  if (_viewBusy || prefersReducedMotion() || typeof document === 'undefined') { run(); return; }
+  var host = app();
+  var leaving = host && host.querySelector ? host.querySelector('main.page-fade') : null;
+  if (!leaving) { run(); return; }
+  _viewBusy = true;
+  leaving.classList.add('page-leaving');
+  window.setTimeout(function () {
+    _viewBusy = false;
+    run();
+  }, 130);
+}
 /** 跳转：history 模式用 pushState，hash 模式用 hash 赋值 */
 function navigate(path, query) {
   // 去掉任何残留的 ?查询 / #片段，避免路径出现双重 ?（如 #/?page=2?）
@@ -3948,7 +5669,8 @@ function navigate(path, query) {
       history.pushState({}, '', appRoot() + path + (query ? serializeQuery(query) : ''));
     } catch (e) {}
   }
-  route();
+  _spaNav = true;
+  withViewTransition(route);
 }
 function serializeQuery(query) {
   var kv = Object.keys(query || {}).map(function (k) { return encodeURIComponent(k) + '=' + encodeURIComponent(query[k]); });
@@ -3972,7 +5694,13 @@ async function route() {
   var path = r.path;
   var q = r.query;
 
-  if (path === '/') { app().innerHTML = renderHome(); fitCardLineClamps(); }
+  if (path === '/') { app().innerHTML = renderHome(); fitCardLineClamps(); if (getConfig().homeTheme === 'magazine') { startMagazineClock(); bindMagazineWeather(); alignMagazineRail(); } else if (_magazineClockTimer) { clearInterval(_magazineClockTimer); _magazineClockTimer = null; } }
+  else if (path.indexOf('/preview/') === 0) {
+    // 草稿预览分享链接：/preview/<签名 token>
+    var pvToken = path.slice('/preview/'.length).replace(/\/.*$/, '');
+    try { pvToken = decodeURIComponent(pvToken); } catch (e) {}
+    await renderPreviewPage(pvToken);
+  }
   else if (path.indexOf('/posts/') === 0) {
     // /posts/<别名>/  或  /posts/<别名>/edit
     var rest = path.slice('/posts/'.length); // 已去尾斜杠
@@ -4005,10 +5733,19 @@ async function route() {
       renderAdmin();
     }
   }
+  else if (path === '/authors') { app().innerHTML = renderAuthors(); }
+  else if (path.indexOf('/authors/') === 0) {
+    var authorName = '';
+    try { authorName = decodeURIComponent(path.slice('/authors/'.length).replace(/\/.*$/, '')); } catch (e) { authorName = path.slice('/authors/'.length); }
+    app().innerHTML = renderAuthorPage(authorName);
+  }
   else if (path === '/archive') { app().innerHTML = renderArchive(); }
   else if (path === '/subscribe') { app().innerHTML = renderSubscribe(); bindSubscribe(); }
   else if (path === '/about') { app().innerHTML = renderAbout(); }
   else if (path === '/tags') { app().innerHTML = renderTags(); }
+  else if (path === '/categories') { app().innerHTML = renderCategories(); }
+  else if (path === '/history') { app().innerHTML = renderHistory(); }
+  else if (path === '/links') { app().innerHTML = renderLinks(); }
   else if (path === '/series') { app().innerHTML = renderSeriesList(); fitCardLineClamps(); }
   else if (path === '/popular') { app().innerHTML = renderPopular(); bindPopular(); }
   else if (path.indexOf('/series/') === 0) { var seriesName = ''; try { seriesName = decodeURIComponent(path.slice('/series/'.length)); } catch (e) { seriesName = path.slice('/series/'.length); } app().innerHTML = renderSeriesDetail(seriesName); fitCardLineClamps(); }
@@ -4017,6 +5754,13 @@ async function route() {
     app().innerHTML = renderNav(path) + '<main class="container page-fade"><div class="empty"><div class="big">' + svgIcon('question', 36) + '</div><p>' + t('post.notFound') + '</p><p><a href="' + esc(href('/')) + '">' + t('post.backHome') + '</a></p></div></main>' + renderFooter();
   }
   updateSEO(path);
+  // 路由切换后回到页面顶部：否则从「上一篇 / 下一篇」跳转后仍停在新文章的同一滚动位置，
+  // 读者会以为没换页，而是直接落到文章中段 / 底部导航处。
+  if ('scrollRestoration' in history) { try { history.scrollRestoration = 'manual'; } catch (e) {} }
+  try { if (window.scrollX !== 0 || window.scrollY !== 0) window.scrollTo(0, 0); } catch (e) { try { window.scrollTo(0, 0); } catch (e2) {} }
+  // 部分浏览器在同一文档导航后会再恢复一次旧滚动位置，下一帧再归零一次兜底
+  try { requestAnimationFrame(function () { window.scrollTo(0, 0); }); } catch (e) {}
+  _spaNav = false;
   bindGlobal();
   /* 播放器等全站组件监听路由变化（如后台页隐藏播放器） */
   try { window.dispatchEvent(new CustomEvent('qy:route')); } catch (e) {}
@@ -4033,6 +5777,8 @@ function updateSEO(path) {
   var pageUrl = base + (path === '/' ? '' : path);
   var pageImage = '';
   var pageType = 'website';
+  var canonicalUrl = pageUrl;
+  var robotsMeta = 'index, follow, max-image-preview:large, max-snippet:-1';
 
   if (path === '/') {
     pageTitle = n + ' · ' + t('site.subtitle');
@@ -4042,6 +5788,9 @@ function updateSEO(path) {
   } else if (path === '/tags') {
     pageTitle = t('tags.title') + ' · ' + n;
     pageDesc = t('tags.title') + ' - ' + siteDesc;
+  } else if (path === '/history') { pageTitle = t('history.title') + ' · ' + n; } else if (path === '/links') { pageTitle = t('links.title') + ' · ' + n; } else if (path === '/categories') {
+    pageTitle = t('categories.title') + ' · ' + n;
+    pageDesc = t('categories.title') + ' - ' + siteDesc;
   } else if (path === '/about') {
     pageTitle = t('about.title') + ' · ' + n;
     pageDesc = t('about.desc');
@@ -4053,12 +5802,16 @@ function updateSEO(path) {
     try { id = decodeURIComponent(path.replace('/posts/', '').replace(/\/.*$/, '')); } catch (e) {}
     var posts = getStaticPosts();
     var post = posts.find(function (p) { return p.id === id; });
+    var seo = (post && post.seo) || {};
     if (post) {
       pageType = 'article';
-      pageTitle = (post.title || t('post.untitled')) + ' · ' + n;
-      pageDesc = post.excerpt || stripMd(post.content || '').slice(0, 200);
+      // 文章级 SEO 覆盖优先；未填写则沿用自动生成
+      pageTitle = seo.title || ((post.title || t('post.untitled')) + ' · ' + n);
+      pageDesc = seo.desc || post.excerpt || stripMd(post.content || '').slice(0, 200) || siteDesc;
       pageImage = post.ogImage || post.cover || '';
       pageUrl = base + '/posts/' + encodeURIComponent(post.id) + '/';
+      canonicalUrl = seo.canonical || pageUrl;
+      if (seo.noindex) robotsMeta = 'noindex, nofollow';
     }
   } else if (path.indexOf('/admin') === 0 || path === '/write') {
     // 后台页面不索引
@@ -4073,7 +5826,7 @@ function updateSEO(path) {
   document.title = pageTitle;
   _setMeta('description', pageDesc);
   _setMeta('author', getSiteAuthor());
-  _setMeta('robots', 'index, follow, max-image-preview:large, max-snippet:-1');
+  _setMeta('robots', robotsMeta);
 
   // Open Graph
   _setOG('og:type', pageType);
@@ -4091,7 +5844,7 @@ function updateSEO(path) {
 
   // Canonical
   var canonical = document.querySelector('link[rel="canonical"]');
-  if (canonical) canonical.setAttribute('href', pageUrl);
+  if (canonical) canonical.setAttribute('href', canonicalUrl);
 
   // Favicon：云端「站点头像 / Logo URL」优先，回退 index.html 中的默认橙色圆
   var siteAvatar = cfg.site && cfg.site.avatar;
@@ -4110,8 +5863,8 @@ function updateSEO(path) {
       var jsonLd = {
         '@context': 'https://schema.org',
         '@type': 'BlogPosting',
-        'headline': p.title || t('post.untitled'),
-        'description': p.excerpt || '',
+        'headline': (p.seo && p.seo.title) || p.title || t('post.untitled'),
+        'description': (p.seo && p.seo.desc) || p.excerpt || '',
         'datePublished': p.date || '',
         'dateModified': p.date || '',
         'author': { '@type': 'Person', 'name': getSiteAuthor() },
@@ -4224,7 +5977,11 @@ function aiFillSlots() {
             var el = document.getElementById('aiSummarySlot');
             if (!el) return;
             if (d && d.summary) {
-              el.innerHTML = aiSummaryCardHTML(d.summary, slug, !!d.cached || adminOk(), !!d.cached);
+              // 「重新生成」仅登录管理员可见。adminOk() 只看本地还在不，
+              // 过期/已撤销的 token 会误导致游客看到管理员按钮，故这里等服务端确认。
+              adminVerified().then(function (ok) {
+                if (el.isConnected) el.innerHTML = aiSummaryCardHTML(d.summary, slug, ok, !!d.cached);
+              });
             } else {
               el.innerHTML = aiSummaryBtnHTML(slug);
             }
@@ -4279,7 +6036,12 @@ function aiDoSummary(btn) {
   btn.innerHTML = svgIcon('spinner', 13) + ' ' + esc(t('site.loading'));
   apiFetch('api/ai/summary', { method: 'POST', body: JSON.stringify({ slug: slug, lang: aiLang(), force: force }) })
     .then(function (d) {
-      if (slot) slot.innerHTML = aiSummaryCardHTML(d.summary || '', slug, adminOk());
+      if (slot) {
+        var cur = slot;
+        adminVerified().then(function (ok) {
+          if (cur.isConnected) cur.innerHTML = aiSummaryCardHTML(d.summary || '', slug, ok);
+        });
+      }
     })
     .catch(function (e) {
       btn.disabled = false;
@@ -4582,8 +6344,11 @@ function bindMobileSidebar() {
   if (hamburger) hamburger.addEventListener('click', openSidebar);
   if (closeBtn) closeBtn.addEventListener('click', closeSidebar);
   if (overlay) overlay.addEventListener('click', closeSidebar);
-  // 点击侧边栏链接后自动关闭
-  sidebar.querySelectorAll('.sidebar-link').forEach(function (a) {
+  // 点击侧边栏链接后自动关闭。
+  // 注意：排除「发现」下拉触发按钮——它同样带 .sidebar-link，若一并绑定 closeSidebar，
+  // 点击会在展开下拉的同一帧把整个侧栏关掉，导致手机端下拉看起来「点了没反应」。
+  // 改为展开/收起下拉时不关侧栏，点了菜单项（真实链接）才关闭。
+  sidebar.querySelectorAll('.sidebar-link:not([data-nav-dropdown-trigger])').forEach(function (a) {
     a.addEventListener('click', closeSidebar);
   });
   // 侧边栏内的主题切换（独立 ID，与顶栏不冲突）
@@ -4667,12 +6432,72 @@ function updateBackTop() {
 
 /* 站内链接点击拦截：history 模式用 pushState，避免整页刷新 */
 var _navClickBound = false;
+// 展开/收起「发现」下拉：切class的同时直接写内联 display。
+// 这样即使浏览器/Service Worker 还缓存着旧样式（缺 .dropdown-open 规则），
+// 下拉依然能正常打开，不会出现「点了没反应」。
+function setDropdownOpen(group, open) {
+    if (!group) return;
+    var panel = group.querySelector('.sub-menu, .sidebar-submenu');
+    if (group.classList.contains('dropdown-open')) group.classList.remove('dropdown-open');
+    else if (open) group.classList.add('dropdown-open');
+    var trigger = group.querySelector('[data-nav-dropdown-trigger]');
+    if (trigger) trigger.setAttribute('aria-expanded', open ? 'true' : 'false');
+    if (!panel) return;
+    if (open) {
+      panel.style.display = group.classList.contains('sidebar-nav-group') ? 'block' : 'flex';
+      panel.style.opacity = '1';
+      panel.style.visibility = 'visible';
+      panel.style.transform = 'translateY(0)';
+    } else {
+      // 收起外层时同时收起内部仍展开的子分组，避免下次打开残留展开状态
+      try {
+        group.querySelectorAll('[data-nav-dropdown].dropdown-open').forEach(function (d) {
+          if (d !== group) setDropdownOpen(d, false);
+        });
+      } catch (e) {}
+      panel.style.display = '';
+      panel.style.opacity = '';
+      panel.style.visibility = '';
+      panel.style.transform = '';
+    }
+  }
 function bindNavClicks() {
   if (_navClickBound) return;
   _navClickBound = true;
   if (typeof document === 'undefined') return;
   document.addEventListener('click', function (e) {
     try {
+      // 「发现」下拉：点击切换；桌面顶栏与手机侧栏共用同一套状态
+      var trigger = e.target;
+      while (trigger && !(trigger.getAttribute && trigger.getAttribute('data-nav-dropdown-trigger') !== null)) {
+        trigger = trigger.parentNode;
+      }
+      if (trigger) {
+        e.preventDefault();
+        var group = trigger;
+        while (group && !(group.getAttribute && group.getAttribute('data-nav-dropdown') !== null)) {
+          group = group.parentNode;
+        }
+        var shouldOpen = group && !group.classList.contains('dropdown-open');
+        // 只收起同级与无关的展开分组：保留祖先（如外层「发现」），否则点开内层子分类会把外层一起关掉
+        function navIsAncestor(anc, node) { while (node) { if (node === anc) return true; node = node.parentNode; } return false; }
+        document.querySelectorAll('[data-nav-dropdown].dropdown-open').forEach(function (openItem) {
+          if (openItem !== group && !navIsAncestor(openItem, group)) setDropdownOpen(openItem, false);
+        });
+        // 再次点击同一个触发器 = 收起（桌面顶栏 / 手机侧栏 / 嵌套子分类统一行为）
+        if (group) {
+          setDropdownOpen(group, shouldOpen);
+          trigger.setAttribute('aria-expanded', shouldOpen ? 'true' : 'false');
+        }
+        return;
+      }
+      // 点击菜单和按钮以外的区域时收起
+      document.querySelectorAll('[data-nav-dropdown].dropdown-open').forEach(function (openItem) {
+        if (!openItem.contains(e.target)) {
+          setDropdownOpen(openItem, false);
+        }
+      });
+
       var a = e.target;
       while (a && a.tagName !== 'A') a = a.parentNode;
       if (!a || !a.getAttribute) return;
@@ -4710,6 +6535,12 @@ function bindNavClicks() {
       }
       catch (err) {}
   }, true);
+  document.addEventListener('keydown', function (e) {
+    if (!e || e.key !== 'Escape') return;
+    document.querySelectorAll('[data-nav-dropdown].dropdown-open').forEach(function (openItem) {
+      setDropdownOpen(openItem, false);
+    });
+  });
 }
 
 /* 目录点击：平滑滚动到正文对应标题，避免改变 location.hash 触发 hash 路由 */
@@ -4878,25 +6709,147 @@ function _waitGlobalStyle() {
  * 首屏渲染不等待网络：先用静态/本地数据立即渲染，云端探测（/api/posts）
  * 异步完成后再合并数据并重渲染一次，切换为云端模式 UI。
  * 避免 API 慢（Workers 冷启动 / 弱网）时整页白屏等待。 */
+/* ---------- 前端错误自监控 ----------
+ * 捕获未处理异常 / Promise 拒绝 → 上报后台「错误日志」。默认开启，可在后台
+ * 设置 → 功能开关 关闭；同一会话同一错误只报一次，单页最多 8 条。 */
+var _errSent = {};
+var _errSentCount = 0;
+function _errReportEnabled() {
+  try { var f = getConfig().features || {}; return f.errorReport !== false; } catch (e) { return true; }
+}
+function reportClientError(kind, message, source, stack) {
+  try {
+    if (!_errReportEnabled()) return;
+    if (!_cloudOn()) return;
+    if (_errSentCount >= 8) return;
+    var msg = String(message == null ? '' : message).slice(0, 500);
+    if (!msg) return;
+    var key = kind + '|' + msg + '|' + String(source || '').slice(0, 300);
+    if (_errSent[key]) return;
+    _errSent[key] = 1; _errSentCount++;
+    var payload = {
+      kind: String(kind || 'error').slice(0, 20),
+      message: msg,
+      source: String(source || '').slice(0, 300),
+      stack: String(stack || '').slice(0, 4000),
+      url: (typeof location !== 'undefined' ? String(location.href || '') : '').slice(0, 500)
+    };
+    apiFetch('api/errors', { method: 'POST', body: JSON.stringify(payload) }).catch(function () {});
+  } catch (e) { /* 上报失败绝不能影响页面 */ }
+}
+function initErrorReporting() {
+  try {
+    window.addEventListener('error', function (e) {
+      if (!e || !e.message) return;   // 资源加载失败没有 message，跳过避免噪音
+      reportClientError('error', e.message, (e.filename || '') + (e.lineno ? ':' + e.lineno : ''), e.error && e.error.stack);
+    });
+    window.addEventListener('unhandledrejection', function (e) {
+      var r = e && e.reason;
+      var msg = (r && (r.message || r.reason)) || r || 'Unhandled rejection';
+      reportClientError('promise', String(msg), '', (r && r.stack) || '');
+    });
+  } catch (e) {}
+}
+window.reportClientError = reportClientError;
+
 window.__bootPromise = (async function () {
+  initErrorReporting();
+  // i18n 自愈：本应已由 i18n.js 提供；若缺失（加载失败）则这里再补一次，失败也不影响渲染
+  if (!(window.__i18n && window.__i18n.loadLocale)) {
+    await new Promise(function (resolve) {
+      var sc = document.createElement('script');
+      sc.src = appRoot() + 'i18n.min.js?v=' + BLOG_VERSION;
+      sc.onload = function () { resolve(true); };
+      sc.onerror = function () { resolve(false); };
+      document.head.appendChild(sc);
+    });
+  }
   var cfg = getConfig();
   applyTheme(getTheme());
   applyAccent(getAccent());
+  applyReadingScale();
   bindNavClicks();
   // 全局样式非阻塞加载后，首帧渲染前需等它就绪（与 i18n 并行），避免 FOUC
   var _cssReady = _waitGlobalStyle();
-  // 确保 i18n 翻译数据在首次渲染前加载完成
+  // 确保 i18n 翻译数据在首次渲染前加载完成。
+  // 网络挂起时最多等 I18N_WAIT_MS：超时也照样先渲染（内嵌字典兜底，导航照常可用），
+  // 语言包到达后会自动重渲染，避免整页卡在加载动画、下拉点不开。
   if (window.__i18n && window.__i18n.loadLocale && !window.__i18n.isReady()) {
-    await window.__i18n.loadLocale(window.__i18n.getLocale());
-    _i18nReady = true;
+    var _i18nLoad = window.__i18n.loadLocale(window.__i18n.getLocale()).then(function () { _i18nReady = true; });
+    var _i18nTimer = new Promise(function (resolve) { setTimeout(resolve, 3000); });
+    await Promise.race([_i18nLoad, _i18nTimer]);
   }
 
   await _cssReady;
-  route();
-  window.addEventListener('hashchange', function () { route(); });
-  window.addEventListener('popstate', function () { route(); });
+  // 首屏渲染兜底：route() 抛错时也要把页面画出来，避免停在加载动画
+  try {
+    route();
+  } catch (errBoot) {
+    try { console.error('[boot] route failed:', errBoot); } catch (e) { /* ignore */ }
+    var app0 = document.querySelector('#app');
+    var boot0 = document.getElementById('bootLoad');
+    if (boot0 && boot0.parentNode) boot0.parentNode.removeChild(boot0);
+    if (app0 && !app0.querySelector('main')) {
+      app0.innerHTML = '<main class="container"><div class="empty"><div class="big">!</div>'
+        + '<p>' + esc((errBoot && errBoot.message) || 'render failed') + '</p>'
+        + '<p><a href="' + esc(href('/')) + '">' + t('post.backHome') + '</a></p></div></main>';
+    }
+  }
+  // 首屏已渲染（成功或走了兜底）：关闭 index.html 里的「网络较慢」提示计时器
+  try { window.__qingyuBooted = true; } catch (e) {}
+  window.addEventListener('hashchange', function () { _spaNav = true; withViewTransition(route); });
+  window.addEventListener('popstate', function () { _spaNav = true; withViewTransition(route); });
 
+/* ---------- 弱网/丢包兜底：云端快照（SWR） ----------
+ * 现象：到 Cloudflare 的线路丢包时 /api/posts 迟迟不回，首页与文章页就一直转圈。
+ * 做法：每次成功拉到云端文章/设置后写一份快照到 localStorage；下次打开先用快照立即渲染，
+ *      同时后台并行刷新真实数据（拿到后再覆盖重渲染）。快照只是「首屏秒开」，不影响数据准确性。
+ */
+var POSTS_SNAP_KEY = 'qingyu.snap.posts';
+var SETTINGS_SNAP_KEY = 'qingyu.snap.settings';
+var SNAP_MAX_AGE = 12 * 3600 * 1000;   // 快照最长用于首屏兜底（12 小时），后台始终会刷新
+function readSnapshot(k) {
+  try {
+    var raw = localStorage.getItem(k);
+    if (!raw) return null;
+    var o = JSON.parse(raw);
+    if (!o || !o.at || Date.now() - o.at > SNAP_MAX_AGE) return null;
+    return o.data || null;
+  } catch (e) { return null; }
+}
+function writeSnapshot(k, data) {
+  try { if (data) localStorage.setItem(k, JSON.stringify({ at: Date.now(), data: data })); } catch (e) {}
+}
+/* 合并云端文章摘要到 window.BLOG_POSTS：云端返回的字段覆盖，本地静态正文/摘要保留 */
+function applyPostsSnapshot(data) {
+  if (!data || !Array.isArray(data.posts)) return false;
+  var existing = (Array.isArray(window.BLOG_POSTS) ? window.BLOG_POSTS : []);
+  var byId = {};
+  existing.forEach(function (p) { byId[p.id] = p; });
+  data.posts.forEach(function (p) {
+    var old = byId[p.id];
+    if (old) {
+      var merged = {};
+      Object.keys(p).forEach(function (k) { if (p[k] !== undefined) merged[k] = p[k]; });
+      byId[p.id] = Object.assign({}, old, merged);
+    } else {
+      byId[p.id] = p;
+    }
+  });
+  window.BLOG_POSTS = Object.keys(byId).map(function (k) { return byId[k]; });
+  return true;
+}
   if (cfg.mode === 'api' || cfg.mode === 'auto') {
+    // ① 先用上次成功的云端快照立即出内容（接口慢/丢包时不再一直转圈）
+    var snapHit = false;
+    var snapPosts = readSnapshot(POSTS_SNAP_KEY);
+    if (snapPosts) snapHit = applyPostsSnapshot(snapPosts) || snapHit;
+    var snapSettings = readSnapshot(SETTINGS_SNAP_KEY);
+    if (snapSettings && snapSettings.settings) { _siteSettings = snapSettings.settings; snapHit = true; notifyFeaturesReady(); }
+    // 只补内容、不提前宣告「云端已就绪」：探测完成前仍走原有懒加载路径，
+    // 避免文章详情在拿到正文前就误判为「不存在」。
+    if (snapHit) { try { route(); } catch (e) {} }
+    // ② 再并行拉真实数据（拿到后会覆盖快照并重渲染）
     // 首次渲染（上方 route()）会显示加载动画；探测完成（成功或失败）后置位并重渲染，
     // 否则首页会一直停在「正在拉取文章…」
     // posts 与 settings 并行拉取：串行叠加等待（各约 0.5~1.5s 冷启动）会拖慢首屏。
@@ -4916,24 +6869,10 @@ window.__bootPromise = (async function () {
         // 合并云端列表与本地静态列表：云端摘要覆盖已返回字段，保留静态正文与摘要
         // （content/enc 等）；未在云端列表中的静态文章仍保留作兜底。
         // 已删除文章的兜底隐患由 renderPost 的 404 处理兜底：访问时即移除并显示不存在。
-        var existing = (Array.isArray(window.BLOG_POSTS) ? window.BLOG_POSTS : []);
-        var byId = {};
-        existing.forEach(function (p) { byId[p.id] = p; });
-        data.posts.forEach(function (p) {
-          var old = byId[p.id];
-          if (old) {
-            // 云端列表是摘要（不含 content/enc）：仅覆盖已返回字段，保留静态正文与摘要，
-            // 避免首页卡片摘要被清空、全文搜索失效
-            var merged = {};
-            Object.keys(p).forEach(function (k) { if (p[k] !== undefined) merged[k] = p[k]; });
-            byId[p.id] = Object.assign({}, old, merged);
-          } else {
-            byId[p.id] = p;
-          }
-        });
-        window.BLOG_POSTS = Object.keys(byId).map(function (k) { return byId[k]; });
+        applyPostsSnapshot(data);
         // 探测成功：模式或数据有变化则重渲染一次（切换云端 UI、刷新列表数据；
         // 0 篇也用 !wasCloud 重渲染 → 从加载动画变为「你还未发布文章」空态）
+        writeSnapshot(POSTS_SNAP_KEY, data);
         if (!wasCloud || data.posts.length) route();
       } else {
         _cloudReady = true;
@@ -4948,10 +6887,14 @@ window.__bootPromise = (async function () {
     // GET /api/settings 为公开接口；已与 posts 并行拉取（sResp），失败时保持静态配置。
     try {
       if (sResp && sResp.settings) {
-        var firstLoad = !_siteSettings;
+        var settingsChanged = JSON.stringify(_siteSettings || {}) !== JSON.stringify(sResp.settings);
         _siteSettings = sResp.settings;
-        if (firstLoad) route();   // 首次加载设置后重渲染：导航/页脚/关于页生效
+        notifyFeaturesReady();
+        writeSnapshot(SETTINGS_SNAP_KEY, sResp);
+        if (settingsChanged) route();   // 缓存设置与服务端设置不同也要更新首页布局
       }
     } catch (e) { /* 设置获取失败 → 使用静态配置 */ }
+    notifyFeaturesReady();   // 静态模式 / 接口失败：同样广播，播放器按默认（开启）处理
   }
+  notifyFeaturesReady();
 })();
